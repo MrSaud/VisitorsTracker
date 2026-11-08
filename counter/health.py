@@ -17,6 +17,7 @@ from django.utils import timezone
 # Per-camera states.
 OK = "ok"              # alive and delivering frames
 STALLED = "stalled"    # alive but no recent frame
+RECONNECTING = "reconnecting"  # alive, lost the source, trying to get it back
 FAILED = "failed"      # stopped with an error
 OFFLINE = "offline"    # meant to be running, but nothing is
 DISABLED = "disabled"  # deliberately not running
@@ -28,7 +29,11 @@ STATUS_DEGRADED = "degraded"
 STATUS_DOWN = "down"
 
 # Higher means worse. DISABLED is deliberate, so it is not a problem.
-SEVERITY = {OK: 0, DISABLED: 0, FINISHED: 0, STALLED: 1, FAILED: 2, OFFLINE: 2}
+# Reconnecting is degraded rather than down: counting has stopped, but the
+# worker is still there and may well recover on its own.
+SEVERITY = {OK: 0, DISABLED: 0, FINISHED: 0,
+            STALLED: 1, RECONNECTING: 1,
+            FAILED: 2, OFFLINE: 2}
 
 HEALTHY_STATES = (OK, DISABLED, FINISHED)
 
@@ -67,7 +72,18 @@ def camera_health(camera, worker=None, last_event_at=None):
         seconds_since_frame = worker.seconds_since_frame if worker else None
     else:
         seconds_since_frame = worker.seconds_since_frame
-        if seconds_since_frame is None:
+        if getattr(worker, "reconnecting", False):
+            # Checked before staleness: while reconnecting there is of course
+            # no recent frame, and "reconnecting" is the more useful word.
+            state = RECONNECTING
+            reason = worker.error or "The source stopped delivering frames."
+            retry_in = getattr(worker, "retry_in", None)
+            detail = reason if reason.endswith(".") else reason + "."
+            if retry_in:
+                detail += f" Retrying in {retry_in:.0f}s."
+            if worker.reconnects:
+                detail += f" Reconnected {worker.reconnects} time(s) already."
+        elif seconds_since_frame is None:
             # Alive but nothing delivered yet; only a problem once it has
             # had longer than the threshold to produce a first frame.
             # started_at is a monotonic reading, so compare like with like.
@@ -101,6 +117,7 @@ def camera_health(camera, worker=None, last_event_at=None):
         "seconds_since_frame": (
             round(seconds_since_frame, 1) if seconds_since_frame is not None else None),
         "frames_read": worker.frames_read if worker else 0,
+        "reconnects": getattr(worker, "reconnects", 0) if worker else 0,
         "fps": round(worker.fps, 2) if worker else 0.0,
         "last_event_at": last_event_at.isoformat() if last_event_at else None,
         "minutes_since_event": None,

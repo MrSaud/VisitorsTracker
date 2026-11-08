@@ -26,13 +26,38 @@ logger = logging.getLogger(__name__)
 # How long a streaming client waits for a new frame before giving up.
 FRAME_WAIT_TIMEOUT = 5.0
 
-# Consecutive read failures tolerated before a live camera is abandoned.
+# Consecutive read failures tolerated before a live stream is called lost.
 MAX_READ_FAILURES = 30
+
+# A live source that drops is reconnected to, with the wait doubling after
+# each failure. RTSP streams drop for ordinary reasons -- a network blip, a
+# switch hiccup, the camera rebooting its own firmware -- and an event is
+# over by the time anyone notices that counting stopped at 10:20.
+RECONNECT_BACKOFF_START = 1.0
+RECONNECT_BACKOFF_MAX = 30.0
+
+# How a read loop ended.
+STOPPED = "stopped"    # asked to stop
+FINISHED = "finished"  # a file played to its end
+LOST = "lost"          # a live source stopped delivering
 
 # How long a resolved event is reused before being looked up again. Crossings
 # are infrequent, but this keeps a busy doorway from querying per person while
 # still noticing an event starting or ending within a few seconds.
 EVENT_CACHE_SECONDS = 10.0
+
+
+def is_file_source(source) -> bool:
+    """Whether a source is a clip that ends, rather than a live feed.
+
+    This decides two things that must not be got wrong: whether running out
+    of frames is a normal finish or a fault, and whether to reconnect. An
+    RTSP or HTTP camera is live -- it is the case reconnection exists for --
+    so a URL is never a file, however much it looks like a path.
+    """
+    if isinstance(source, int):
+        return False
+    return "://" not in str(source)
 
 
 class CounterWorker(threading.Thread):
@@ -45,7 +70,7 @@ class CounterWorker(threading.Thread):
         self.camera_pk = camera.pk
         self.camera_name = camera.name
         self.source = camera.resolved_source()
-        self.is_file = not isinstance(self.source, int)
+        self.is_file = is_file_source(self.source)
 
         detector = build_detector(
             settings.COUNTER_DETECTOR,
@@ -86,6 +111,12 @@ class CounterWorker(threading.Thread):
         # like a healthy one unless this is checked.
         self.last_frame_at: float | None = None
         self.finished_at: float | None = None
+        # Reconnection state, so a dashboard can say "trying" rather than
+        # leaving an operator to guess between frozen and gone.
+        self.connected_at: float | None = None
+        self.reconnects = 0
+        self.reconnecting = False
+        self.retry_in: float | None = None
 
     # -- public API -------------------------------------------------------
 
@@ -130,6 +161,9 @@ class CounterWorker(threading.Thread):
             "seconds_since_frame": (
                 round(since_frame, 1) if since_frame is not None else None),
             "fps": round(self.fps, 2),
+            "reconnecting": self.reconnecting,
+            "reconnects": self.reconnects,
+            "retry_in": self.retry_in,
             "session_in": self.counter.total_in,
             "session_out": self.counter.total_out,
             "session_inside": self.counter.occupancy,
@@ -139,22 +173,115 @@ class CounterWorker(threading.Thread):
     # -- thread body ------------------------------------------------------
 
     def run(self):
-        capture = cv2.VideoCapture(self.source)
-        if not capture.isOpened():
-            self.error = (
-                f"Could not open video source {self.source!r}. "
-                "For a webcam, check that the terminal running this process has "
-                "camera access in System Settings > Privacy & Security > Camera."
-            )
-            logger.error("camera %s: %s", self.camera_pk, self.error)
+        """Stay connected to the source for as long as we are wanted.
+
+        A live source is reconnected to after a drop; the counting session
+        continues across the gap, so the totals keep running while the
+        tracks are thrown away.
+        """
+        failures = 0                       # consecutive failures to get a stream
+        backoff = RECONNECT_BACKOFF_START
+
+        try:
+            while not self._stop_event.is_set():
+                capture = self._open()
+
+                if capture is not None:
+                    self._mark_connected()
+                    failures = 0
+                    backoff = RECONNECT_BACKOFF_START
+                    try:
+                        outcome = self._read_frames(capture)
+                    finally:
+                        capture.release()
+                    if outcome in (STOPPED, FINISHED):
+                        break
+                elif self.is_file:
+                    # A file that will not open is a mistake to report, not
+                    # a blip to wait out.
+                    break
+
+                failures += 1
+                if not self._may_retry(failures):
+                    logger.error("camera %s: giving up after %d attempt(s)",
+                                 self.camera_pk, failures)
+                    break
+                if not self._wait_to_retry(backoff):
+                    break
+                backoff = min(backoff * 2.0, RECONNECT_BACKOFF_MAX)
+        finally:
+            self.reconnecting = False
+            self.retry_in = None
             self.finished_at = time.time()
+            close_old_connections()
             with self._condition:
                 self._condition.notify_all()
-            return
 
-        self.started_at = time.monotonic()
-        failures = 0
+    # -- connection -------------------------------------------------------
 
+    def _open(self):
+        """Open the source, or record why it could not be opened."""
+        capture = cv2.VideoCapture(self.source)
+        if capture.isOpened():
+            return capture
+
+        capture.release()
+        self.error = (
+            f"Could not open video source {self.source!r}. " + self._open_hint()
+        )
+        logger.error("camera %s: %s", self.camera_pk, self.error)
+        return None
+
+    def _open_hint(self) -> str:
+        """Advice that fits the kind of source, rather than all of them."""
+        if isinstance(self.source, int):
+            return (
+                "Check that the process running this has camera access in "
+                "System Settings > Privacy & Security > Camera, and that no "
+                "other app is holding the device."
+            )
+        if self.is_file:
+            return "Check that the file exists and is a format OpenCV can read."
+        return (
+            "Check that the camera is powered and reachable on the network, "
+            "and that the URL, port and credentials are right."
+        )
+
+    def _mark_connected(self):
+        reconnected = self.connected_at is not None
+        self.connected_at = time.monotonic()
+        if self.started_at is None:
+            self.started_at = self.connected_at
+        self.error = None
+        self.reconnecting = False
+        self.retry_in = None
+
+        if reconnected:
+            self.reconnects += 1
+            # The scene moved on while we were away. A surviving track would
+            # be matched to whoever now stands nearest, which reads as that
+            # person crossing the line.
+            self.counter.forget_tracks()
+            logger.info("camera %s: reconnected (%d time(s) so far)",
+                        self.camera_pk, self.reconnects)
+
+    def _may_retry(self, failures: int) -> bool:
+        """Whether to try again. Zero attempts configured means never give up."""
+        limit = int(getattr(settings, "COUNTER_RECONNECT_ATTEMPTS", 0) or 0)
+        return limit <= 0 or failures <= limit
+
+    def _wait_to_retry(self, seconds: float) -> bool:
+        """Back off before the next attempt. False if asked to stop meanwhile."""
+        self.reconnecting = True
+        self.retry_in = round(seconds, 1)
+        logger.warning("camera %s: %s Retrying in %.0fs.",
+                       self.camera_pk, self.error or "Stream lost.", seconds)
+        interrupted = self._stop_event.wait(seconds)
+        self.retry_in = None
+        return not interrupted
+
+    def _read_frames(self, capture) -> str:
+        """Read until the source ends, breaks, or we are asked to stop."""
         # A file would otherwise be consumed as fast as the CPU allows, which
         # makes playback useless to watch and distorts fps. Pace it to the
         # clip's own rate. Live cameras already pace themselves.
@@ -164,55 +291,52 @@ class CounterWorker(threading.Thread):
             if 0.0 < source_fps < 240.0:
                 frame_interval = 1.0 / source_fps
         next_frame_at = time.monotonic()
+        failures = 0
 
-        try:
-            while not self._stop_event.is_set():
-                ok, frame = capture.read()
+        while not self._stop_event.is_set():
+            ok, frame = capture.read()
 
-                if not ok or frame is None:
-                    if self.is_file:
-                        # A video file simply ran out; that is a normal finish.
-                        break
-                    failures += 1
-                    if failures > MAX_READ_FAILURES:
-                        self.error = "Camera stopped returning frames."
-                        break
-                    time.sleep(0.1)
-                    continue
+            if not ok or frame is None:
+                if self.is_file:
+                    # A video file simply ran out; that is a normal finish.
+                    return FINISHED
+                failures += 1
+                if failures > MAX_READ_FAILURES:
+                    self.error = "Camera stopped returning frames."
+                    return LOST
+                if self._stop_event.wait(0.1):
+                    return STOPPED
+                continue
 
-                failures = 0
-                self.frames_read += 1
+            failures = 0
+            self.frames_read += 1
 
-                try:
-                    annotated, events = self.counter.process(frame)
-                except cv2.error as exc:  # pragma: no cover - defensive
-                    self.error = f"OpenCV failure while processing a frame: {exc}"
-                    break
+            try:
+                annotated, events = self.counter.process(frame)
+            except cv2.error as exc:  # pragma: no cover - defensive
+                self.error = f"OpenCV failure while processing a frame: {exc}"
+                return LOST
 
-                self._publish(annotated)
+            self._publish(annotated)
 
-                if events:
-                    self._persist(events)
+            if events:
+                self._persist(events)
 
-                elapsed = time.monotonic() - (self.started_at or time.monotonic())
-                if elapsed > 0:
-                    self.fps = self.frames_read / elapsed
+            elapsed = time.monotonic() - (self.started_at or time.monotonic())
+            if elapsed > 0:
+                self.fps = self.frames_read / elapsed
 
-                if frame_interval:
-                    next_frame_at += frame_interval
-                    lag = next_frame_at - time.monotonic()
-                    if lag > 0:
-                        # Wake early if someone asks us to stop mid-sleep.
-                        self._stop_event.wait(lag)
-                    else:
-                        # Processing is slower than the clip; don't accumulate debt.
-                        next_frame_at = time.monotonic()
-        finally:
-            self.finished_at = time.time()
-            capture.release()
-            close_old_connections()
-            with self._condition:
-                self._condition.notify_all()
+            if frame_interval:
+                next_frame_at += frame_interval
+                lag = next_frame_at - time.monotonic()
+                if lag > 0:
+                    # Wake early if someone asks us to stop mid-sleep.
+                    self._stop_event.wait(lag)
+                else:
+                    # Processing is slower than the clip; don't accumulate debt.
+                    next_frame_at = time.monotonic()
+
+        return STOPPED
 
     # -- internals --------------------------------------------------------
 

@@ -295,6 +295,17 @@ class CentroidTracker:
         """No motion model, so a skipped frame simply holds position."""
         return self.tracks
 
+    def forget_tracks(self):
+        """Drop everyone currently tracked, keeping the id counter.
+
+        Used when the stream is discontinuous. After a reconnect the scene
+        has moved on, and a surviving track would be matched to whoever now
+        stands nearest -- inventing a crossing from one side to the other.
+        Ids keep counting up, so a later track never looks like an earlier
+        person.
+        """
+        self.tracks.clear()
+
     def update(self, boxes):
         """Feed this frame's boxes; returns the live tracks."""
         if not boxes:
@@ -454,6 +465,21 @@ class VisitorCounter:
             return frame
         scale = self.frame_width / float(width)
         return cv2.resize(frame, (self.frame_width, int(round(height * scale))))
+
+    def forget_tracks(self):
+        """Forget who is on screen, keeping the running totals.
+
+        A reconnected camera resumes the same counting session: ``total_in``
+        and ``total_out`` must survive the gap, but the tracks and the line
+        sides they remember must not.
+        """
+        forget = getattr(self.tracker, "forget_tracks", None)
+        if forget is not None:
+            forget()
+        self._last_detections = []
+        # Start the frame cycle again so the next frame takes a detection
+        # rather than advancing a motion model over nothing.
+        self._frame_index = 0
 
     def process(self, frame):
         """Run one frame. Returns ``(annotated_frame, events)``."""

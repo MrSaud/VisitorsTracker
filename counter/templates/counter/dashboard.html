@@ -177,7 +177,14 @@
     letter-spacing: 0.07em; color: var(--muted); }
   .event-figures .value { font-size: 26px; font-weight: 600;
     font-variant-numeric: tabular-nums; }
-  .capacity-bar { height: 8px; border-radius: 999px; background: #22262f; overflow: hidden; }
+  .capacity-bar { height: 8px; border-radius: 999px; background: #22262f; position: relative; }
+  .capacity-bar span { overflow: hidden; }
+  /* Where it got to earlier, so an empty-looking bar cannot imply
+     the room was never full. */
+  .capacity-bar i {
+    position: absolute; top: -3px; bottom: -3px; width: 2px;
+    background: var(--out); border-radius: 1px;
+  }
   .capacity-bar span { display: block; height: 100%; background: var(--in);
     border-radius: 999px; transition: width 0.3s; }
   .event-card.near .capacity-bar span { background: var(--accent); }
@@ -311,6 +318,7 @@
     <div class="tile"><div class="label">Total out</div><div class="value v-out" id="t-out">&mdash;</div></div>
     <div class="tile"><div class="label">Inside now</div><div class="value v-inside" id="t-inside">&mdash;</div><div class="note" id="t-inside-note"></div></div>
     <div class="tile"><div class="label">Today in</div><div class="value" id="t-today">&mdash;</div></div>
+    <div class="tile"><div class="label">Peak today</div><div class="value v-inside" id="t-peak">&mdash;</div><div class="note" id="t-peak-note"></div></div>
     <div class="tile"><div class="label">Cameras running</div><div class="value" id="t-running">&mdash;</div></div>
   </section>
 
@@ -330,6 +338,7 @@
       <div><div class="label">Out</div><div class="value v-out" id="d-out">&mdash;</div></div>
       <div><div class="label">Daily average</div><div class="value" id="d-avg">&mdash;</div></div>
       <div><div class="label">Busiest day</div><div class="value" id="d-busy">&mdash;</div></div>
+      <div><div class="label">Fullest moment</div><div class="value v-inside" id="d-peak">&mdash;</div></div>
     </div>
 
     <div class="chart" id="d-chart"></div>
@@ -339,7 +348,7 @@
       <summary>Show the numbers</summary>
       <div class="table-wrap">
         <table class="daily-table">
-          <thead><tr><th>Date</th><th>In</th><th>Out</th><th>Net</th></tr></thead>
+          <thead><tr><th>Date</th><th>In</th><th>Out</th><th>Net</th><th>Peak</th></tr></thead>
           <tbody id="d-rows"></tbody>
         </table>
       </div>
@@ -532,6 +541,10 @@ async function refresh() {
     const resetNote = document.getElementById("t-inside-note");
     if (resetNote) resetNote.textContent = data.occupancy.scope;
     document.getElementById("t-today").textContent = data.today.in;
+    // Footfall says how many came through; the peak says how full it got.
+    document.getElementById("t-peak").textContent = data.today.peak.peak;
+    document.getElementById("t-peak-note").textContent =
+      data.today.peak.at ? `at ${clockTime(data.today.peak.at)}` : "inside at once";
     document.getElementById("t-running").textContent = data.running_cameras;
 
     for (const camera of data.cameras) {
@@ -575,6 +588,11 @@ document.addEventListener("click", async (event) => {
 
 // ---- the running event -------------------------------------------------
 
+function clockTime(iso) {
+  if (!iso) return "";
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 function formatRemaining(seconds) {
   if (seconds <= 0) return "ending now";
   const hours = Math.floor(seconds / 3600);
@@ -608,6 +626,7 @@ function renderEvent(event) {
     ["Left", event.attendance.out, "v-out"],
     ["Inside now", event.attendance.inside, "v-inside"],
   ];
+  cells.push(["Peak inside", event.peak.peak, "v-inside"]);
   if (capacity) cells.push(["Capacity", capacity.capacity, ""]);
   for (const [label, value, cls] of cells) {
     const cell = document.createElement("div");
@@ -624,13 +643,27 @@ function renderEvent(event) {
     const fill = document.createElement("span");
     fill.style.width = `${Math.min(100, capacity.percent)}%`;
     bar.appendChild(fill);
+
+    if (capacity.peak > capacity.inside) {
+      const mark = document.createElement("i");
+      mark.style.left = `calc(${Math.min(100, capacity.peak_percent)}% - 1px)`;
+      mark.title = `peaked at ${capacity.peak} (${capacity.peak_percent}%)`;
+      bar.appendChild(mark);
+    }
     card.appendChild(bar);
 
     const note = document.createElement("div");
     note.className = "capacity-note";
-    note.textContent = capacity.level === "over"
-      ? `Over capacity by ${capacity.inside - capacity.capacity}`
-      : `${capacity.percent}% full · ${capacity.remaining} places left`;
+    if (capacity.level === "over") {
+      note.textContent = `Over capacity by ${capacity.inside - capacity.capacity}`;
+    } else if (capacity.breached) {
+      // Fine now, but it was not earlier -- and that is the part worth saying.
+      note.textContent = `${capacity.percent}% full · peaked at ` +
+        `${capacity.peak} (${capacity.peak_percent}%) ` +
+        `${clockTime(capacity.peak_at)}`;
+    } else {
+      note.textContent = `${capacity.percent}% full · ${capacity.remaining} places left`;
+    }
     card.appendChild(note);
   }
   return card;
@@ -700,6 +733,9 @@ function renderDaily(data) {
   document.getElementById("d-avg").textContent = summary.daily_average_in;
   document.getElementById("d-busy").textContent =
     summary.busiest_date ? `${summary.busiest_date} (${summary.busiest_in})` : "—";
+  document.getElementById("d-peak").textContent = summary.peak_inside
+    ? `${summary.peak_inside} on ${summary.peak_date}`
+    : "—";
 
   const chart = document.getElementById("d-chart");
   const axis = document.getElementById("d-axis");
@@ -715,7 +751,8 @@ function renderDaily(data) {
   rows.forEach((row, index) => {
     const col = document.createElement("div");
     col.className = row.in ? "col" : "col zero";
-    col.title = `${row.date}: in ${row.in}, out ${row.out}`;
+    col.title = `${row.date}: in ${row.in}, out ${row.out}` +
+      (row.peak ? `, peak ${row.peak} inside` : "");
 
     const cap = document.createElement("div");
     cap.className = "cap";
@@ -734,7 +771,7 @@ function renderDaily(data) {
     axis.appendChild(tick);
 
     const tr = document.createElement("tr");
-    for (const value of [row.date, row.in, row.out, row.net]) {
+    for (const value of [row.date, row.in, row.out, row.net, row.peak]) {
       const td = document.createElement("td");
       td.textContent = value;
       tr.appendChild(td);

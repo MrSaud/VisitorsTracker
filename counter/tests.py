@@ -5,7 +5,9 @@ a model file, or any particular machine speed.
 """
 
 import itertools
+import os
 import pathlib
+import sys
 import tempfile
 import time as time_module
 from io import StringIO
@@ -21,7 +23,12 @@ from django.core.management import call_command
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
-from .camera import CounterWorker
+from .camera import CounterWorker, is_file_source
+from .supervisor import (
+    NO_AUTOSTART_COMMANDS,
+    Supervisor,
+    autostart_enabled,
+)
 from .daywindow import occupancy_window_start, parse_reset_time
 from .tracking import (
     KalmanBox,
@@ -36,6 +43,7 @@ from .health import (
     FINISHED,
     OFFLINE,
     OK,
+    RECONNECTING,
     STALLED,
     STATUS_DEGRADED,
     STATUS_DOWN,
@@ -52,7 +60,9 @@ from .reports import (
     opening_span,
     weekday_hour_matrix,
     local_today,
+    occupancy_peaks,
     parse_date,
+    peak_occupancy,
     resolve_range,
     summarise,
 )
@@ -808,9 +818,10 @@ class DailyApiTests(TestCase):
         self.assertEqual(response["Content-Type"], "text/csv")
         self.assertIn("attachment;", response["Content-Disposition"])
         lines = response.content.decode().strip().splitlines()
-        self.assertEqual(lines[0], "date,in,out,net")
-        self.assertEqual(lines[1], "2026-03-03,4,0,4")
-        self.assertEqual(lines[2], "2026-03-04,0,0,0")
+        self.assertEqual(lines[0], "date,in,out,net,peak_inside,peak_at")
+        # Four arrivals, none of whom left, so all four were inside at once.
+        self.assertTrue(lines[1].startswith("2026-03-03,4,0,4,4,"))
+        self.assertEqual(lines[2], "2026-03-04,0,0,0,0,")
 
     def test_bad_date_is_400(self):
         response = self.client.get("/api/v1/daily/?start=07-03-2026")
@@ -2018,3 +2029,845 @@ class OccupancyScopeLabelTests(TestCase):
         make_event("Science Fair")
         body = self.client.get("/api/v1/stats/").json()
         self.assertEqual(body["occupancy"]["scope"], "since Science Fair began")
+
+
+# ---------------------------------------------------------------------------
+# surviving a dropped stream
+# ---------------------------------------------------------------------------
+
+class FakeCapture:
+    """Stands in for cv2.VideoCapture: n good frames, then nothing."""
+
+    def __init__(self, frames=0, opened=True):
+        self.frames = frames
+        self._opened = opened
+        self.served = 0
+        self.released = False
+
+    def isOpened(self):
+        return self._opened
+
+    def read(self):
+        if self.served < self.frames:
+            self.served += 1
+            return True, blank_frame()
+        return False, None
+
+    def get(self, prop):
+        return 0.0
+
+    def release(self):
+        self.released = True
+
+
+class CaptureScript:
+    """Hands out captures in order, then unopenable ones for ever."""
+
+    def __init__(self, captures):
+        self.captures = list(captures)
+        self.opens = 0
+
+    def __call__(self, source):
+        self.opens += 1
+        if self.captures:
+            return self.captures.pop(0)
+        return FakeCapture(opened=False)
+
+
+class ForgetTracksTests(TestCase):
+    """Dropping tracks over a stream gap, while keeping the id counter."""
+
+    def test_centroid_tracker_forgets_tracks_but_not_ids(self):
+        tracker = CentroidTracker()
+        tracker.update([box_at(100, 100)])
+        first_id = next(iter(tracker.tracks))
+
+        tracker.forget_tracks()
+        self.assertEqual(len(tracker.tracks), 0)
+
+        tracker.update([box_at(100, 100)])
+        self.assertNotIn(first_id, tracker.tracks,
+                         "a reused id would read as the same person")
+
+    def test_sort_tracker_forgets_tracks_but_not_ids(self):
+        tracker = SortTracker(min_hits=1)
+        tracker.update([(track_box(100, 100), 0.9)])
+        first_id = next(iter(tracker.tracks))
+
+        tracker.forget_tracks()
+        self.assertEqual(len(tracker.tracks), 0)
+
+        tracker.update([(track_box(100, 100), 0.9)])
+        self.assertNotIn(first_id, tracker.tracks)
+
+    def test_counter_keeps_its_totals(self):
+        counter = VisitorCounter(detector=StubDetector([[]]),
+                                 line=LineCounter(position=0.5))
+        counter.line.total_in = 7
+        counter.line.total_out = 3
+
+        counter.forget_tracks()
+
+        self.assertEqual((counter.total_in, counter.total_out), (7, 3),
+                         "a reconnect continues the session, it does not reset it")
+        self.assertEqual(counter.active_tracks, 0)
+
+
+class ReconnectDoesNotInventCrossingsTests(TestCase):
+    """The hazard in reconnecting: a stale track meeting a new person.
+
+    Both halves run the same walk past the line. The only difference is
+    the gap in the middle, which is what must stop the crossing being
+    counted -- the person on the far side is not the one who was waiting.
+    """
+
+    WALK = [40, 45, 50, 55, 60, 180, 185, 190, 195, 200]
+
+    def _walk(self, gap_after=None):
+        counter = VisitorCounter(
+            detector=StubDetector([[box_at(160, y)] for y in self.WALK]),
+            tracker=build_tracker("sort", max_disappeared=25),
+            line=LineCounter(position=0.5),
+            detect_every=1,
+        )
+        frame = blank_frame()
+        events = []
+        for index in range(len(self.WALK)):
+            if gap_after is not None and index == gap_after:
+                counter.forget_tracks()
+            _annotated, batch = counter.process(frame)
+            events.extend(batch)
+        return counter, events
+
+    def test_an_uninterrupted_walk_is_counted(self):
+        counter, events = self._walk()
+        self.assertEqual(counter.total_in, 1)
+        self.assertEqual(len(events), 1,
+                         "control case: this walk must be countable")
+
+    def test_the_same_walk_across_a_gap_is_not_counted(self):
+        counter, events = self._walk(gap_after=5)
+        self.assertEqual(events, [])
+        self.assertEqual((counter.total_in, counter.total_out), (0, 0))
+
+
+@override_settings(COUNTER_RECONNECT_ATTEMPTS=1)
+class WorkerReconnectTests(TransactionTestCase):
+    """The real worker thread, over a capture that drops out."""
+
+    def _run(self, script, timeout=20):
+        camera = Camera.objects.create(name="Gate", source="0")
+        worker = CounterWorker(camera)
+        worker.counter.detector = StubDetector(
+            [[box_at(160, y)] for y in ReconnectDoesNotInventCrossingsTests.WALK])
+        worker.counter.detect_every = 1
+
+        with patch("cv2.VideoCapture", script), \
+                patch("counter.camera.MAX_READ_FAILURES", 2), \
+                patch("counter.camera.RECONNECT_BACKOFF_START", 0.05), \
+                patch("counter.camera.RECONNECT_BACKOFF_MAX", 0.05):
+            worker.start()
+            worker.join(timeout=timeout)
+        self.assertFalse(worker.is_alive(), "worker never finished")
+        return camera, worker
+
+    def test_a_dropped_stream_is_reopened(self):
+        script = CaptureScript([FakeCapture(frames=5), FakeCapture(frames=5)])
+        _camera, worker = self._run(script)
+
+        self.assertEqual(worker.reconnects, 1)
+        self.assertEqual(worker.frames_read, 10,
+                         "frames from both connections count")
+
+    def test_reconnecting_does_not_fabricate_a_crossing(self):
+        # Five frames above the line, the stream drops, five frames below.
+        script = CaptureScript([FakeCapture(frames=5), FakeCapture(frames=5)])
+        camera, worker = self._run(script)
+
+        self.assertEqual(worker.reconnects, 1)
+        self.assertEqual(Crossing.objects.filter(camera=camera).count(), 0)
+        self.assertEqual(worker.counter.total_in, 0)
+
+    def test_the_same_frames_without_a_drop_do_count(self):
+        script = CaptureScript([FakeCapture(frames=10)])
+        camera, worker = self._run(script)
+
+        self.assertEqual(worker.reconnects, 0)
+        self.assertEqual(Crossing.objects.filter(camera=camera).count(), 1,
+                         "control case: the walk itself is countable")
+
+    def test_attempts_are_capped_by_the_setting(self):
+        script = CaptureScript([FakeCapture(frames=2)])
+        _camera, worker = self._run(script)
+
+        # One connection, one retry allowed, then the next failure stops it.
+        self.assertEqual(script.opens, 2)
+        self.assertIsNotNone(worker.error)
+
+    @override_settings(COUNTER_RECONNECT_ATTEMPTS=0)
+    def test_zero_attempts_means_keep_trying(self):
+        script = CaptureScript([FakeCapture(frames=2)])
+        camera = Camera.objects.create(name="Gate", source="0")
+        worker = CounterWorker(camera)
+
+        with patch("cv2.VideoCapture", script), \
+                patch("counter.camera.MAX_READ_FAILURES", 1), \
+                patch("counter.camera.RECONNECT_BACKOFF_START", 0.01), \
+                patch("counter.camera.RECONNECT_BACKOFF_MAX", 0.01):
+            worker.start()
+            deadline = time_module.monotonic() + 5
+            while script.opens < 4 and time_module.monotonic() < deadline:
+                time_module.sleep(0.02)
+            still_trying = worker.is_alive()
+            worker.stop()
+
+        self.assertTrue(still_trying, "a camera that may come back is not given up on")
+        self.assertGreaterEqual(script.opens, 4)
+
+    def test_a_file_that_ends_is_not_reconnected_to(self):
+        camera = Camera.objects.create(name="Clip", source="/tmp/some-clip.mp4")
+        worker = CounterWorker(camera)
+        script = CaptureScript([FakeCapture(frames=3)])
+
+        with patch("cv2.VideoCapture", script):
+            worker.start()
+            worker.join(timeout=10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(worker.reconnects, 0, "a clip ending is not a fault")
+        self.assertEqual(script.opens, 1)
+        self.assertIsNone(worker.error)
+
+
+@override_settings(COUNTER_STALE_FRAME_SECONDS=30)
+class ReconnectingHealthTests(TestCase):
+    """A camera being reconnected to is degraded, not down, and says so."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0", is_active=True)
+
+    def _worker(self, reconnects=0, **kwargs):
+        worker = FakeWorker(**kwargs)
+        worker.reconnecting = True
+        worker.reconnects = reconnects
+        worker.retry_in = 8.0
+        return worker
+
+    def test_reconnecting_beats_stalled(self):
+        worker = self._worker(seconds_since_frame=120.0,
+                              error="Camera stopped returning frames.")
+        row = camera_health(self.camera, worker)
+
+        self.assertEqual(row["state"], RECONNECTING,
+                         "'stalled' hides the fact that something is being done")
+        self.assertIn("Retrying in 8s", row["detail"])
+        self.assertFalse(row["healthy"])
+
+    def test_reconnecting_is_degraded_not_down(self):
+        worker = self._worker(seconds_since_frame=120.0, error="Stream lost.")
+        rows = [camera_health(self.camera, worker)]
+        self.assertEqual(overall_status(rows), STATUS_DEGRADED)
+
+    def test_a_recovered_camera_is_ok_again(self):
+        worker = FakeWorker(seconds_since_frame=1.0)
+        worker.reconnecting = False
+        worker.reconnects = 3
+        row = camera_health(self.camera, worker)
+
+        self.assertEqual(row["state"], OK)
+        self.assertEqual(row["reconnects"], 3)
+
+
+# ---------------------------------------------------------------------------
+# keeping cameras running
+# ---------------------------------------------------------------------------
+
+class RecordingRegistry:
+    """A registry that records what it was asked to do."""
+
+    def __init__(self, workers=None):
+        self.workers = dict(workers or {})
+        self.started = []
+        self.stopped = []
+
+    def get(self, pk):
+        return self.workers.get(int(pk))
+
+    def start(self, camera):
+        self.started.append(camera.pk)
+        self.workers[camera.pk] = FakeWorker()
+        return self.workers[camera.pk]
+
+    def stop(self, pk):
+        self.stopped.append(int(pk))
+        return self.workers.pop(int(pk), None) is not None
+
+    def stats(self):
+        return [{"camera_id": pk} for pk in self.workers]
+
+
+class SupervisorReconcileTests(TestCase):
+    """What should be running is what the database says, not what was clicked."""
+
+    def setUp(self):
+        self.registry = RecordingRegistry()
+        self.supervisor = Supervisor(registry=self.registry, interval=1, cooldown=30)
+
+    def test_an_active_camera_with_no_worker_is_started(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=True)
+        result = self.supervisor.reconcile()
+
+        self.assertEqual(result.started, [camera.pk])
+        self.assertEqual((result.stopped, result.waiting), ([], []))
+
+    def test_a_running_camera_is_left_alone(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=True)
+        self.registry.workers[camera.pk] = FakeWorker(alive=True)
+
+        result = self.supervisor.reconcile()
+
+        self.assertEqual((result.started, result.stopped), ([], []),
+                         "reconciling must not restart a healthy camera")
+
+    def test_a_dead_worker_is_replaced(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=True)
+        self.registry.workers[camera.pk] = FakeWorker(alive=False)
+
+        result = self.supervisor.reconcile()
+
+        self.assertEqual(result.started, [camera.pk],
+                         "this is the post-restart case the report warns about")
+
+    def test_a_deactivated_camera_is_stopped(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=False)
+        self.registry.workers[camera.pk] = FakeWorker(alive=True)
+
+        result = self.supervisor.reconcile()
+
+        self.assertEqual(result.stopped, [camera.pk])
+        self.assertEqual(result.started, [])
+
+    def test_a_deleted_camera_is_stopped(self):
+        self.registry.workers[404] = FakeWorker(alive=True)
+
+        result = self.supervisor.reconcile()
+
+        self.assertEqual(result.stopped, [404])
+
+    def test_a_flapping_camera_waits_out_its_cooldown(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=True)
+
+        first = self.supervisor.reconcile(now=1000.0)
+        self.assertEqual(first.started, [camera.pk])
+
+        # It died again immediately.
+        self.registry.workers[camera.pk] = FakeWorker(alive=False)
+        result = self.supervisor.reconcile(now=1005.0)
+
+        self.assertEqual(result.started, [],
+                         "restarting in a tight loop helps nobody")
+        self.assertEqual(result.waiting, [camera.pk])
+
+    def test_it_restarts_once_the_cooldown_passes(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=True)
+        self.supervisor.reconcile(now=1000.0)
+        self.registry.workers[camera.pk] = FakeWorker(alive=False)
+
+        result = self.supervisor.reconcile(now=1031.0)
+
+        self.assertEqual(result.started, [camera.pk])
+        self.assertEqual(result.waiting, [])
+
+    def test_the_first_start_is_immediate(self):
+        Camera.objects.create(name="Door", source="0", is_active=True)
+        result = self.supervisor.reconcile(now=0.0)
+        self.assertEqual(len(result.started), 1)
+        self.assertEqual(result.waiting, [])
+
+
+class AutostartGuardTests(TestCase):
+    """Importing the app must not open a camera unless that was asked for."""
+
+    def _argv(self, *args):
+        return patch.object(sys, "argv", ["manage.py", *args])
+
+    @override_settings(COUNTER_AUTOSTART=False)
+    def test_off_by_default(self):
+        with self._argv("runserver", "--noreload"):
+            self.assertFalse(autostart_enabled())
+
+    @override_settings(COUNTER_AUTOSTART=True)
+    def test_on_when_asked_for(self):
+        with self._argv("runserver", "--noreload"):
+            self.assertTrue(autostart_enabled())
+
+    @override_settings(COUNTER_AUTOSTART=True)
+    def test_never_during_a_management_command(self):
+        for command in ("migrate", "test", "collectstatic", "run_counter",
+                        "supervise", "shell"):
+            with self.subTest(command=command), self._argv(command):
+                self.assertFalse(autostart_enabled(),
+                                 f"{command} must not grab a camera")
+
+    @override_settings(COUNTER_AUTOSTART=True)
+    def test_every_blocked_command_is_blocked(self):
+        for command in NO_AUTOSTART_COMMANDS:
+            with self.subTest(command=command), self._argv(command):
+                self.assertFalse(autostart_enabled())
+
+    @override_settings(COUNTER_AUTOSTART=True)
+    def test_the_reloaders_parent_process_does_not_count(self):
+        # runserver without --noreload runs the app twice. Only the child,
+        # which carries RUN_MAIN, should open cameras.
+        with self._argv("runserver"), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RUN_MAIN", None)
+            self.assertFalse(autostart_enabled())
+
+        with self._argv("runserver"), patch.dict(os.environ, {"RUN_MAIN": "true"}):
+            self.assertTrue(autostart_enabled())
+
+    @override_settings(COUNTER_AUTOSTART=True)
+    def test_a_wsgi_server_counts(self):
+        with patch.object(sys, "argv", ["gunicorn", "config.wsgi"]):
+            self.assertTrue(autostart_enabled())
+
+
+class SuperviseCommandTests(TestCase):
+    def test_once_does_a_single_pass(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=True)
+        out = StringIO()
+
+        registry = RecordingRegistry()
+        with patch("counter.management.commands.supervise.REGISTRY", registry):
+            call_command("supervise", "--once", stdout=out)
+
+        self.assertIn(f"started camera {camera.pk}", out.getvalue())
+        self.assertEqual(registry.started, [camera.pk])
+
+
+# ---------------------------------------------------------------------------
+# the fullest moment, not just the busiest day
+# ---------------------------------------------------------------------------
+
+def local_at(year, month, day, hour=0, minute=0):
+    return timezone.make_aware(
+        datetime(year, month, day, hour, minute), timezone.get_current_timezone())
+
+
+class PeakOccupancyTests(TestCase):
+    """Occupancy's high-water mark, which "inside now" cannot answer later."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.other = Camera.objects.create(name="Side", source="1")
+
+    def _cross(self, when, direction=DIRECTION_IN, camera=None):
+        return Crossing.objects.create(
+            camera=camera or self.camera, track_id=1,
+            direction=direction, occurred_at=when,
+        )
+
+    def test_peak_is_the_highest_simultaneous_count(self):
+        day = date(2026, 5, 4)
+        for minute, direction in [(0, DIRECTION_IN), (1, DIRECTION_IN),
+                                  (2, DIRECTION_IN), (3, DIRECTION_OUT),
+                                  (4, DIRECTION_OUT), (5, DIRECTION_IN)]:
+            self._cross(local_at(2026, 5, 4, 10, minute), direction)
+
+        result = peak_occupancy(start=day, end=day)
+
+        self.assertEqual(result["peak"], 3, "three were inside at 10:02")
+        self.assertEqual(result["date"], "2026-05-04")
+
+    def test_peak_records_when_it_happened(self):
+        day = date(2026, 5, 4)
+        self._cross(local_at(2026, 5, 4, 9, 0))
+        self._cross(local_at(2026, 5, 4, 11, 40))
+        self._cross(local_at(2026, 5, 4, 12, 0), DIRECTION_OUT)
+
+        result = peak_occupancy(start=day, end=day)
+
+        self.assertEqual(result["peak"], 2)
+        self.assertEqual(timezone.localtime(
+            datetime.fromisoformat(result["at"])).strftime("%H:%M"), "11:40")
+
+    def test_footfall_and_fullness_are_different_questions(self):
+        # 400 people through the door, never more than two inside at once.
+        day = date(2026, 5, 4)
+        when = local_at(2026, 5, 4, 9, 0)
+        for index in range(200):
+            self._cross(when + timedelta(seconds=index * 10), DIRECTION_IN)
+            self._cross(when + timedelta(seconds=index * 10 + 1), DIRECTION_IN)
+            self._cross(when + timedelta(seconds=index * 10 + 2), DIRECTION_OUT)
+            self._cross(when + timedelta(seconds=index * 10 + 3), DIRECTION_OUT)
+
+        rows = daily_counts(start=day, end=day)
+
+        self.assertEqual(rows[0]["in"], 400)
+        self.assertEqual(rows[0]["peak"], 2,
+                         "a busy doorway is not a full room")
+
+    def test_a_missed_exit_cannot_inflate_later_days(self):
+        # Ten in and no exits on the first day: the next day must start empty.
+        for minute in range(10):
+            self._cross(local_at(2026, 5, 4, 10, minute))
+        for minute in range(2):
+            self._cross(local_at(2026, 5, 5, 10, minute))
+
+        peaks = occupancy_peaks(start=date(2026, 5, 4), end=date(2026, 5, 5))
+
+        self.assertEqual(peaks[date(2026, 5, 4)]["peak"], 10)
+        self.assertEqual(peaks[date(2026, 5, 5)]["peak"], 2,
+                         "yesterday's ghosts must not be inside today")
+
+    def test_the_running_count_is_clamped_at_zero(self):
+        # Exits with no matching entries: a miscount, not negative occupancy.
+        day = date(2026, 5, 4)
+        self._cross(local_at(2026, 5, 4, 9, 0), DIRECTION_OUT)
+        self._cross(local_at(2026, 5, 4, 9, 1), DIRECTION_OUT)
+        self._cross(local_at(2026, 5, 4, 9, 2), DIRECTION_IN)
+
+        result = peak_occupancy(start=day, end=day)
+
+        self.assertEqual(result["peak"], 1,
+                         "a negative baseline would hide the one real arrival")
+
+    def test_late_night_utc_lands_on_the_local_date(self):
+        # 22:30 UTC on the 1st is 01:30 on the 2nd in Kuwait.
+        self._cross(datetime(2026, 3, 1, 22, 30, tzinfo=dt_timezone.utc))
+        peaks = occupancy_peaks(start=date(2026, 3, 1), end=date(2026, 3, 2))
+
+        self.assertNotIn(date(2026, 3, 1), peaks)
+        self.assertEqual(peaks[date(2026, 3, 2)]["peak"], 1)
+
+    def test_all_cameras_are_walked_together(self):
+        # One person in each door at the same time is two people inside,
+        # and each camera on its own would say one.
+        day = date(2026, 5, 4)
+        self._cross(local_at(2026, 5, 4, 10, 0), camera=self.camera)
+        self._cross(local_at(2026, 5, 4, 10, 1), camera=self.other)
+
+        self.assertEqual(peak_occupancy(start=day, end=day)["peak"], 2)
+        self.assertEqual(
+            peak_occupancy(start=day, end=day, camera=self.camera)["peak"], 1)
+
+    def test_nothing_recorded_is_a_zero_peak(self):
+        result = peak_occupancy(start=date(2026, 5, 4), end=date(2026, 5, 4))
+        self.assertEqual(result, {"peak": 0, "at": None, "date": None})
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="06:00")
+    def test_a_day_that_began_before_midnight_is_not_restarted(self):
+        # With a 06:00 reset, 02:00 belongs to the window that opened at
+        # 06:00 the day before, and those three are still inside.
+        for minute in range(3):
+            self._cross(local_at(2026, 5, 4, 20, minute))
+        self._cross(local_at(2026, 5, 5, 2, 0))
+        self._cross(local_at(2026, 5, 5, 2, 1))
+
+        peaks = occupancy_peaks(start=date(2026, 5, 5), end=date(2026, 5, 5))
+
+        self.assertEqual(peaks[date(2026, 5, 5)]["peak"], 5,
+                         "the five inside at 02:01, not just the two arrivals")
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="06:00")
+    def test_the_reset_still_empties_the_count(self):
+        for minute in range(3):
+            self._cross(local_at(2026, 5, 4, 20, minute))
+        self._cross(local_at(2026, 5, 5, 8, 0))
+
+        peaks = occupancy_peaks(start=date(2026, 5, 5), end=date(2026, 5, 5))
+
+        self.assertEqual(peaks[date(2026, 5, 5)]["peak"], 1,
+                         "08:00 is after the 06:00 reset, so it starts empty")
+
+
+class DailyPeakReportTests(TestCase):
+    """The peak travels with the per-date report and its summary."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def _cross(self, when, direction=DIRECTION_IN):
+        Crossing.objects.create(camera=self.camera, track_id=1,
+                                direction=direction, occurred_at=when)
+
+    def test_rows_carry_the_peak_and_its_time(self):
+        self._cross(local_at(2026, 5, 4, 9, 0))
+        self._cross(local_at(2026, 5, 4, 9, 30))
+
+        rows = daily_counts(start=date(2026, 5, 4), end=date(2026, 5, 4))
+
+        self.assertEqual(rows[0]["peak"], 2)
+        self.assertTrue(rows[0]["peak_at"].startswith("2026-05-04"))
+
+    def test_a_quiet_day_reads_zero_rather_than_blank(self):
+        rows = daily_counts(start=date(2026, 5, 4), end=date(2026, 5, 5))
+        self.assertEqual([r["peak"] for r in rows], [0, 0])
+        self.assertEqual([r["peak_at"] for r in rows], [None, None])
+
+    def test_the_summary_reports_the_fullest_day(self):
+        # Busiest by footfall and fullest are different days on purpose.
+        for minute in range(6):
+            self._cross(local_at(2026, 5, 4, 9, minute))
+            self._cross(local_at(2026, 5, 4, 9, minute, ) + timedelta(seconds=30),
+                        DIRECTION_OUT)
+        for minute in range(4):
+            self._cross(local_at(2026, 5, 5, 9, minute))
+
+        rows = daily_counts(start=date(2026, 5, 4), end=date(2026, 5, 5))
+        summary = summarise(rows)
+
+        self.assertEqual(summary["busiest_date"], "2026-05-04")
+        self.assertEqual(summary["busiest_in"], 6)
+        self.assertEqual(summary["peak_inside"], 4)
+        self.assertEqual(summary["peak_date"], "2026-05-05")
+
+    def test_an_empty_summary_has_a_zero_peak(self):
+        summary = summarise([])
+        self.assertEqual(summary["peak_inside"], 0)
+        self.assertIsNone(summary["peak_date"])
+
+
+class EventPeakTests(TestCase):
+    """An event's fullest moment, and capacity measured against it."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def _cross(self, when, direction=DIRECTION_IN, event=None):
+        Crossing.objects.create(camera=self.camera, track_id=1,
+                                direction=direction, occurred_at=when,
+                                event=event)
+
+    def test_peak_is_the_worst_day_not_the_sum_of_days(self):
+        event = Event.objects.create(
+            name="Three-day expo",
+            starts_at=timezone.now() - timedelta(days=3),
+            ends_at=timezone.now() + timedelta(hours=1),
+        )
+        # Ten inside at once on each of three days, all of whom leave.
+        for days_back in (3, 2, 1):
+            base = timezone.localtime() - timedelta(days=days_back)
+            for index in range(10):
+                self._cross(base + timedelta(minutes=index), event=event)
+            for index in range(10):
+                self._cross(base + timedelta(minutes=30 + index),
+                            DIRECTION_OUT, event=event)
+
+        self.assertEqual(event.totals()["in"], 30, "attendance spans the run")
+        self.assertEqual(event.peak_occupancy()["peak"], 10,
+                         "ten at once, three times over, is not thirty at once")
+
+    def test_capacity_remembers_a_breach_that_has_passed(self):
+        event = Event.objects.create(
+            name="Gallery opening",
+            starts_at=timezone.now() - timedelta(hours=2),
+            ends_at=timezone.now() + timedelta(hours=2),
+            capacity=5,
+        )
+        base = timezone.localtime() - timedelta(hours=1)
+        for index in range(6):
+            self._cross(base + timedelta(minutes=index), event=event)
+        for index in range(5):
+            self._cross(base + timedelta(minutes=30 + index),
+                        DIRECTION_OUT, event=event)
+
+        state = event.capacity_state()
+
+        self.assertEqual(state["inside"], 1)
+        self.assertEqual(state["level"], "ok", "it is comfortable now")
+        self.assertEqual(state["peak"], 6)
+        self.assertEqual(state["peak_percent"], 120.0)
+        self.assertTrue(state["breached"],
+                        "'fine when you looked' is not 'never over'")
+
+    def test_capacity_that_was_never_breached_says_so(self):
+        event = Event.objects.create(
+            name="Workshop",
+            starts_at=timezone.now() - timedelta(hours=2),
+            ends_at=timezone.now() + timedelta(hours=2),
+            capacity=50,
+        )
+        self._cross(timezone.localtime() - timedelta(minutes=10), event=event)
+
+        state = event.capacity_state()
+        self.assertFalse(state["breached"])
+        self.assertEqual(state["peak"], 1)
+
+    def test_a_camera_reports_its_own_peak_today(self):
+        now = timezone.localtime()
+        for index in range(3):
+            self._cross(now - timedelta(minutes=10 - index))
+
+        self.assertEqual(self.camera.peak_today()["peak"], 3)
+
+
+class PeakApiTests(TestCase):
+    """The peak reaches the places an operator actually looks."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def _cross(self, when, direction=DIRECTION_IN, event=None):
+        Crossing.objects.create(camera=self.camera, track_id=1,
+                                direction=direction, occurred_at=when,
+                                event=event)
+
+    def test_stats_reports_the_peak_so_far_today(self):
+        now = timezone.localtime().replace(hour=12, minute=0)
+        for index in range(4):
+            self._cross(now + timedelta(minutes=index))
+        self._cross(now + timedelta(minutes=10), DIRECTION_OUT)
+
+        payload = self.client.get("/api/v1/stats/").json()
+
+        self.assertEqual(payload["today"]["peak"]["peak"], 4)
+        self.assertIsNotNone(payload["today"]["peak"]["at"])
+
+    def test_the_running_event_reports_its_peak(self):
+        event = make_event(name="Expo", offset_hours=-1, duration_hours=4,
+                           capacity=3)
+        base = timezone.localtime() - timedelta(minutes=30)
+        for index in range(4):
+            self._cross(base + timedelta(minutes=index), event=event)
+        for index in range(4):
+            self._cross(base + timedelta(minutes=10 + index),
+                        DIRECTION_OUT, event=event)
+
+        payload = self.client.get("/api/v1/events/current/").json()
+        card = payload["events"][0]
+
+        self.assertEqual(card["peak"]["peak"], 4)
+        self.assertEqual(card["attendance"]["inside"], 0)
+        self.assertTrue(card["capacity"]["breached"])
+
+    def test_the_csv_carries_the_peak_columns(self):
+        self._cross(local_at(2026, 5, 4, 9, 0))
+        self._cross(local_at(2026, 5, 4, 9, 5))
+
+        response = self.client.get(
+            "/api/v1/daily/?start=2026-05-04&end=2026-05-04&format=csv")
+        body = response.content.decode()
+        header, first = body.splitlines()[0], body.splitlines()[1]
+
+        self.assertEqual(header, "date,in,out,net,peak_inside,peak_at")
+        self.assertIn(",2,", first)
+
+
+class SourceClassificationTests(TestCase):
+    """A stream URL is a live camera, not a file that ends.
+
+    Getting this backwards is quiet and expensive: running out of frames
+    would be filed as "the clip finished", which is a healthy state, so an
+    IP camera dropping off the network at 10:20 would be reported as fine
+    and never reconnected to.
+    """
+
+    def test_a_webcam_index_is_live(self):
+        self.assertFalse(is_file_source(0))
+        self.assertFalse(is_file_source(2))
+
+    def test_a_path_is_a_file(self):
+        self.assertTrue(is_file_source("/tmp/walk.mp4"))
+        self.assertTrue(is_file_source("clips/door.avi"))
+
+    def test_an_rtsp_camera_is_live(self):
+        self.assertFalse(is_file_source("rtsp://10.0.0.8:554/stream1"))
+
+    def test_an_http_camera_is_live(self):
+        self.assertFalse(is_file_source("http://10.0.0.8:8080/video"))
+
+    def test_the_worker_agrees(self):
+        live = Camera.objects.create(name="IP cam", source="rtsp://10.0.0.8/s")
+        clip = Camera.objects.create(name="Clip", source="/tmp/walk.mp4")
+
+        self.assertFalse(CounterWorker(live).is_file)
+        self.assertTrue(CounterWorker(clip).is_file)
+
+
+@override_settings(COUNTER_STALE_FRAME_SECONDS=30)
+class StreamFailureIsNotAFinishedClipTests(TestCase):
+    """An IP camera that stops must never be reported as healthy."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(
+            name="IP cam", source="rtsp://10.0.0.8/s", is_active=True)
+
+    def test_a_dead_stream_worker_is_a_fault(self):
+        worker = FakeWorker(alive=False, frames_read=5000,
+                            error="Camera stopped returning frames.",
+                            is_file=False)
+        row = camera_health(self.camera, worker)
+
+        self.assertEqual(row["state"], FAILED)
+        self.assertFalse(row["healthy"],
+                         "a stream running out is not a clip finishing")
+
+
+class SupervisorFinishedClipTests(TestCase):
+    """A file that played out is not a camera to revive."""
+
+    def setUp(self):
+        self.registry = RecordingRegistry()
+        self.supervisor = Supervisor(registry=self.registry, cooldown=0)
+
+    def test_a_finished_clip_is_left_finished(self):
+        camera = Camera.objects.create(
+            name="Demo clip", source="/tmp/walk.avi", is_active=True)
+        self.registry.workers[camera.pk] = FakeWorker(
+            alive=False, is_file=True, frames_read=400, error=None)
+
+        result = self.supervisor.reconcile()
+
+        self.assertEqual(result.started, [],
+                         "replaying a clip on a timer invents visitors")
+        self.assertEqual(result.finished, [camera.pk])
+
+    def test_a_clip_that_failed_is_still_restarted(self):
+        camera = Camera.objects.create(
+            name="Demo clip", source="/tmp/walk.avi", is_active=True)
+        self.registry.workers[camera.pk] = FakeWorker(
+            alive=False, is_file=True, frames_read=0,
+            error="Could not open video source")
+
+        result = self.supervisor.reconcile()
+
+        self.assertEqual(result.started, [camera.pk])
+        self.assertEqual(result.finished, [])
+
+    def test_a_live_camera_that_stopped_is_restarted(self):
+        camera = Camera.objects.create(
+            name="IP cam", source="rtsp://10.0.0.8/s", is_active=True)
+        self.registry.workers[camera.pk] = FakeWorker(
+            alive=False, is_file=False, frames_read=9000,
+            error="Camera stopped returning frames.")
+
+        result = self.supervisor.reconcile()
+
+        self.assertEqual(result.started, [camera.pk],
+                         "a live camera never 'finishes' on its own")
+
+
+class OpenFailureHintTests(TestCase):
+    """The advice must match the kind of source that failed."""
+
+    def _error_for(self, source):
+        camera = Camera.objects.create(name="X", source=source)
+        worker = CounterWorker(camera)
+        with patch("cv2.VideoCapture", lambda _s: FakeCapture(opened=False)):
+            self.assertIsNone(worker._open())
+        return worker.error
+
+    def test_a_webcam_mentions_permissions(self):
+        self.assertIn("Privacy & Security", self._error_for("0"))
+
+    def test_a_file_mentions_the_file(self):
+        message = self._error_for("/tmp/walk.mp4")
+        self.assertIn("file exists", message)
+        self.assertNotIn("Privacy & Security", message)
+
+    def test_a_network_camera_mentions_the_network(self):
+        message = self._error_for("rtsp://10.0.0.8/s")
+        self.assertIn("reachable on the network", message)
+        self.assertNotIn("Privacy & Security", message,
+                         "camera permissions have nothing to do with RTSP")

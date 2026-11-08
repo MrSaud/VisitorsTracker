@@ -183,6 +183,122 @@ building is reliably empty; the error can then never exceed one day's worth.
 - Anyone still inside across the reset is not carried over. If your site
   genuinely operates overnight, set the reset to its quietest hour.
 
+## Peak occupancy
+
+`inside` answers "how many are in the room **now**", which is no use the
+morning after. A hall can breach its capacity at 11:40 and read comfortably
+by the time anyone looks — the figure that matters afterwards is the
+high-water mark.
+
+Every report carries it. From a seeded week:
+
+| Date | In | Out | Peak |
+|---|---|---|---|
+| 2026-11-02 | 30 | 30 | **13** |
+| 2026-11-08 | 46 | 44 | **46** |
+
+Similar footfall, completely different crowding: on the 2nd people trickled
+through, on the 8th they all came at once. Footfall alone cannot tell those
+apart.
+
+It is walked from the crossing log — plus one for an entry, minus one for an
+exit — with two deliberate rules:
+
+- The running count **resets at the daily boundary** and is clamped at zero,
+  exactly as `occupancy` is, so a missed exit cannot inflate every later day.
+- Peaks are bucketed by the date the crossing happened on, so the column
+  lines up with the `in`/`out` beside it even when the reset is not midnight.
+
+A multi-day event is therefore the **worst day**, not the sum of its
+mornings: ten inside at once on each of three days is a peak of 10, not 30.
+
+Where it shows up:
+
+- `stats.today.peak` — the `Peak today` tile.
+- `events[].peak` and `capacity.peak` / `peak_percent` / `breached` — the
+  event card shows a red mark on the capacity bar at the level reached, so
+  an almost-empty bar cannot imply the room was never full.
+- `daily[].peak` and `summary.peak_inside` — the per-date table and CSV.
+
+`capacity.breached` is worth alerting on. "Fine when you looked" is not the
+same as "never over".
+
+## Staying up
+
+Counting that needs somebody to press Start is counting that will be missing
+after a power cut. Three separate things can stop it, and each has its own
+answer.
+
+### The source drops
+
+RTSP streams drop for ordinary reasons: a network blip, a switch hiccup, the
+camera rebooting its firmware. The worker reconnects on its own, waiting 1s,
+2s, 4s … up to 30s between attempts, and **never gives up** by default
+(`COUNTER_RECONNECT_ATTEMPTS=0`). Set a number to stop trying after that many
+consecutive failures.
+
+Across the gap the counting session continues — `in`/`out` keep their values
+— but **every track is thrown away**. This matters: the scene moved on while
+we were away, and a surviving track would be matched to whoever now stands
+nearest, recording a crossing from one side to the other that nobody made.
+Tests cover both halves: the same walk past the line counts 1 when the stream
+is continuous and 0 when the stream dropped in the middle.
+
+While reconnecting, health reports `reconnecting` (degraded, not down) with
+the reason and the time until the next attempt.
+
+> A **URL source is live, a path is a file.** Running out of frames is a
+> normal finish for a clip and a fault for a camera, so getting this backwards
+> would file a dead IP camera as healthy and never reconnect to it.
+
+### The process goes away
+
+Workers live in the process that started them, so a restart takes all of them
+with it, and `/api/v1/health/` reports `offline` — correct, but after the
+fact. With autostart the server brings up every active camera itself:
+
+```bash
+COUNTER_AUTOSTART=1 .venv/bin/python manage.py runserver 0.0.0.0:8000 --noreload
+```
+
+A supervisor thread then re-checks every `COUNTER_SUPERVISE_INTERVAL` seconds
+(default 10) and reconciles what is running against what the database says:
+
+- an active camera with no live worker is started;
+- a deactivated or deleted camera is stopped;
+- a camera that keeps dying is left alone for 30s between restarts, so a
+  broken configuration cannot spin;
+- a **video file that played to its end is left finished** — replaying a demo
+  clip on a timer would invent visitors for ever.
+
+Autostart is off by default, and never runs under `migrate`, `test`,
+`run_counter` and the rest, nor in the reloader's parent process. Importing
+the app should not take hold of a camera.
+
+To keep counting in a process of its own instead:
+
+```bash
+.venv/bin/python manage.py supervise
+```
+
+Pick **one** home for counting — the server with autostart, or `supervise`.
+Workers are per-process, so the dashboard's Start button acts on the server's
+workers, and two processes would fight over the device.
+
+### The machine reboots
+
+`deploy/com.visitorstracker.counter.plist` is a launchd agent that starts the
+server at login with autostart on, and restarts it if it exits:
+
+```bash
+sed 's|__PROJECT__|'"$PWD"'|g' deploy/com.visitorstracker.counter.plist \
+  > ~/Library/LaunchAgents/com.visitorstracker.counter.plist
+launchctl load -w ~/Library/LaunchAgents/com.visitorstracker.counter.plist
+```
+
+It must be a **LaunchAgent, not a LaunchDaemon**: macOS grants camera access
+per user, and a daemon running as root gets no camera at all.
+
 ## Authentication
 
 Reads are open by default so a wall display needs no credential. Anything
@@ -223,6 +339,9 @@ All of these are environment variables:
 | `COUNTER_FRAME_WIDTH` | `640` | Frames are downscaled to this width before detection |
 | `COUNTER_OCCUPANCY_RESET_AT` | `00:00` | Local time occupancy returns to zero |
 | `COUNTER_STALE_FRAME_SECONDS` | `30` | No frame for this long means stalled |
+| `COUNTER_RECONNECT_ATTEMPTS` | `0` | Consecutive reconnection attempts before giving up on a live camera. `0` means never give up |
+| `COUNTER_AUTOSTART` | `0` | `1` starts every active camera with the server and keeps them running |
+| `COUNTER_SUPERVISE_INTERVAL` | `10` | Seconds between supervisor checks |
 | `COUNTER_TRACKER` | `sort` | `sort` or `centroid` |
 | `COUNTER_API_TOKEN` | *(unset)* | Shared token for machine write access |
 | `COUNTER_PUBLIC_READS` | `1` | `0` requires auth for reads as well |
@@ -236,7 +355,7 @@ All of these are environment variables:
 | `GET` | `/api/v1/events/<id>/` | One event, with its hourly profile |
 | `GET` | `/api/v1/health/` | Whether cameras are working — see [Health](#health) |
 | `GET` | `/api/v1/stats/` | Totals across all cameras, plus per-camera detail |
-| `GET` | `/api/v1/daily/` | Crossings per date — see [Visitors per date](#visitors-per-date) |
+| `GET` | `/api/v1/daily/` | Crossings per date and daily peaks — see [Visitors per date](#visitors-per-date) |
 | `GET` | `/api/v1/hourly/` | Arrivals by hour of day — see [Busiest hours](#busiest-hours) |
 | `GET` | `/api/v1/cameras/` | List cameras |
 | `GET` | `/api/v1/cameras/<id>/` | One camera |
@@ -310,8 +429,11 @@ Response:
   "start": "2026-11-02", "end": "2026-11-08",
   "summary": {"in": 190, "out": 157, "net": 33,
               "busiest_date": "2026-11-02", "busiest_in": 42,
-              "days": 7, "daily_average_in": 27.14},
-  "days": [{"date": "2026-11-02", "in": 42, "out": 34, "net": 8}]
+              "days": 7, "daily_average_in": 27.14,
+              "peak_inside": 46, "peak_date": "2026-11-08",
+              "peak_at": "2026-11-08T20:13:09+03:00"},
+  "days": [{"date": "2026-11-02", "in": 42, "out": 34, "net": 8,
+            "peak": 13, "peak_at": "2026-11-02T09:24:00+03:00"}]
 }
 ```
 
@@ -322,6 +444,9 @@ Two things worth knowing:
   local belongs to that day, not to the previous UTC one.
 - **Quiet days are included as zeros** rather than omitted, so a chart or
   spreadsheet does not silently skip them.
+- **`peak` is the fullest moment of that day**, not its footfall — see
+  [Peak occupancy](#peak-occupancy). `busiest_date` and `peak_date` answer
+  different questions and are often different days.
 
 Remember that `in` counts *entry crossings*, not distinct people — someone
 entering three times adds three. See the note on identity under
@@ -382,6 +507,7 @@ python manage.py check_health
 |---|---|---|
 | `ok` | Alive and delivering frames | ✅ |
 | `stalled` | Alive, but no frame for `COUNTER_STALE_FRAME_SECONDS` (default 30) | ❌ |
+| `reconnecting` | Lost the source and trying to get it back — see [Staying up](#staying-up) | ❌ |
 | `failed` | Stopped with an error — the reason is reported | ❌ |
 | `offline` | Marked active, but nothing is running. The post-restart case | ❌ |
 | `disabled` | Not active, so nothing is expected | ✅ |
@@ -475,14 +601,19 @@ python manage.py run_counter --camera 1 --seconds 60
 python manage.py run_counter --source clip.mp4 --name "Test clip"
 ```
 
+`run_counter` runs what you name and exits when it ends. For an unattended
+deployment use `supervise`, which also restarts what stops — see
+[Staying up](#staying-up).
+
 ## Tests
 
 ```bash
 python manage.py test
 ```
 
-224 tests covering tracker identity through crossings and occlusion,
-event scoping and attribution,
+286 tests covering tracker identity through crossings and occlusion,
+event scoping and attribution, reconnection after a dropped stream,
+supervisor reconciliation and peak occupancy,
 assignment optimality against brute force, line-crossing direction, the dead
 band,
 the YOLOv8 output decoding, line-setup suggestions, local-date and local-hour
@@ -495,6 +626,7 @@ automatically when it has not been exported.
 
 - Workers live in the web server process, so `runserver --noreload` (or a
   single Gunicorn worker) keeps one set of cameras. Across multiple Gunicorn
-  workers each process would open its own capture; run counting as a separate
-  `run_counter` process in that case.
+  workers each process would open its own capture and the supervisor would
+  run in each of them; use one worker, or move counting to `supervise`.
+- `logs/` is where the launchd agent writes; it is gitignored.
 - `db.sqlite3` is gitignored — run `migrate` after cloning.

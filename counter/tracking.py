@@ -285,6 +285,15 @@ class SortTracker:
             candidate.place(candidate.kalman.predict())
         return self.tracks
 
+    def forget_tracks(self):
+        """Drop every track, keeping the id counter.
+
+        See :meth:`counter.vision.CentroidTracker.forget_tracks`: the
+        Kalman state of a track from before a stream gap is worse than no
+        state at all.
+        """
+        self._candidates.clear()
+
     def update_detections(self, detections):
         """Common interface, shared with CentroidTracker."""
         return self.update(detections)

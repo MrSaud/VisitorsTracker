@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keeps VisitorsTracker counting across reboots and crashes.
+
+  launchd starts the server, the server starts every active camera
+  (COUNTER_AUTOSTART=1) and restarts any that stop, and each worker
+  reconnects to its own source when a stream drops. Between them, nothing
+  short of the machine being off leaves an event uncounted.
+
+  Install (replace the path with your own checkout):
+
+      sed 's|__PROJECT__|'"$HOME"'/Desktop/DjangoLab/VisitorsTracker|g' \
+        deploy/com.visitorstracker.counter.plist \
+        > ~/Library/LaunchAgents/com.visitorstracker.counter.plist
+      launchctl load -w ~/Library/LaunchAgents/com.visitorstracker.counter.plist
+
+  A LaunchAgent runs as the logged-in user, which is what a camera needs:
+  macOS grants camera access per user, and a LaunchDaemon running as root
+  gets no camera at all.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.visitorstracker.counter</string>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT__/.venv/bin/python</string>
+    <string>__PROJECT__/manage.py</string>
+    <string>runserver</string>
+    <string>0.0.0.0:8000</string>
+    <!-- The reloader would run the app twice and is pointless here. -->
+    <string>--noreload</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Start the active cameras, and keep them started. -->
+    <key>COUNTER_AUTOSTART</key>
+    <string>1</string>
+    <!-- Never stop trying to reach a camera that is down. -->
+    <key>COUNTER_RECONNECT_ATTEMPTS</key>
+    <string>0</string>
+    <!-- Set these for a real deployment rather than leaving the defaults. -->
+    <key>DJANGO_DEBUG</key>
+    <string>0</string>
+    <key>DJANGO_SECRET_KEY</key>
+    <string>__CHANGE_ME__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart the process if it exits for any reason. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Do not hammer a configuration that cannot start. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT__/logs/counter.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT__/logs/counter.err.log</string>
+</dict>
+</plist>

@@ -130,6 +130,24 @@ COUNTER_MAX_DISAPPEARED = int(os.environ.get("COUNTER_MAX_DISAPPEARED", "25"))
 # "centroid" (nearest-distance, kept as a fallback).
 COUNTER_TRACKER = os.environ.get("COUNTER_TRACKER", "sort")
 
+# Consecutive reconnection attempts before a live camera is given up on.
+# 0 means never give up: a stream that is down for an hour is still the
+# camera you want counting when it comes back. The wait doubles from 1s to
+# 30s between attempts, so a camera that will never work costs two log
+# lines a minute rather than a busy loop.
+COUNTER_RECONNECT_ATTEMPTS = int(os.environ.get("COUNTER_RECONNECT_ATTEMPTS", "0"))
+
+# Start every active camera when the server starts, and restart any that
+# stop. Without this, counting does not resume after a reboot or a restart
+# until somebody presses Start. Off by default: importing the app should
+# not take hold of a camera, and it would fight "manage.py run_counter"
+# over the device.
+COUNTER_AUTOSTART = os.environ.get("COUNTER_AUTOSTART", "0") == "1"
+
+# How often the supervisor checks that the right cameras are running.
+COUNTER_SUPERVISE_INTERVAL = float(
+    os.environ.get("COUNTER_SUPERVISE_INTERVAL", "10"))
+
 # A worker with no new frame for this long is reported as stalled. A frozen
 # stream otherwise looks identical to a healthy one.
 COUNTER_STALE_FRAME_SECONDS = float(

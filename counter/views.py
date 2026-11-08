@@ -26,8 +26,10 @@ from .reports import (
     busiest_hours,
     daily_counts,
     hourly_profile,
+    local_today,
     opening_span,
     parse_date,
+    peak_occupancy,
     resolve_range,
     summarise,
     weekday_hour_matrix,
@@ -190,6 +192,7 @@ def camera_reset(request, camera_id: int):
 
 @api_view(["GET"])
 def overall_stats(request):
+    today = local_today()
     cameras = Camera.objects.all()
     per_camera = [_camera_payload(c, REGISTRY.get(c.pk)) for c in cameras]
     total_in = sum(c["totals"]["in"] for c in per_camera)
@@ -225,6 +228,10 @@ def overall_stats(request):
             "today": {
                 "in": sum(c["today"]["in"] for c in per_camera),
                 "out": sum(c["today"]["out"] for c in per_camera),
+                # Walked across all cameras together, not summed per camera:
+                # two entrances busy at different times do not make one
+                # bigger crowd.
+                "peak": peak_occupancy(start=today, end=today),
             },
             "running_cameras": sum(1 for c in per_camera if c["running"]),
             "cameras": per_camera,
@@ -298,9 +305,10 @@ def daily_report(request):
             f'attachment; filename="visitors_{label}.csv"'
         )
         writer = csv.writer(response)
-        writer.writerow(["date", "in", "out", "net"])
+        writer.writerow(["date", "in", "out", "net", "peak_inside", "peak_at"])
         for row in rows:
-            writer.writerow([row["date"], row["in"], row["out"], row["net"]])
+            writer.writerow([row["date"], row["in"], row["out"], row["net"],
+                             row["peak"], row["peak_at"] or ""])
         return response
 
     return Response({
@@ -408,6 +416,7 @@ def health(request):
 def _event_payload(event, now=None):
     now = now or timezone.now()
     running = event.is_running(now)
+    peak = event.peak_occupancy()
     payload = {
         "id": event.pk,
         "name": event.name,
@@ -419,7 +428,8 @@ def _event_payload(event, now=None):
         "cameras": [{"id": c.pk, "name": c.name} for c in event.cameras.all()],
         "covers_all_cameras": not event.cameras.exists(),
         "attendance": event.totals(),
-        "capacity": event.capacity_state(),
+        "peak": peak,
+        "capacity": event.capacity_state(peak=peak),
         "notes": event.notes,
     }
     if running:

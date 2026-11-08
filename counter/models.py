@@ -100,6 +100,17 @@ class Camera(models.Model):
             "event_name": event.name if event else None,
         }
 
+    def peak_today(self):
+        """The fullest moment so far today on this camera.
+
+        Lives here for symmetry with :meth:`occupancy`, but the walk itself
+        is in :mod:`counter.reports`; imported late because reports needs
+        this module.
+        """
+        from .reports import peak_occupancy
+
+        return peak_occupancy(camera=self, days=1)
+
     def totals_today(self):
         start = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
         rows = (
@@ -197,12 +208,33 @@ class Event(models.Model):
             "net": total_in - total_out,
         }
 
-    def capacity_state(self):
-        """How full it is, when a capacity has been set."""
+    def peak_occupancy(self):
+        """The fullest single moment of the event.
+
+        Attendance says how many came; this says how many were in at once,
+        which is the figure a capacity, a floor plan or a safety officer is
+        actually about. Counted per day and maxed across them, so a
+        multi-day event is not the sum of its mornings.
+        """
+        from .reports import peak_occupancy
+
+        return peak_occupancy(
+            start=timezone.localtime(self.starts_at).date(),
+            end=timezone.localtime(self.ends_at).date(),
+            event=self,
+        )
+
+    def capacity_state(self, peak=None):
+        """How full it is, when a capacity has been set.
+
+        ``peak`` may be passed in by a caller that has already walked the
+        crossings, so a payload carrying both does not walk them twice.
+        """
         if not self.capacity:
             return None
         inside = self.totals()["inside"]
         share = inside / self.capacity
+        peak = peak or self.peak_occupancy()
         if share >= 1.0:
             level = "over"
         elif share >= 0.9:
@@ -215,6 +247,13 @@ class Event(models.Model):
             "percent": round(share * 100, 1),
             "level": level,
             "remaining": max(0, self.capacity - inside),
+            # Whether it was ever breached, not just whether it is now.
+            # "We were fine when you looked" is not the same as "we were
+            # never over".
+            "peak": peak["peak"],
+            "peak_at": peak["at"],
+            "peak_percent": round(peak["peak"] / self.capacity * 100, 1),
+            "breached": peak["peak"] >= self.capacity,
         }
 
 

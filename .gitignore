@@ -17,3 +17,6 @@ media/
 counter/ml_models/*.onnx
 counter/ml_models/*.pt
 counter/ml_models/people.jpg
+
+# launchd writes here
+logs/
