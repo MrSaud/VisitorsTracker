@@ -18,6 +18,10 @@
     --accent: #ffd54f;
   }
   * { box-sizing: border-box; }
+  /* An author "display" beats the browser's [hidden] rule, so hiding a
+     panel from script would otherwise leave an empty coloured box behind.
+     Seen with the health banner on a dashboard with nothing wrong. */
+  [hidden] { display: none !important; }
   body {
     margin: 0;
     background: var(--bg);
