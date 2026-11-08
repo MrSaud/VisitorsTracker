@@ -3,6 +3,7 @@
 from django.db import models
 from django.utils import timezone
 
+from .daywindow import occupancy_window_start
 from .vision import DIRECTION_IN, DIRECTION_OUT, HORIZONTAL, VERTICAL
 
 
@@ -53,19 +54,34 @@ class Camera(models.Model):
 
     # -- derived counts ---------------------------------------------------
 
-    def totals(self):
-        rows = (
-            self.events.values("direction")
-            .order_by()
-            .annotate(total=models.Count("id"))
-        )
+    def _direction_counts(self, queryset):
+        rows = queryset.values("direction").order_by().annotate(
+            total=models.Count("id"))
         counts = {row["direction"]: row["total"] for row in rows}
-        total_in = counts.get(DIRECTION_IN, 0)
-        total_out = counts.get(DIRECTION_OUT, 0)
+        return counts.get(DIRECTION_IN, 0), counts.get(DIRECTION_OUT, 0)
+
+    def totals(self):
+        """Lifetime crossings. Footfall, not occupancy."""
+        total_in, total_out = self._direction_counts(self.events)
+        return {"in": total_in, "out": total_out}
+
+    def occupancy(self):
+        """How many are inside now, counted from the daily reset.
+
+        ``net`` is reported unclamped alongside ``inside``: a persistently
+        negative net means exits outnumber entries, which is a sign the
+        camera direction is inverted rather than a sign of an empty room.
+        """
+        since = occupancy_window_start()
+        total_in, total_out = self._direction_counts(
+            self.events.filter(occurred_at__gte=since))
+        net = total_in - total_out
         return {
             "in": total_in,
             "out": total_out,
-            "inside": max(0, total_in - total_out),
+            "inside": max(0, net),
+            "net": net,
+            "since": since.isoformat(),
         }
 
     def totals_today(self):

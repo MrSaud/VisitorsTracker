@@ -56,6 +56,7 @@
   .v-in { color: var(--in); }
   .v-out { color: var(--out); }
   .v-inside { color: var(--inside); }
+  .tile .note { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .cameras { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
   .camera {
     background: var(--panel);
@@ -106,6 +107,7 @@
   button:disabled { opacity: 0.45; cursor: not-allowed; }
   button.primary { background: #1f6f43; border-color: #2a8d56; }
   button.danger { background: #6f2a2a; border-color: #8d3a3a; }
+  .controls.read-only { color: var(--muted); font-size: 12.5px; }
   .pill {
     font-size: 11px;
     padding: 3px 9px;
@@ -228,7 +230,7 @@
   <section class="totals">
     <div class="tile"><div class="label">Total in</div><div class="value v-in" id="t-in">&mdash;</div></div>
     <div class="tile"><div class="label">Total out</div><div class="value v-out" id="t-out">&mdash;</div></div>
-    <div class="tile"><div class="label">Inside now</div><div class="value v-inside" id="t-inside">&mdash;</div></div>
+    <div class="tile"><div class="label">Inside now</div><div class="value v-inside" id="t-inside">&mdash;</div><div class="note" id="t-inside-note"></div></div>
     <div class="tile"><div class="label">Today in</div><div class="value" id="t-today">&mdash;</div></div>
     <div class="tile"><div class="label">Cameras running</div><div class="value" id="t-running">&mdash;</div></div>
   </section>
@@ -278,7 +280,7 @@
       </div>
 
       <div class="viewport" data-role="viewport">
-        <div class="placeholder" data-role="placeholder">Not running &mdash; press Start to open this camera.</div>
+        <div class="placeholder" data-role="placeholder">Not running{% if can_operate %} &mdash; press Start to open this camera{% endif %}.</div>
       </div>
 
       <div class="error" data-role="error" hidden></div>
@@ -289,11 +291,17 @@
         <div><div class="label">Inside</div><div class="value v-inside" data-role="inside">&mdash;</div></div>
       </div>
 
+      {% if can_operate %}
       <div class="controls">
         <button class="primary" data-action="start">Start</button>
         <button data-action="stop">Stop</button>
         <button class="danger" data-action="reset">Reset counts</button>
       </div>
+      {% else %}
+      <div class="controls read-only">
+        Read-only &mdash; <a href="/admin/login/?next=/">sign in</a> to control cameras.
+      </div>
+      {% endif %}
 
       <div class="meta" data-role="meta"></div>
     </article>
@@ -310,6 +318,10 @@
 
 <script>
 const CSRF = "{{ csrf_token }}";
+const CAN_OPERATE = {% if can_operate %}true{% else %}false{% endif %};
+const IDLE_TEXT = CAN_OPERATE
+  ? "Not running — press Start to open this camera."
+  : "Not running.";
 const POLL_MS = 2000;
 
 async function postJSON(url) {
@@ -353,7 +365,7 @@ function applyCamera(card, data) {
 
   setText(card, "in", data.totals.in);
   setText(card, "out", data.totals.out);
-  setText(card, "inside", data.totals.inside);
+  setText(card, "inside", data.occupancy.inside);
 
   if (data.running) {
     pill.textContent = "running";
@@ -362,7 +374,7 @@ function applyCamera(card, data) {
   } else {
     pill.textContent = "stopped";
     pill.classList.remove("on");
-    if (!card.dataset.starting) hideStream(card, "Not running — press Start to open this camera.");
+    if (!card.dataset.starting) hideStream(card, IDLE_TEXT);
   }
 
   const live = data.live;
@@ -386,8 +398,10 @@ function applyCamera(card, data) {
     setText(card, "meta", "");
   }
 
-  card.querySelector('[data-action="start"]').disabled = data.running;
-  card.querySelector('[data-action="stop"]').disabled = !data.running;
+  const startButton = card.querySelector('[data-action="start"]');
+  const stopButton = card.querySelector('[data-action="stop"]');
+  if (startButton) startButton.disabled = data.running;
+  if (stopButton) stopButton.disabled = !data.running;
 }
 
 async function refresh() {
@@ -398,7 +412,9 @@ async function refresh() {
 
     document.getElementById("t-in").textContent = data.totals.in;
     document.getElementById("t-out").textContent = data.totals.out;
-    document.getElementById("t-inside").textContent = data.totals.inside;
+    document.getElementById("t-inside").textContent = data.occupancy.inside;
+    const resetNote = document.getElementById("t-inside-note");
+    if (resetNote) resetNote.textContent = `since ${data.occupancy.resets_at}`;
     document.getElementById("t-today").textContent = data.today.in;
     document.getElementById("t-running").textContent = data.running_cameras;
 

@@ -49,8 +49,15 @@ REST_FRAMEWORK = {
     # ?format=csv. JSON is the only renderer configured, so that mechanism
     # buys nothing; release the parameter for the reports to use.
     "URL_FORMAT_OVERRIDE": None,
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "counter.authentication.StaticTokenAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    # Reads are open; anything that changes state needs a staff session or
+    # the service token. Resetting counts deletes history, so it must not
+    # be reachable by anyone who can merely reach the host.
     "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.AllowAny",
+        "counter.permissions.IsOperatorOrReadOnly",
     ],
 }
 
@@ -118,6 +125,19 @@ COUNTER_DETECT_EVERY = int(os.environ.get("COUNTER_DETECT_EVERY", "3"))
 
 # Frames a track may go unseen before it is dropped.
 COUNTER_MAX_DISAPPEARED = int(os.environ.get("COUNTER_MAX_DISAPPEARED", "25"))
+
+# Shared token for machine clients: Authorization: Token <value>.
+# Unset means no machine client can write; staff sessions still can.
+COUNTER_API_TOKEN = os.environ.get("COUNTER_API_TOKEN", "")
+
+# Whether unauthenticated callers may read stats and reports.
+COUNTER_PUBLIC_READS = os.environ.get("COUNTER_PUBLIC_READS", "1") == "1"
+
+# Local time of day at which occupancy returns to zero, as "HH:MM".
+# Occupancy is counted from this boundary rather than from all history: a
+# missed exit is never corrected, so an all-time (in - out) drifts upward
+# forever. Set this to when the building is reliably empty.
+COUNTER_OCCUPANCY_RESET_AT = os.environ.get("COUNTER_OCCUPANCY_RESET_AT", "00:00")
 
 # Width frames are resized to before detection (smaller = faster).
 COUNTER_FRAME_WIDTH = int(os.environ.get("COUNTER_FRAME_WIDTH", "640"))

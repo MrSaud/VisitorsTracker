@@ -53,7 +53,6 @@ rather than failing silently.
 
 Tracks are positional and short-lived, so the same person returning later is
 a new track and counts again: **`in` is entry crossings, not unique people**.
-Occupancy (`inside`) is unaffected, being in minus out.
 
 The dead band (`LineCounter.margin`) is what stops someone loitering on the
 line from racking up counts. Set `invert_direction` on a camera if in and out
@@ -89,6 +88,58 @@ right default for a real entrance, and still has headroom well beyond camera
 frame rates. A missing or corrupt model never stops the cameras — the loader
 logs a warning and uses HOG.
 
+## Occupancy and the daily reset
+
+`inside` is **not** all-time `in - out`. Every counter misses some crossings,
+and a missed exit is never corrected, so an all-time figure drifts upward
+forever:
+
+| Missed exits | After 1 week | After 30 days |
+|---|---|---|
+| 1% | reads 21 | reads 90 |
+| 3% | reads 63 | reads 270 |
+| 5% | reads 105 | reads 450 |
+
+…at 300 visitors a day, with the building empty. Within a month the headline
+number would be pure accumulated error.
+
+So occupancy is counted from the most recent daily reset, set by
+`COUNTER_OCCUPANCY_RESET_AT` (default `00:00`). Point it at a time the
+building is reliably empty; the error can then never exceed one day's worth.
+
+- `totals` stays lifetime footfall, which is what you want for reporting.
+- `occupancy.inside` is clamped at zero, but `occupancy.net` is reported
+  unclamped alongside it. A persistently negative net means exits outnumber
+  entries, which indicates a reversed camera rather than an empty room.
+- Anyone still inside across the reset is not carried over. If your site
+  genuinely operates overnight, set the reset to its quietest hour.
+
+## Authentication
+
+Reads are open by default so a wall display needs no credential. Anything
+that changes state — starting or stopping a camera, and especially
+`reset`, which deletes history — requires an operator.
+
+Two ways to be one:
+
+```bash
+# 1. A staff session, for humans. The dashboard shows controls only to staff.
+python manage.py createsuperuser
+
+# 2. A shared token, for machines.
+export COUNTER_API_TOKEN='a-long-random-value'
+curl -X POST -H 'Authorization: Token a-long-random-value' \
+     http://127.0.0.1:8000/api/v1/cameras/1/stop/
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `COUNTER_API_TOKEN` | *(unset)* | Shared token for machine clients. Unset means no machine client can write; staff sessions still can |
+| `COUNTER_PUBLIC_READS` | `1` | Set to `0` to require authentication for reads and the video stream too |
+
+An unset `COUNTER_API_TOKEN` rejects every token rather than accepting any,
+so a missing environment variable fails closed.
+
 ## Tuning
 
 All of these are environment variables:
@@ -101,6 +152,9 @@ All of these are environment variables:
 | `COUNTER_DETECT_EVERY` | `3` | Detect on every Nth frame |
 | `COUNTER_MAX_DISAPPEARED` | `25` | Frames a track survives unseen |
 | `COUNTER_FRAME_WIDTH` | `640` | Frames are downscaled to this width before detection |
+| `COUNTER_OCCUPANCY_RESET_AT` | `00:00` | Local time occupancy returns to zero |
+| `COUNTER_API_TOKEN` | *(unset)* | Shared token for machine write access |
+| `COUNTER_PUBLIC_READS` | `1` | `0` requires auth for reads as well |
 
 ## API
 
@@ -228,9 +282,9 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 python manage.py test
 ```
 
-81 tests covering tracker identity, line-crossing direction, the dead band,
-the YOLOv8 output decoding, line-setup suggestions, local-date bucketing and
-the API. Most use a stub detector, so they need
+104 tests covering tracker identity, line-crossing direction, the dead band,
+the YOLOv8 output decoding, line-setup suggestions, local-date bucketing,
+occupancy reset behaviour, authentication and the API. Most use a stub detector, so they need
 no camera and no model file; the tests that exercise the real model skip
 automatically when it has not been exported.
 

@@ -2,14 +2,22 @@
 
 import csv
 
-from django.http import Http404, HttpResponse, StreamingHttpResponse
+from django.conf import settings
+from django.http import (
+    Http404,
+    HttpResponse,
+    HttpResponseForbidden,
+    StreamingHttpResponse,
+)
 from django.shortcuts import get_object_or_404, render
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from .camera import REGISTRY, mjpeg_frames
+from .daywindow import occupancy_window_start
 from .models import Camera, CountEvent
+from .permissions import _is_operator
 from .reports import DEFAULT_DAYS, daily_counts, parse_date, resolve_range, summarise
 
 
@@ -22,12 +30,20 @@ def dashboard(request):
     running = {row["camera_id"] for row in REGISTRY.stats() if row["running"]}
     for camera in cameras:
         camera.is_running = camera.pk in running
-        camera.totals_cache = camera.totals()
     return render(
         request,
         "counter/dashboard.html",
-        {"cameras": cameras, "has_cameras": bool(cameras)},
+        {
+            "cameras": cameras,
+            "has_cameras": bool(cameras),
+            # Controls are hidden rather than left to fail with a 403.
+            "can_operate": _is_operator(request),
+        },
     )
+
+
+def _reads_allowed(request) -> bool:
+    return getattr(settings, "COUNTER_PUBLIC_READS", True) or _is_operator(request)
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +52,9 @@ def dashboard(request):
 
 def video_feed(request, camera_id: int):
     """Live annotated MJPEG stream for a running camera."""
+    if not _reads_allowed(request):
+        return HttpResponseForbidden("Authentication required to view this stream.")
+
     worker = REGISTRY.get(camera_id)
     if worker is None:
         raise Http404("camera is not running")
@@ -51,6 +70,9 @@ def video_feed(request, camera_id: int):
 
 def snapshot(request, camera_id: int):
     """The most recent annotated frame as a single JPEG."""
+    if not _reads_allowed(request):
+        return HttpResponseForbidden("Authentication required to view this camera.")
+
     worker = REGISTRY.get(camera_id)
     if worker is None:
         raise Http404("camera is not running")
@@ -74,6 +96,7 @@ def _camera_payload(camera, worker=None):
         "line_orientation": camera.line_orientation,
         "invert_direction": camera.invert_direction,
         "totals": camera.totals(),
+        "occupancy": camera.occupancy(),
         "today": camera.totals_today(),
         "running": bool(worker and worker.is_alive()),
     }
@@ -157,12 +180,20 @@ def overall_stats(request):
     per_camera = [_camera_payload(c, REGISTRY.get(c.pk)) for c in cameras]
     total_in = sum(c["totals"]["in"] for c in per_camera)
     total_out = sum(c["totals"]["out"] for c in per_camera)
+
+    # Occupancy is summed per camera from the daily reset, never derived
+    # from lifetime totals, which drift upward as exits are missed.
+    occupied = sum(c["occupancy"]["inside"] for c in per_camera)
+    occupancy_net = sum(c["occupancy"]["net"] for c in per_camera)
+
     return Response(
         {
-            "totals": {
-                "in": total_in,
-                "out": total_out,
-                "inside": max(0, total_in - total_out),
+            "totals": {"in": total_in, "out": total_out},
+            "occupancy": {
+                "inside": occupied,
+                "net": occupancy_net,
+                "since": occupancy_window_start().isoformat(),
+                "resets_at": settings.COUNTER_OCCUPANCY_RESET_AT,
             },
             "today": {
                 "in": sum(c["today"]["in"] for c in per_camera),

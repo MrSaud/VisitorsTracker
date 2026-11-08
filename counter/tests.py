@@ -6,14 +6,17 @@ a model file, or any particular machine speed.
 
 import pathlib
 import tempfile
-from datetime import date, datetime, timezone as dt_timezone
+from datetime import date, datetime, time, timedelta, timezone as dt_timezone
 from unittest import skipUnless
 
 import cv2
 import numpy as np
-from django.test import TestCase, TransactionTestCase
+from django.contrib.auth.models import User
+from django.test import TestCase, TransactionTestCase, override_settings
+from django.utils import timezone
 
 from .camera import CounterWorker
+from .daywindow import occupancy_window_start, parse_reset_time
 from .models import Camera, CountEvent
 from .reports import (
     MAX_DAYS,
@@ -253,12 +256,16 @@ class CameraModelTests(TestCase):
         camera = Camera.objects.create(name="Door", source="0")
         for direction in (DIRECTION_IN, DIRECTION_IN, DIRECTION_IN, DIRECTION_OUT):
             CountEvent.objects.create(camera=camera, track_id=1, direction=direction)
-        self.assertEqual(camera.totals(), {"in": 3, "out": 1, "inside": 2})
+        self.assertEqual(camera.totals(), {"in": 3, "out": 1})
+        self.assertEqual(camera.occupancy()["inside"], 2)
 
     def test_inside_clamps_at_zero(self):
         camera = Camera.objects.create(name="Door", source="0")
         CountEvent.objects.create(camera=camera, track_id=1, direction=DIRECTION_OUT)
-        self.assertEqual(camera.totals()["inside"], 0)
+        occupancy = camera.occupancy()
+        self.assertEqual(occupancy["inside"], 0)
+        # The raw net stays visible so a reversed camera is diagnosable.
+        self.assertEqual(occupancy["net"], -1)
 
 
 class ApiTests(TestCase):
@@ -277,7 +284,8 @@ class ApiTests(TestCase):
         response = self.client.get("/api/v1/stats/")
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["totals"], {"in": 2, "out": 1, "inside": 1})
+        self.assertEqual(body["totals"], {"in": 2, "out": 1})
+        self.assertEqual(body["occupancy"]["inside"], 1)
         self.assertEqual(body["running_cameras"], 0)
         self.assertEqual(len(body["cameras"]), 1)
 
@@ -293,6 +301,8 @@ class ApiTests(TestCase):
         self.assertEqual(response.json()["count"], 2)
 
     def test_reset_deletes_events(self):
+        self.client.force_login(
+            User.objects.create_user("op", password="x", is_staff=True))
         response = self.client.post(f"/api/v1/cameras/{self.camera.pk}/reset/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["deleted"], 3)
@@ -365,7 +375,8 @@ class WorkerEndToEndTests(TransactionTestCase):
             events = list(CountEvent.objects.filter(camera=camera))
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].direction, DIRECTION_IN)
-            self.assertEqual(camera.totals(), {"in": 1, "out": 0, "inside": 1})
+            self.assertEqual(camera.totals(), {"in": 1, "out": 0})
+            self.assertEqual(camera.occupancy()["inside"], 1)
 
     def test_unopenable_source_reports_an_error_instead_of_crashing(self):
         camera = Camera.objects.create(name="Missing", source="/no/such/clip.mp4")
@@ -786,3 +797,198 @@ class DailyApiTests(TestCase):
     def test_dashboard_includes_the_panel(self):
         response = self.client.get("/")
         self.assertContains(response, "Visitors per date")
+
+
+class OccupancyWindowTests(TestCase):
+    """The daily boundary occupancy is measured from."""
+
+    def test_parses_hh_mm(self):
+        self.assertEqual(parse_reset_time("06:30"), time(6, 30))
+        self.assertEqual(parse_reset_time("0:00"), time(0, 0))
+        self.assertEqual(parse_reset_time("23:59"), time(23, 59))
+
+    def test_rubbish_falls_back_to_midnight(self):
+        for bad in ("", "nonsense", "25:99", None, "6:xx"):
+            self.assertEqual(parse_reset_time(bad), time(0, 0))
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="06:00")
+    def test_boundary_is_today_when_reset_has_passed(self):
+        now = timezone.make_aware(datetime(2026, 3, 10, 9, 0))
+        start = occupancy_window_start(now)
+        self.assertEqual(timezone.localtime(start).date(), date(2026, 3, 10))
+        self.assertEqual(timezone.localtime(start).hour, 6)
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="06:00")
+    def test_boundary_is_yesterday_before_the_reset(self):
+        # 03:00 is before the 06:00 reset, so the window began yesterday.
+        now = timezone.make_aware(datetime(2026, 3, 10, 3, 0))
+        start = occupancy_window_start(now)
+        self.assertEqual(timezone.localtime(start).date(), date(2026, 3, 9))
+        self.assertEqual(timezone.localtime(start).hour, 6)
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
+    def test_midnight_reset_matches_the_local_date(self):
+        now = timezone.make_aware(datetime(2026, 3, 10, 13, 45))
+        start = occupancy_window_start(now)
+        self.assertEqual(timezone.localtime(start).date(), date(2026, 3, 10))
+        self.assertEqual(timezone.localtime(start).hour, 0)
+
+
+class OccupancyDoesNotDriftTests(TestCase):
+    """The defect this fix exists for: missed exits must not accumulate."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def _event(self, when, direction):
+        CountEvent.objects.create(camera=self.camera, track_id=1,
+                                  direction=direction, occurred_at=when)
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
+    def test_yesterdays_missed_exits_do_not_inflate_today(self):
+        yesterday = timezone.localtime() - timedelta(days=1)
+        # 50 entries yesterday, every single exit missed.
+        for _ in range(50):
+            self._event(yesterday, DIRECTION_IN)
+
+        # Today: two in, one out.
+        now = timezone.localtime()
+        self._event(now, DIRECTION_IN)
+        self._event(now, DIRECTION_IN)
+        self._event(now, DIRECTION_OUT)
+
+        self.assertEqual(self.camera.totals(), {"in": 52, "out": 1},
+                         "lifetime footfall still counts everything")
+        self.assertEqual(self.camera.occupancy()["inside"], 1,
+                         "occupancy must reset daily, not carry 50 ghosts")
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
+    def test_drift_across_many_days_is_bounded(self):
+        # Three weeks of 20 entries/day with every exit missed.
+        for days_back in range(21, 0, -1):
+            when = timezone.localtime() - timedelta(days=days_back)
+            for _ in range(20):
+                self._event(when, DIRECTION_IN)
+
+        self.assertEqual(self.camera.totals()["in"], 420)
+        self.assertEqual(self.camera.occupancy()["inside"], 0,
+                         "420 un-exited visitors must not show as inside")
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
+    def test_negative_net_is_visible_but_inside_clamps(self):
+        self._event(timezone.localtime(), DIRECTION_OUT)
+        occupancy = self.camera.occupancy()
+        self.assertEqual(occupancy["inside"], 0)
+        self.assertEqual(occupancy["net"], -1)
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
+    def test_stats_endpoint_reports_occupancy_not_lifetime(self):
+        yesterday = timezone.localtime() - timedelta(days=1)
+        for _ in range(30):
+            self._event(yesterday, DIRECTION_IN)
+        self._event(timezone.localtime(), DIRECTION_IN)
+
+        body = self.client.get("/api/v1/stats/").json()
+        self.assertEqual(body["totals"]["in"], 31)
+        self.assertEqual(body["occupancy"]["inside"], 1)
+        self.assertEqual(body["occupancy"]["resets_at"], "00:00")
+
+
+@override_settings(COUNTER_API_TOKEN="test-token-value", COUNTER_PUBLIC_READS=True)
+class ApiAuthTests(TestCase):
+    """Reads open, writes closed."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        CountEvent.objects.create(camera=self.camera, track_id=1,
+                                  direction=DIRECTION_IN)
+        self.staff = User.objects.create_user("op", password="x", is_staff=True)
+        self.normal = User.objects.create_user("visitor", password="x")
+
+    # -- reads ----------------------------------------------------------
+
+    def test_anonymous_may_read(self):
+        for path in ("/api/v1/stats/", "/api/v1/cameras/", "/api/v1/daily/"):
+            self.assertEqual(self.client.get(path).status_code, 200, path)
+
+    @override_settings(COUNTER_PUBLIC_READS=False)
+    def test_reads_can_be_closed(self):
+        self.assertEqual(self.client.get("/api/v1/stats/").status_code, 401)
+
+    @override_settings(COUNTER_PUBLIC_READS=False)
+    def test_staff_may_read_when_reads_are_closed(self):
+        self.client.force_login(self.staff)
+        self.assertEqual(self.client.get("/api/v1/stats/").status_code, 200)
+
+    # -- writes ---------------------------------------------------------
+
+    def test_anonymous_cannot_reset(self):
+        response = self.client.post(f"/api/v1/cameras/{self.camera.pk}/reset/")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(CountEvent.objects.count(), 1, "history must survive")
+
+    def test_anonymous_cannot_stop_a_camera(self):
+        self.assertEqual(
+            self.client.post(f"/api/v1/cameras/{self.camera.pk}/stop/").status_code, 401)
+
+    def test_non_staff_user_cannot_write(self):
+        self.client.force_login(self.normal)
+        response = self.client.post(f"/api/v1/cameras/{self.camera.pk}/reset/")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(CountEvent.objects.count(), 1)
+
+    def test_staff_may_write(self):
+        self.client.force_login(self.staff)
+        response = self.client.post(f"/api/v1/cameras/{self.camera.pk}/reset/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(CountEvent.objects.count(), 0)
+
+    def test_valid_token_may_write(self):
+        response = self.client.post(
+            f"/api/v1/cameras/{self.camera.pk}/reset/",
+            HTTP_AUTHORIZATION="Token test-token-value",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(CountEvent.objects.count(), 0)
+
+    def test_wrong_token_is_rejected(self):
+        response = self.client.post(
+            f"/api/v1/cameras/{self.camera.pk}/reset/",
+            HTTP_AUTHORIZATION="Token not-the-token",
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(CountEvent.objects.count(), 1)
+
+    def test_malformed_authorization_header_is_rejected(self):
+        response = self.client.post(
+            f"/api/v1/cameras/{self.camera.pk}/reset/",
+            HTTP_AUTHORIZATION="Token",
+        )
+        self.assertEqual(response.status_code, 401)
+
+    @override_settings(COUNTER_API_TOKEN="")
+    def test_token_auth_refuses_when_unconfigured(self):
+        """An empty setting must not make every token valid."""
+        response = self.client.post(
+            f"/api/v1/cameras/{self.camera.pk}/reset/",
+            HTTP_AUTHORIZATION="Token anything-at-all",
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(CountEvent.objects.count(), 1)
+
+    # -- dashboard ------------------------------------------------------
+
+    def test_dashboard_hides_controls_from_anonymous(self):
+        response = self.client.get("/")
+        self.assertNotContains(response, 'data-action="reset"')
+        self.assertContains(response, "Read-only")
+
+    def test_dashboard_shows_controls_to_staff(self):
+        self.client.force_login(self.staff)
+        response = self.client.get("/")
+        self.assertContains(response, 'data-action="reset"')
+
+    @override_settings(COUNTER_PUBLIC_READS=False)
+    def test_stream_is_closed_when_reads_are(self):
+        self.assertEqual(
+            self.client.get(f"/api/v1/cameras/{self.camera.pk}/stream/").status_code, 403)
