@@ -45,8 +45,9 @@ rather than failing silently.
 
 1. **Detect** — a YOLOv8 ONNX model when one is present, otherwise OpenCV's
    built-in HOG pedestrian detector. See [Detector](#detector) below.
-2. **Track** — a nearest-centroid tracker assigns a stable id to each person,
-   so one visitor is counted once rather than once per frame.
+2. **Track** — a SORT-style tracker assigns a stable id to each person, so
+   one visitor is counted once rather than once per frame. See
+   [Tracking](#tracking).
 3. **Count** — each track's centroid is compared against the counting line.
    A side change outside a small dead band emits one `CountEvent`, with
    `direction` of `in` or `out`.
@@ -87,6 +88,71 @@ HOG is roughly 3x faster but misses most people at an angle; YOLOv8n is the
 right default for a real entrance, and still has headroom well beyond camera
 frame rates. A missing or corrupt model never stops the cameras — the loader
 logs a warning and uses HOG.
+
+## Tracking
+
+Detection finds people in a single frame; tracking is what links them
+between frames, and it decides whether a visitor is counted once, twice or
+not at all.
+
+The default (`COUNTER_TRACKER=sort`) combines three things:
+
+- **Motion.** Each track runs a constant-velocity Kalman filter, so it is
+  matched against where it is *predicted* to be, not where it last was.
+- **Shape.** Matching uses box overlap, not just centre distance, so a near
+  person and a far one are not confused.
+- **Optimality.** Assignment is solved globally (Hungarian), so one
+  confident early match cannot force a cascade of wrong ones.
+
+Where the detector reports calibrated probabilities (YOLO), association runs
+in two stages: confident detections first, then a second pass that lets
+unmatched tracks claim the weak detections a partly occluded person
+produces, instead of dropping them.
+
+### Why not nearest-centroid
+
+The old tracker matched on centre distance alone. When two people pass each
+other — routine at a doorway — each detection is briefly nearest the *other*
+person's last position, and the identities swap. A swap at the counting line
+cancels both crossings.
+
+Measured on a two-way pass, one person entering and one leaving:
+
+| Tracker | Counted |
+|---|---|
+| Truth | 1 in, 1 out |
+| Nearest-centroid | **0 in, 0 out** |
+| SORT | 1 in, 1 out |
+
+And on a clip of three real people crossing the line once:
+
+| Tracker | Counted | Identities created |
+|---|---|---|
+| Truth | 3 in | 3 |
+| Nearest-centroid | **4 in** | 4 |
+| SORT | 3 in | 3 |
+
+`COUNTER_TRACKER=centroid` restores the old behaviour if ever needed.
+
+### Cost
+
+Association only, excluding detection:
+
+| People in frame | Centroid | SORT |
+|---|---|---|
+| 3 | 0.03 ms | 0.16 ms |
+| 8 | 0.08 ms | 0.34 ms |
+| 20 | 0.23 ms | 0.96 ms |
+
+Against ~41 ms for YOLOv8n detection, tracking is a rounding error.
+
+### A note on matching
+
+Pure IoU association fails once a person moves about their own box width
+between detections — overlap collapses towards zero — which happens at any
+realistic walking pace with `COUNTER_DETECT_EVERY` above 1. So overlap is
+combined with centre proximity measured in box-diagonals, hard-gated at
+twice the diagonal so the distance term cannot pair distant strangers.
 
 ## Occupancy and the daily reset
 
@@ -154,6 +220,7 @@ All of these are environment variables:
 | `COUNTER_FRAME_WIDTH` | `640` | Frames are downscaled to this width before detection |
 | `COUNTER_OCCUPANCY_RESET_AT` | `00:00` | Local time occupancy returns to zero |
 | `COUNTER_STALE_FRAME_SECONDS` | `30` | No frame for this long means stalled |
+| `COUNTER_TRACKER` | `sort` | `sort` or `centroid` |
 | `COUNTER_API_TOKEN` | *(unset)* | Shared token for machine write access |
 | `COUNTER_PUBLIC_READS` | `1` | `0` requires auth for reads as well |
 
@@ -372,7 +439,9 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 python manage.py test
 ```
 
-159 tests covering tracker identity, line-crossing direction, the dead band,
+190 tests covering tracker identity through crossings and occlusion,
+assignment optimality against brute force, line-crossing direction, the dead
+band,
 the YOLOv8 output decoding, line-setup suggestions, local-date and local-hour
 bucketing, occupancy reset behaviour, camera health states, authentication
 and the API. Most use a stub detector, so they need

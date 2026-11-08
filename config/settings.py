@@ -126,6 +126,10 @@ COUNTER_DETECT_EVERY = int(os.environ.get("COUNTER_DETECT_EVERY", "3"))
 # Frames a track may go unseen before it is dropped.
 COUNTER_MAX_DISAPPEARED = int(os.environ.get("COUNTER_MAX_DISAPPEARED", "25"))
 
+# Tracker: "sort" (Kalman motion + IoU + optimal assignment) or
+# "centroid" (nearest-distance, kept as a fallback).
+COUNTER_TRACKER = os.environ.get("COUNTER_TRACKER", "sort")
+
 # A worker with no new frame for this long is reported as stalled. A frozen
 # stream otherwise looks identical to a healthy one.
 COUNTER_STALE_FRAME_SECONDS = float(

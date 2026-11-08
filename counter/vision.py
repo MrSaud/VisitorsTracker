@@ -98,6 +98,8 @@ class HogPersonDetector:
     """OpenCV HOG pedestrian detector. No model file required."""
 
     name = "hog"
+    # Scores are SVM decision values, not probabilities.
+    score_is_probability = False
 
     def __init__(self, min_confidence: float | None = None):
         self.min_confidence = (
@@ -132,6 +134,7 @@ class OnnxPersonDetector:
     """YOLOv8 person detector run through ``cv2.dnn``."""
 
     name = "onnx"
+    score_is_probability = True
 
     def __init__(self, model_path, min_confidence: float | None = None, input_size: int = 640):
         self.model_path = Path(model_path)
@@ -284,6 +287,14 @@ class CentroidTracker:
         self._next_id += 1
         return track
 
+    def update_detections(self, detections):
+        """Common interface: ``detections`` is a list of ``(box, score)``."""
+        return self.update([box for box, _score in detections])
+
+    def advance(self):
+        """No motion model, so a skipped frame simply holds position."""
+        return self.tracks
+
     def update(self, boxes):
         """Feed this frame's boxes; returns the live tracks."""
         if not boxes:
@@ -410,14 +421,16 @@ class VisitorCounter:
         detect_every: int = 3,
         max_disappeared: int = 25,
         frame_width: int = 640,
+        tracker=None,
     ):
         self.detector = detector
         self.line = line or LineCounter()
         self.detect_every = max(1, int(detect_every))
         self.frame_width = int(frame_width)
-        self.tracker = CentroidTracker(max_disappeared=max_disappeared)
+        # Any object offering update_detections() and advance() will do.
+        self.tracker = tracker or CentroidTracker(max_disappeared=max_disappeared)
         self._frame_index = 0
-        self._last_boxes: list = []
+        self._last_detections: list = []
 
     @property
     def total_in(self) -> int:
@@ -446,12 +459,16 @@ class VisitorCounter:
         """Run one frame. Returns ``(annotated_frame, events)``."""
         frame = self._resize(frame)
 
+        # On a detect frame the tracker gets measurements. In between it
+        # advances its motion model instead of being fed stale boxes,
+        # which would otherwise read as "this person stopped moving".
         if self._frame_index % self.detect_every == 0:
-            detections = self.detector.detect(frame)
-            self._last_boxes = [box for box, _score in detections]
+            self._last_detections = self.detector.detect(frame)
+            tracks = self.tracker.update_detections(self._last_detections)
+        else:
+            tracks = self.tracker.advance()
         self._frame_index += 1
 
-        tracks = self.tracker.update(self._last_boxes)
         events = self.line.update(tracks, frame.shape)
         return self.annotate(frame, tracks), events
 

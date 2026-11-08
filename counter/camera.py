@@ -18,6 +18,7 @@ from django.conf import settings
 from django.db import close_old_connections
 from django.utils import timezone
 
+from .tracking import build_tracker
 from .vision import LineCounter, VisitorCounter, build_detector
 
 logger = logging.getLogger(__name__)
@@ -41,11 +42,17 @@ class CounterWorker(threading.Thread):
         self.source = camera.resolved_source()
         self.is_file = not isinstance(self.source, int)
 
+        detector = build_detector(
+            settings.COUNTER_DETECTOR,
+            settings.COUNTER_MIN_CONFIDENCE,
+            settings.COUNTER_ONNX_MODEL,
+        )
         self.counter = VisitorCounter(
-            detector=build_detector(
-                settings.COUNTER_DETECTOR,
-                settings.COUNTER_MIN_CONFIDENCE,
-                settings.COUNTER_ONNX_MODEL,
+            detector=detector,
+            tracker=build_tracker(
+                settings.COUNTER_TRACKER,
+                max_disappeared=settings.COUNTER_MAX_DISAPPEARED,
+                detector=detector,
             ),
             line=LineCounter(
                 position=camera.line_position,

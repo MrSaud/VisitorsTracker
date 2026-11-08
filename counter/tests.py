@@ -4,6 +4,7 @@ A stub detector stands in for HOG/ONNX so nothing here needs a camera,
 a model file, or any particular machine speed.
 """
 
+import itertools
 import pathlib
 import tempfile
 import time as time_module
@@ -21,6 +22,13 @@ from django.utils import timezone
 
 from .camera import CounterWorker
 from .daywindow import occupancy_window_start, parse_reset_time
+from .tracking import (
+    KalmanBox,
+    SortTracker,
+    build_tracker,
+    iou_batch,
+    linear_assignment,
+)
 from .health import (
     DISABLED,
     FAILED,
@@ -1441,3 +1449,279 @@ class CheckHealthCommandTests(TestCase):
 
     def test_no_cameras_is_not_a_failure(self):
         call_command("check_health", stdout=StringIO())
+
+
+def track_box(cx, cy, w=46, h=92):
+    return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+
+
+class IouBatchTests(TestCase):
+    def test_identical_boxes_are_one(self):
+        box = [[0, 0, 10, 10]]
+        self.assertAlmostEqual(float(iou_batch(box, box)[0][0]), 1.0, places=5)
+
+    def test_disjoint_boxes_are_zero(self):
+        self.assertEqual(float(iou_batch([[0, 0, 10, 10]], [[50, 50, 60, 60]])[0][0]), 0.0)
+
+    def test_half_overlap(self):
+        # 10x10 boxes sharing exactly half their area.
+        value = float(iou_batch([[0, 0, 10, 10]], [[5, 0, 15, 10]])[0][0])
+        self.assertAlmostEqual(value, 50 / 150, places=5)
+
+    def test_shape_and_empty_inputs(self):
+        self.assertEqual(iou_batch([[0, 0, 1, 1]] * 3, [[0, 0, 1, 1]] * 4).shape, (3, 4))
+        self.assertEqual(iou_batch([], [[0, 0, 1, 1]]).shape, (0, 1))
+        self.assertEqual(iou_batch([[0, 0, 1, 1]], []).shape, (1, 0))
+
+    def test_degenerate_box_does_not_divide_by_zero(self):
+        self.assertEqual(float(iou_batch([[5, 5, 5, 5]], [[0, 0, 10, 10]])[0][0]), 0.0)
+
+
+class LinearAssignmentTests(TestCase):
+    def test_matches_the_obvious_pairing(self):
+        cost = np.array([[1.0, 9.0], [9.0, 1.0]])
+        self.assertEqual(sorted(linear_assignment(cost)), [(0, 0), (1, 1)])
+
+    def test_greedy_would_lose_here(self):
+        # Greedy takes (0,0)=1 and is then forced into (1,1)=100 for 101.
+        # The optimum is (0,1)+(1,0) = 2 + 3 = 5.
+        cost = np.array([[1.0, 2.0], [3.0, 100.0]])
+        pairs = sorted(linear_assignment(cost))
+        self.assertEqual(pairs, [(0, 1), (1, 0)])
+
+    def test_rectangular_more_columns(self):
+        pairs = linear_assignment(np.array([[1.0, 5.0, 9.0]]))
+        self.assertEqual(pairs, [(0, 0)])
+
+    def test_rectangular_more_rows(self):
+        pairs = linear_assignment(np.array([[1.0], [5.0], [9.0]]))
+        self.assertEqual(pairs, [(0, 0)])
+
+    def test_empty(self):
+        self.assertEqual(linear_assignment(np.zeros((0, 0))), [])
+
+    def test_optimal_against_brute_force(self):
+        rng = np.random.default_rng(17)
+        for _ in range(40):
+            rows = int(rng.integers(1, 5))
+            cols = int(rng.integers(1, 5))
+            cost = rng.integers(0, 15, size=(rows, cols)).astype(float)
+
+            pairs = linear_assignment(cost)
+            mine = sum(cost[r, c] for r, c in pairs)
+
+            size = min(rows, cols)
+            best = min(
+                sum(cost[r, c] for r, c in zip(rs, cs))
+                for rs in itertools.permutations(range(rows), size)
+                for cs in itertools.permutations(range(cols), size)
+            )
+            self.assertAlmostEqual(mine, best, places=9)
+            self.assertEqual(len(pairs), size)
+
+
+class KalmanBoxTests(TestCase):
+    def test_round_trips_a_box(self):
+        box = (100.0, 50.0, 146.0, 142.0)
+        kalman = KalmanBox(box)
+        for actual, expected in zip(kalman.box, box):
+            self.assertAlmostEqual(actual, expected, places=3)
+
+    def test_predicts_constant_velocity_forward(self):
+        kalman = KalmanBox(track_box(100, 120))
+        for step in range(1, 4):
+            kalman.predict()
+            kalman.update(track_box(100 + step * 20, 120))
+
+        predicted = kalman.predict()
+        centre_x = (predicted[0] + predicted[2]) / 2
+        # Having seen +20 per frame, it should lead rather than stand still.
+        self.assertGreater(centre_x, 160.0,
+                           "motion model should extrapolate, not hold position")
+
+    def test_area_never_inverts_the_box(self):
+        kalman = KalmanBox(track_box(100, 120, w=10, h=10))
+        for _ in range(60):
+            kalman.predict()
+        x1, y1, x2, y2 = kalman.box
+        self.assertGreaterEqual(x2, x1)
+        self.assertGreaterEqual(y2, y1)
+
+
+class SortTrackerTests(TestCase):
+    def _walk(self, tracker, positions, score=0.9):
+        """Run the tracker, snapshotting id -> centroid at each frame.
+
+        The tracker hands out live Track objects on purpose, so storing the
+        dicts themselves would compare against their final positions later.
+        """
+        seen = []
+        for group in positions:
+            dets = [(track_box(x, y), score) for x, y in group]
+            tracks = tracker.update_detections(dets)
+            seen.append({tid: tuple(t.centroid) for tid, t in tracks.items()})
+        return seen
+
+    def test_one_person_keeps_one_id(self):
+        tracker = SortTracker(max_disappeared=25)
+        frames = self._walk(tracker, [[(60 + i * 25, 120)] for i in range(8)])
+        ids = {tid for frame in frames for tid in frame}
+        self.assertEqual(len(ids), 1, "a single walker must not fragment")
+
+    def test_tentative_tracks_are_withheld(self):
+        tracker = SortTracker(max_disappeared=25, min_hits=2)
+        first = tracker.update_detections([(track_box(100, 120), 0.9)])
+        self.assertEqual(len(first), 0, "one sighting is not yet a person")
+        second = tracker.update_detections([(track_box(120, 120), 0.9)])
+        self.assertEqual(len(second), 1)
+
+    def test_crossing_paths_do_not_swap_identity(self):
+        """The failure that makes a doorway miscount."""
+        tracker = SortTracker(max_disappeared=25)
+        path = [[(30 + i * 60, 115), (330 - i * 60, 125)] for i in range(6)]
+        frames = self._walk(tracker, path)
+
+        def nearest(snapshot, point):
+            return min(snapshot.items(),
+                       key=lambda kv: (kv[1][0] - point[0]) ** 2
+                       + (kv[1][1] - point[1]) ** 2)[0]
+
+        early = frames[1]
+        late = frames[-1]
+        a_start = nearest(early, path[1][0])
+        b_start = nearest(early, path[1][1])
+        a_end = nearest(late, path[-1][0])
+        b_end = nearest(late, path[-1][1])
+
+        self.assertEqual(a_start, a_end, "person A changed identity mid-walk")
+        self.assertEqual(b_start, b_end, "person B changed identity mid-walk")
+
+    def test_survives_a_brief_occlusion(self):
+        tracker = SortTracker(max_disappeared=25)
+        self._walk(tracker, [[(60 + i * 25, 120)] for i in range(4)])
+        original = set(tracker.tracks)
+
+        for _ in range(3):              # hidden behind a pillar
+            tracker.update_detections([])
+
+        after = tracker.update_detections([(track_box(200, 120), 0.9)])
+        self.assertEqual(set(after), original,
+                         "reappearing after occlusion must not create a new person")
+
+    def test_track_expires_after_max_disappeared(self):
+        tracker = SortTracker(max_disappeared=3)
+        self._walk(tracker, [[(100, 120)], [(100, 120)]])
+        self.assertEqual(len(tracker.tracks), 1)
+        for _ in range(5):
+            tracker.update_detections([])
+        self.assertEqual(len(tracker.tracks), 0)
+
+    def test_two_separate_people_get_two_ids(self):
+        tracker = SortTracker(max_disappeared=25)
+        frames = self._walk(tracker, [[(60, 120), (260, 120)] for _ in range(3)])
+        self.assertEqual(len(frames[-1]), 2)
+
+    def test_advance_moves_tracks_without_detections(self):
+        tracker = SortTracker(max_disappeared=25)
+        self._walk(tracker, [[(60, 120)], [(90, 120)], [(120, 120)]])
+        before = float(next(iter(tracker.tracks.values())).centroid[0])
+        tracker.advance()
+        after = float(next(iter(tracker.tracks.values())).centroid[0])
+        self.assertGreater(after, before, "prediction should carry motion forward")
+
+    def test_track_objects_persist_so_side_is_remembered(self):
+        """The line counter writes to track.side; it must survive the frame."""
+        tracker = SortTracker(max_disappeared=25)
+        self._walk(tracker, [[(60, 120)], [(90, 120)]])
+        track = next(iter(tracker.tracks.values()))
+        track.side = -1
+        tracker.update_detections([(track_box(120, 120), 0.9)])
+        self.assertEqual(next(iter(tracker.tracks.values())).side, -1)
+
+    def test_weak_detection_recovers_a_track_in_the_second_stage(self):
+        tracker = SortTracker(max_disappeared=25, high_confidence=0.5)
+        self._walk(tracker, [[(60, 120)], [(90, 120)]], score=0.9)
+        original = set(tracker.tracks)
+        # Partly occluded: still there, but the detector is unsure.
+        tracker.update_detections([(track_box(120, 120), 0.2)])
+        self.assertEqual(set(tracker.tracks), original)
+
+    def test_distance_gate_rejects_an_unrelated_box(self):
+        tracker = SortTracker(max_disappeared=25)
+        score = tracker.affinity([track_box(50, 50)], [track_box(2000, 2000)])
+        self.assertEqual(float(score[0][0]), -1.0)
+
+    def test_affinity_rewards_overlap_and_closeness(self):
+        tracker = SortTracker()
+        close = float(tracker.affinity([track_box(100, 120)], [track_box(110, 120)])[0][0])
+        far = float(tracker.affinity([track_box(100, 120)], [track_box(190, 120)])[0][0])
+        self.assertGreater(close, far)
+
+    def test_fast_motion_still_matches(self):
+        """Displacement near box width kills plain IoU; this must survive it."""
+        tracker = SortTracker(max_disappeared=25)
+        frames = self._walk(tracker, [[(60 + i * 45, 120)] for i in range(6)])
+        ids = {tid for frame in frames for tid in frame}
+        self.assertEqual(len(ids), 1)
+
+
+class TrackerComparisonTests(TestCase):
+    """Why this tracker exists, stated as a test."""
+
+    FRAME_H, FRAME_W = 240, 320
+    A = [30, 90, 150, 210, 270, 300]
+    B = [290, 230, 170, 110, 50, 20]
+
+    class _Script:
+        name = "stub"
+        score_is_probability = True
+        min_confidence = 0.35
+
+        def __init__(self, a_path, b_path):
+            self.a_path, self.b_path, self.index = a_path, b_path, 0
+
+        def detect(self, frame):
+            k = min(self.index, len(self.a_path) - 1)
+            self.index += 1
+            return [(track_box(self.a_path[k], 115), 0.9),
+                    (track_box(self.b_path[k], 125), 0.9)]
+
+    def _count(self, tracker):
+        counter = VisitorCounter(
+            detector=self._Script(self.A, self.B),
+            line=LineCounter(position=0.5, orientation=VERTICAL),
+            detect_every=1, frame_width=self.FRAME_W, tracker=tracker,
+        )
+        for _ in range(len(self.A)):
+            counter.process(np.zeros((self.FRAME_H, self.FRAME_W, 3), dtype=np.uint8))
+        return counter.total_in, counter.total_out
+
+    def test_sort_counts_a_two_way_pass_correctly(self):
+        """One entering, one leaving, passing at the line: 1 in, 1 out."""
+        self.assertEqual(self._count(SortTracker(max_disappeared=25)), (1, 1))
+
+    def test_centroid_tracker_miscounts_the_same_scene(self):
+        """Documents the defect being fixed: the swap cancels both crossings."""
+        self.assertEqual(self._count(CentroidTracker(max_disappeared=25)), (0, 0))
+
+
+class BuildTrackerTests(TestCase):
+    def test_sort_is_the_default(self):
+        self.assertIsInstance(build_tracker(None), SortTracker)
+        self.assertIsInstance(build_tracker("sort"), SortTracker)
+
+    def test_centroid_can_be_forced(self):
+        self.assertIsInstance(build_tracker("centroid"), CentroidTracker)
+
+    def test_two_stage_only_for_probability_detectors(self):
+        class Prob:
+            score_is_probability = True
+            min_confidence = 0.35
+
+        class Svm:
+            score_is_probability = False
+            min_confidence = 0.45
+
+        self.assertIsNotNone(build_tracker("sort", detector=Prob()).high_confidence)
+        self.assertIsNone(build_tracker("sort", detector=Svm()).high_confidence)
+        self.assertIsNone(build_tracker("sort", detector=None).high_confidence)
