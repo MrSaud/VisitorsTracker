@@ -112,6 +112,57 @@ All of these are environment variables:
 | `GET` | `/api/v1/cameras/<id>/stream/` | Annotated MJPEG live stream |
 | `GET` | `/api/v1/cameras/<id>/snapshot/` | Latest annotated frame as JPEG |
 
+## "It never counts anything"
+
+Run the probe. It separates the two causes, from your real camera:
+
+```bash
+python manage.py camera_probe --source 0 --seconds 20
+```
+
+Walk through the view the way a visitor would. It reports how often a person
+was detected, how much of the frame they filled, which way they travelled,
+and the counting line that suits that movement:
+
+```
+frames with a person : 80 (100%)
+body fills on average: 44% of frame height
+  -> good framing for detection.
+
+Suggested counting line
+  movement was mostly  : left-to-right
+  line orientation     : vertical
+  line position        : 0.38
+  you moved rightwards, which currently counts as IN
+```
+
+Apply it straight to a camera:
+
+```bash
+python manage.py camera_probe --camera 1 --seconds 20 --apply
+```
+
+**0% detected** is a framing problem and no line setting will fix it — see
+the camera placement rules below. **Detected but never counted** means the
+line is in the wrong place or the wrong orientation.
+
+## Camera placement
+
+The detector is trained on whole people, so framing decides whether anything
+works at all:
+
+| | |
+|---|---|
+| **Distance** | People should fill roughly 30-60% of frame height — head to knees at least. A head-and-shoulders webcam shot is the most common reason nothing is detected |
+| **Height** | Chest height or above, angled slightly down. Eye-level straight-on is fine; floor-level is not |
+| **Angle** | Let people cross the frame, not walk straight at the lens. A body moving across gives the tracker a clear path over the line |
+| **Lighting** | Front-lit. A camera pointed at a bright window turns everyone into a silhouette |
+| **Line** | Place it where people genuinely cross, away from where they stop and loiter |
+
+Direction convention: with a **horizontal** line, moving *down* the frame is
+IN; with a **vertical** line, moving *right* is IN. If that is backwards for
+your mounting, tick **invert direction** on the camera.
+
 ## Headless counting
 
 To count without the web server:
@@ -128,8 +179,8 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 python manage.py test
 ```
 
-45 tests covering tracker identity, line-crossing direction, the dead band,
-the YOLOv8 output decoding and the API. Most use a stub detector, so they need
+53 tests covering tracker identity, line-crossing direction, the dead band,
+the YOLOv8 output decoding, line-setup suggestions and the API. Most use a stub detector, so they need
 no camera and no model file; the tests that exercise the real model skip
 automatically when it has not been exported.
 

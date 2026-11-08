@@ -30,6 +30,7 @@ from .vision import (
     build_detector,
     non_max_suppression,
     resolve_model_path,
+    suggest_line_setup,
 )
 
 FRAME_H, FRAME_W = 240, 320
@@ -531,3 +532,58 @@ class OnnxModelTests(TestCase):
             self.assertGreaterEqual(score, detector.min_confidence)
             self.assertLessEqual(x2, width + 1)
             self.assertLessEqual(y2, height + 1)
+
+
+class SuggestLineSetupTests(TestCase):
+    """The recommendation that tells someone why their camera never counts."""
+
+    SHAPE = (360, 640, 3)
+
+    def test_walking_across_suggests_a_vertical_line(self):
+        # Someone crossing a desk webcam: x sweeps, y barely moves.
+        centroids = [(x, 180 + (x % 7)) for x in range(60, 580, 20)]
+        result = suggest_line_setup(centroids, self.SHAPE)
+        self.assertTrue(result["confident"])
+        self.assertEqual(result["orientation"], VERTICAL)
+
+    def test_walking_toward_the_camera_suggests_a_horizontal_line(self):
+        centroids = [(320 + (y % 5), y) for y in range(40, 330, 12)]
+        result = suggest_line_setup(centroids, self.SHAPE)
+        self.assertTrue(result["confident"])
+        self.assertEqual(result["orientation"], HORIZONTAL)
+
+    def test_position_sits_at_the_middle_of_observed_travel(self):
+        # Travel spans x 100..500 on a 640-wide frame -> midpoint 300/640.
+        centroids = [(x, 180) for x in range(100, 501, 20)]
+        result = suggest_line_setup(centroids, self.SHAPE)
+        self.assertEqual(result["orientation"], VERTICAL)
+        self.assertAlmostEqual(result["position"], 300 / 640, places=2)
+
+    def test_travel_direction_is_reported(self):
+        rightwards = suggest_line_setup([(x, 180) for x in range(60, 580, 20)], self.SHAPE)
+        self.assertEqual(rightwards["travel"], "increasing")
+        leftwards = suggest_line_setup([(x, 180) for x in range(560, 40, -20)], self.SHAPE)
+        self.assertEqual(leftwards["travel"], "decreasing")
+
+    def test_standing_still_is_not_confident(self):
+        centroids = [(320 + (i % 3), 180 + (i % 3)) for i in range(40)]
+        result = suggest_line_setup(centroids, self.SHAPE)
+        self.assertFalse(result["confident"])
+        self.assertIsNone(result["orientation"])
+
+    def test_too_few_samples_returns_none(self):
+        self.assertIsNone(suggest_line_setup([], self.SHAPE))
+        self.assertIsNone(suggest_line_setup([(1.0, 2.0)], self.SHAPE))
+
+    def test_axis_choice_is_normalised_by_frame_shape(self):
+        # 200px of travel is a third of the width but over half the height,
+        # so the dominant axis here is vertical despite equal pixel spans.
+        centroids = [(100 + i * 20, 80 + i * 20) for i in range(11)]
+        result = suggest_line_setup(centroids, (360, 640, 3))
+        self.assertEqual(result["orientation"], HORIZONTAL)
+
+    def test_position_is_clamped_into_frame(self):
+        centroids = [(x, 180) for x in range(-200, 40, 10)]
+        result = suggest_line_setup(centroids, self.SHAPE)
+        self.assertGreaterEqual(result["position"], 0.05)
+        self.assertLessEqual(result["position"], 0.95)

@@ -486,3 +486,68 @@ class VisitorCounter:
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA,
         )
         return canvas
+
+
+# ---------------------------------------------------------------------------
+# setup assistance
+# ---------------------------------------------------------------------------
+
+def suggest_line_setup(centroids, frame_shape):
+    """Recommend a counting line from centroids actually observed on camera.
+
+    The common reason a camera "never counts" is a line the subject never
+    crosses: the default is horizontal, but someone walking across a desk
+    webcam moves along x while their y barely changes. Rather than have
+    people guess, measure which axis they travel along and put the line
+    across it.
+
+    Returns ``None`` when there is not enough movement to judge.
+    """
+    points = [(float(x), float(y)) for x, y in centroids]
+    if len(points) < 2:
+        return None
+
+    height, width = frame_shape[:2]
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+
+    # Normalise by frame size: a 640x360 frame would otherwise bias to x.
+    x_span = (max(xs) - min(xs)) / max(1.0, width)
+    y_span = (max(ys) - min(ys)) / max(1.0, height)
+
+    if max(x_span, y_span) < 0.15:
+        # Barely moved; a line anywhere would be guesswork.
+        return {
+            "orientation": None,
+            "position": None,
+            "x_span": x_span,
+            "y_span": y_span,
+            "travel": None,
+            "confident": False,
+            "reason": "not enough movement to tell which way people travel",
+        }
+
+    if x_span >= y_span:
+        orientation = VERTICAL
+        values, extent = xs, width
+    else:
+        orientation = HORIZONTAL
+        values, extent = ys, height
+
+    position = ((min(values) + max(values)) / 2.0) / max(1.0, extent)
+
+    # Net travel along the chosen axis decides which way "in" currently points.
+    net = values[-1] - values[0]
+    travel = "increasing" if net > 0 else "decreasing"
+
+    return {
+        "orientation": orientation,
+        "position": round(min(0.95, max(0.05, position)), 2),
+        "x_span": x_span,
+        "y_span": y_span,
+        "travel": travel,
+        "confident": True,
+        "reason": (
+            f"movement was mostly {'horizontal' if orientation == VERTICAL else 'vertical'}"
+        ),
+    }
