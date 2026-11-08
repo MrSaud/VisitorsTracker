@@ -51,6 +51,10 @@ rather than failing silently.
    A side change outside a small dead band emits one `CountEvent`, with
    `direction` of `in` or `out`.
 
+Tracks are positional and short-lived, so the same person returning later is
+a new track and counts again: **`in` is entry crossings, not unique people**.
+Occupancy (`inside`) is unaffected, being in minus out.
+
 The dead band (`LineCounter.margin`) is what stops someone loitering on the
 line from racking up counts. Set `invert_direction` on a camera if in and out
 come out backwards for its mounting angle.
@@ -103,6 +107,7 @@ All of these are environment variables:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/v1/stats/` | Totals across all cameras, plus per-camera detail |
+| `GET` | `/api/v1/daily/` | Crossings per date — see [Visitors per date](#visitors-per-date) |
 | `GET` | `/api/v1/cameras/` | List cameras |
 | `GET` | `/api/v1/cameras/<id>/` | One camera |
 | `POST` | `/api/v1/cameras/<id>/start/` | Start its worker |
@@ -111,6 +116,50 @@ All of these are environment variables:
 | `POST` | `/api/v1/cameras/<id>/reset/` | Delete recorded crossings |
 | `GET` | `/api/v1/cameras/<id>/stream/` | Annotated MJPEG live stream |
 | `GET` | `/api/v1/cameras/<id>/snapshot/` | Latest annotated frame as JPEG |
+
+## Visitors per date
+
+The dashboard's **Visitors per date** panel charts daily crossings over 7, 30
+or 90 days, with a totals strip, a busiest-day figure and a CSV download. The
+same data is available directly:
+
+```bash
+curl 'http://127.0.0.1:8000/api/v1/daily/?days=7'
+curl 'http://127.0.0.1:8000/api/v1/daily/?start=2026-03-01&end=2026-03-31'
+curl 'http://127.0.0.1:8000/api/v1/daily/?camera=1&days=30'
+curl -OJ 'http://127.0.0.1:8000/api/v1/daily/?days=30&format=csv'
+```
+
+| Parameter | Meaning |
+|---|---|
+| `days` | Window size, default 30, capped at 730. Combines with `start` or `end` |
+| `start` / `end` | Explicit `YYYY-MM-DD` window, inclusive at both ends |
+| `camera` | Restrict to one camera id |
+| `format=csv` | Download as CSV instead of JSON |
+
+Response:
+
+```json
+{
+  "start": "2026-11-02", "end": "2026-11-08",
+  "summary": {"in": 190, "out": 157, "net": 33,
+              "busiest_date": "2026-11-02", "busiest_in": 42,
+              "days": 7, "daily_average_in": 27.14},
+  "days": [{"date": "2026-11-02", "in": 42, "out": 34, "net": 8}]
+}
+```
+
+Two things worth knowing:
+
+- **Dates are local**, using the project's `TIME_ZONE` (`Asia/Kuwait` by
+  default). Events are stored as UTC instants, so a visitor arriving at 01:30
+  local belongs to that day, not to the previous UTC one.
+- **Quiet days are included as zeros** rather than omitted, so a chart or
+  spreadsheet does not silently skip them.
+
+Remember that `in` counts *entry crossings*, not distinct people — someone
+entering three times adds three. See the note on identity under
+[How counting works](#how-counting-works).
 
 ## "It never counts anything"
 
@@ -179,8 +228,9 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 python manage.py test
 ```
 
-53 tests covering tracker identity, line-crossing direction, the dead band,
-the YOLOv8 output decoding, line-setup suggestions and the API. Most use a stub detector, so they need
+81 tests covering tracker identity, line-crossing direction, the dead band,
+the YOLOv8 output decoding, line-setup suggestions, local-date bucketing and
+the API. Most use a stub detector, so they need
 no camera and no model file; the tests that exercise the real model skip
 automatically when it has not been exported.
 

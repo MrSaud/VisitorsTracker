@@ -1,5 +1,7 @@
 """Dashboard, MJPEG stream and the JSON API."""
 
+import csv
+
 from django.http import Http404, HttpResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, render
 from rest_framework import status
@@ -8,6 +10,7 @@ from rest_framework.response import Response
 
 from .camera import REGISTRY, mjpeg_frames
 from .models import Camera, CountEvent
+from .reports import DEFAULT_DAYS, daily_counts, parse_date, resolve_range, summarise
 
 
 # ---------------------------------------------------------------------------
@@ -169,3 +172,76 @@ def overall_stats(request):
             "cameras": per_camera,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# per-date reporting
+# ---------------------------------------------------------------------------
+
+def _daily_params(request):
+    """Pull and validate the reporting window from the query string."""
+    params = request.query_params if hasattr(request, "query_params") else request.GET
+
+    start = parse_date(params.get("start"))
+    end = parse_date(params.get("end"))
+
+    raw_days = (params.get("days") or "").strip()
+    if raw_days:
+        try:
+            days = int(raw_days)
+        except ValueError:
+            raise ValueError(f"'{raw_days}' is not a whole number of days")
+        if days < 1:
+            raise ValueError("days must be at least 1")
+    else:
+        days = DEFAULT_DAYS
+
+    camera = None
+    raw_camera = (params.get("camera") or "").strip()
+    if raw_camera:
+        try:
+            camera = Camera.objects.get(pk=int(raw_camera))
+        except (ValueError, Camera.DoesNotExist):
+            raise ValueError(f"no camera with id '{raw_camera}'")
+
+    return start, end, days, camera
+
+
+@api_view(["GET"])
+def daily_report(request):
+    """Crossings per calendar date, in the project's local timezone.
+
+    ``?days=30`` (default), or an explicit ``?start=&end=`` window.
+    ``?camera=<id>`` narrows to one camera, ``?format=csv`` downloads it.
+    """
+    try:
+        start, end, days, camera = _daily_params(request)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    rows = daily_counts(start=start, end=end, days=days, camera=camera)
+    window_start, window_end = resolve_range(start, end, days)
+
+    params = request.query_params
+    if (params.get("format") or "").lower() == "csv":
+        label = f"{window_start.isoformat()}_{window_end.isoformat()}"
+        if camera is not None:
+            label = f"camera{camera.pk}_{label}"
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = (
+            f'attachment; filename="visitors_{label}.csv"'
+        )
+        writer = csv.writer(response)
+        writer.writerow(["date", "in", "out", "net"])
+        for row in rows:
+            writer.writerow([row["date"], row["in"], row["out"], row["net"]])
+        return response
+
+    return Response({
+        "start": window_start.isoformat(),
+        "end": window_end.isoformat(),
+        "camera_id": camera.pk if camera else None,
+        "camera_name": camera.name if camera else None,
+        "summary": summarise(rows),
+        "days": rows,
+    })

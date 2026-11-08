@@ -45,6 +45,10 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",
     ],
+    # DRF claims ?format= for renderer negotiation, which 404s on
+    # ?format=csv. JSON is the only renderer configured, so that mechanism
+    # buys nothing; release the parameter for the reports to use.
+    "URL_FORMAT_OVERRIDE": None,
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],

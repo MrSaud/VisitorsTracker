@@ -6,6 +6,7 @@ a model file, or any particular machine speed.
 
 import pathlib
 import tempfile
+from datetime import date, datetime, timezone as dt_timezone
 from unittest import skipUnless
 
 import cv2
@@ -14,6 +15,14 @@ from django.test import TestCase, TransactionTestCase
 
 from .camera import CounterWorker
 from .models import Camera, CountEvent
+from .reports import (
+    MAX_DAYS,
+    daily_counts,
+    local_today,
+    parse_date,
+    resolve_range,
+    summarise,
+)
 from .vision import (
     DEFAULT_HOG_CONFIDENCE,
     DEFAULT_ONNX_CONFIDENCE,
@@ -587,3 +596,193 @@ class SuggestLineSetupTests(TestCase):
         result = suggest_line_setup(centroids, self.SHAPE)
         self.assertGreaterEqual(result["position"], 0.05)
         self.assertLessEqual(result["position"], 0.95)
+
+
+class DailyRangeTests(TestCase):
+    def test_days_alone_ends_today(self):
+        start, end = resolve_range(days=7)
+        self.assertEqual(end, local_today())
+        self.assertEqual((end - start).days, 6)      # inclusive of both ends
+
+    def test_start_plus_days(self):
+        start, end = resolve_range(start=date(2026, 3, 1), days=5)
+        self.assertEqual((start, end), (date(2026, 3, 1), date(2026, 3, 5)))
+
+    def test_end_plus_days(self):
+        start, end = resolve_range(end=date(2026, 3, 10), days=3)
+        self.assertEqual((start, end), (date(2026, 3, 8), date(2026, 3, 10)))
+
+    def test_explicit_window_is_respected(self):
+        start, end = resolve_range(start=date(2026, 3, 1), end=date(2026, 3, 4))
+        self.assertEqual((start, end), (date(2026, 3, 1), date(2026, 3, 4)))
+
+    def test_backwards_window_is_swapped(self):
+        start, end = resolve_range(start=date(2026, 3, 9), end=date(2026, 3, 2))
+        self.assertEqual((start, end), (date(2026, 3, 2), date(2026, 3, 9)))
+
+    def test_window_is_capped(self):
+        start, end = resolve_range(start=date(2000, 1, 1), end=date(2026, 1, 1))
+        self.assertEqual((end - start).days + 1, MAX_DAYS)
+
+    def test_days_is_clamped(self):
+        _s, _e = resolve_range(days=99999)
+        self.assertEqual((_e - _s).days + 1, MAX_DAYS)
+
+
+class DailyCountsTests(TestCase):
+    """Bucketing by local date, which is the whole point of this report."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.other = Camera.objects.create(name="Side", source="1")
+
+    def _event(self, when, direction=DIRECTION_IN, camera=None):
+        return CountEvent.objects.create(
+            camera=camera or self.camera, track_id=1,
+            direction=direction, occurred_at=when,
+        )
+
+    def test_late_night_utc_lands_on_the_local_date(self):
+        # 22:30 UTC on the 1st is 01:30 on the 2nd in Kuwait (UTC+3).
+        self._event(datetime(2026, 3, 1, 22, 30, tzinfo=dt_timezone.utc))
+        rows = daily_counts(start=date(2026, 3, 1), end=date(2026, 3, 2))
+        by_date = {r["date"]: r for r in rows}
+        self.assertEqual(by_date["2026-03-01"]["in"], 0, "must not use the UTC date")
+        self.assertEqual(by_date["2026-03-02"]["in"], 1)
+
+    def test_start_of_local_day_is_included(self):
+        # 21:00 UTC == 00:00 local on the 2nd: the first instant of that day.
+        self._event(datetime(2026, 3, 1, 21, 0, tzinfo=dt_timezone.utc))
+        rows = daily_counts(start=date(2026, 3, 2), end=date(2026, 3, 2))
+        self.assertEqual(rows[0]["in"], 1)
+
+    def test_just_before_local_day_is_excluded(self):
+        self._event(datetime(2026, 3, 1, 20, 59, tzinfo=dt_timezone.utc))
+        rows = daily_counts(start=date(2026, 3, 2), end=date(2026, 3, 2))
+        self.assertEqual(rows[0]["in"], 0)
+
+    def test_quiet_days_are_zero_filled(self):
+        self._event(datetime(2026, 3, 1, 9, 0, tzinfo=dt_timezone.utc))
+        self._event(datetime(2026, 3, 4, 9, 0, tzinfo=dt_timezone.utc))
+        rows = daily_counts(start=date(2026, 3, 1), end=date(2026, 3, 5))
+        self.assertEqual(len(rows), 5)
+        self.assertEqual([r["in"] for r in rows], [1, 0, 0, 1, 0])
+        self.assertEqual([r["date"] for r in rows][1], "2026-03-02")
+
+    def test_in_and_out_are_separated(self):
+        for _ in range(3):
+            self._event(datetime(2026, 3, 3, 9, 0, tzinfo=dt_timezone.utc))
+        self._event(datetime(2026, 3, 3, 10, 0, tzinfo=dt_timezone.utc),
+                    direction=DIRECTION_OUT)
+        rows = daily_counts(start=date(2026, 3, 3), end=date(2026, 3, 3))
+        self.assertEqual((rows[0]["in"], rows[0]["out"], rows[0]["net"]), (3, 1, 2))
+
+    def test_camera_filter(self):
+        self._event(datetime(2026, 3, 3, 9, 0, tzinfo=dt_timezone.utc))
+        self._event(datetime(2026, 3, 3, 9, 0, tzinfo=dt_timezone.utc), camera=self.other)
+        everything = daily_counts(start=date(2026, 3, 3), end=date(2026, 3, 3))
+        one = daily_counts(start=date(2026, 3, 3), end=date(2026, 3, 3), camera=self.camera)
+        self.assertEqual(everything[0]["in"], 2)
+        self.assertEqual(one[0]["in"], 1)
+
+    def test_events_outside_the_window_are_ignored(self):
+        self._event(datetime(2026, 2, 20, 9, 0, tzinfo=dt_timezone.utc))
+        rows = daily_counts(start=date(2026, 3, 1), end=date(2026, 3, 3))
+        self.assertEqual(sum(r["in"] for r in rows), 0)
+
+
+class SummariseTests(TestCase):
+    def test_totals_and_busiest_day(self):
+        rows = [
+            {"date": "2026-03-01", "in": 2, "out": 1, "net": 1},
+            {"date": "2026-03-02", "in": 9, "out": 4, "net": 5},
+            {"date": "2026-03-03", "in": 1, "out": 0, "net": 1},
+        ]
+        summary = summarise(rows)
+        self.assertEqual(summary["in"], 12)
+        self.assertEqual(summary["out"], 5)
+        self.assertEqual(summary["busiest_date"], "2026-03-02")
+        self.assertEqual(summary["busiest_in"], 9)
+        self.assertEqual(summary["daily_average_in"], 4.0)
+
+    def test_all_zero_has_no_busiest_day(self):
+        rows = [{"date": "2026-03-01", "in": 0, "out": 0, "net": 0}]
+        self.assertIsNone(summarise(rows)["busiest_date"])
+
+    def test_empty_report(self):
+        self.assertEqual(summarise([])["in"], 0)
+
+
+class ParseDateTests(TestCase):
+    def test_valid(self):
+        self.assertEqual(parse_date("2026-03-07"), date(2026, 3, 7))
+
+    def test_blank_is_none(self):
+        self.assertIsNone(parse_date(""))
+        self.assertIsNone(parse_date(None))
+
+    def test_invalid_raises(self):
+        with self.assertRaises(ValueError):
+            parse_date("07/03/2026")
+        with self.assertRaises(ValueError):
+            parse_date("not-a-date")
+
+
+class DailyApiTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        for _ in range(4):
+            CountEvent.objects.create(
+                camera=self.camera, track_id=1, direction=DIRECTION_IN,
+                occurred_at=datetime(2026, 3, 3, 9, 0, tzinfo=dt_timezone.utc),
+            )
+
+    def test_explicit_window(self):
+        response = self.client.get("/api/v1/daily/?start=2026-03-01&end=2026-03-05")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["start"], "2026-03-01")
+        self.assertEqual(body["end"], "2026-03-05")
+        self.assertEqual(len(body["days"]), 5)
+        self.assertEqual(body["summary"]["in"], 4)
+
+    def test_default_window_is_thirty_days(self):
+        body = self.client.get("/api/v1/daily/").json()
+        self.assertEqual(len(body["days"]), 30)
+        self.assertEqual(body["end"], local_today().isoformat())
+
+    def test_camera_filter_is_reported_back(self):
+        body = self.client.get(
+            f"/api/v1/daily/?camera={self.camera.pk}&start=2026-03-03&end=2026-03-03"
+        ).json()
+        self.assertEqual(body["camera_id"], self.camera.pk)
+        self.assertEqual(body["camera_name"], "Door")
+        self.assertEqual(body["days"][0]["in"], 4)
+
+    def test_csv_export(self):
+        response = self.client.get(
+            "/api/v1/daily/?start=2026-03-03&end=2026-03-04&format=csv"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "text/csv")
+        self.assertIn("attachment;", response["Content-Disposition"])
+        lines = response.content.decode().strip().splitlines()
+        self.assertEqual(lines[0], "date,in,out,net")
+        self.assertEqual(lines[1], "2026-03-03,4,0,4")
+        self.assertEqual(lines[2], "2026-03-04,0,0,0")
+
+    def test_bad_date_is_400(self):
+        response = self.client.get("/api/v1/daily/?start=07-03-2026")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("detail", response.json())
+
+    def test_bad_days_is_400(self):
+        self.assertEqual(self.client.get("/api/v1/daily/?days=lots").status_code, 400)
+        self.assertEqual(self.client.get("/api/v1/daily/?days=0").status_code, 400)
+
+    def test_unknown_camera_is_400(self):
+        self.assertEqual(self.client.get("/api/v1/daily/?camera=9999").status_code, 400)
+
+    def test_dashboard_includes_the_panel(self):
+        response = self.client.get("/")
+        self.assertContains(response, "Visitors per date")
