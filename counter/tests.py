@@ -5,10 +5,12 @@ a model file, or any particular machine speed.
 """
 
 import itertools
+import json
 import os
 import pathlib
 import sys
 import tempfile
+import urllib.error
 import time as time_module
 from io import StringIO
 from unittest.mock import patch
@@ -19,7 +21,9 @@ import cv2
 import numpy as np
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
+from django.core import mail
 from django.core.management import call_command
+from django.db import IntegrityError
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
@@ -51,7 +55,20 @@ from .health import (
     camera_health,
     overall_status,
 )
-from .models import Camera, Crossing, Event, active_event_for
+from .alerts import (
+    Condition,
+    alert_channels,
+    capacity_conditions,
+    current_conditions,
+    deliver,
+    health_conditions,
+    notification_text,
+    pending,
+    reconcile_alerts,
+    run_checks,
+    send_pending,
+)
+from .models import Alert, Camera, Crossing, Event, active_event_for
 from .reports import (
     MAX_DAYS,
     busiest_hours,
@@ -2871,3 +2888,612 @@ class OpenFailureHintTests(TestCase):
         self.assertIn("reachable on the network", message)
         self.assertNotIn("Privacy & Security", message,
                          "camera permissions have nothing to do with RTSP")
+
+
+# ---------------------------------------------------------------------------
+# alerting
+# ---------------------------------------------------------------------------
+
+ALERTS_ON = dict(
+    COUNTER_ALERTS_ENABLED=True,
+    COUNTER_ALERT_AFTER_SECONDS=60,
+    COUNTER_ALERT_MIN_SEVERITY=1,
+    COUNTER_ALERT_WEBHOOK="",
+    COUNTER_ALERT_EMAILS="",
+    COUNTER_SITE_NAME="Test venue",
+)
+
+
+@override_settings(**ALERTS_ON)
+class AlertConditionTests(TestCase):
+    """What counts as worth telling somebody about."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0", is_active=True)
+
+    def _health(self, worker):
+        return health_conditions([self.camera], FakeRegistry({self.camera.pk: worker}))
+
+    def test_a_working_camera_is_not_news(self):
+        self.assertEqual(self._health(FakeWorker(seconds_since_frame=1.0)), [])
+
+    def test_an_offline_camera_is_critical(self):
+        conditions = self._health(None)
+
+        self.assertEqual(len(conditions), 1)
+        self.assertEqual(conditions[0].level, Alert.LEVEL_CRITICAL)
+        self.assertEqual(conditions[0].state, OFFLINE)
+        self.assertEqual(conditions[0].key, f"health:camera:{self.camera.pk}")
+        self.assertIn("Door is offline", conditions[0].message)
+
+    def test_a_stalled_camera_is_a_warning(self):
+        conditions = self._health(FakeWorker(seconds_since_frame=120.0))
+
+        self.assertEqual(conditions[0].level, Alert.LEVEL_WARNING)
+        self.assertEqual(conditions[0].state, STALLED)
+
+    def test_a_reconnecting_camera_is_a_warning(self):
+        worker = FakeWorker(seconds_since_frame=120.0, error="Stream lost.")
+        worker.reconnecting = True
+        worker.reconnects = 1
+        worker.retry_in = 4.0
+
+        conditions = self._health(worker)
+
+        self.assertEqual(conditions[0].state, RECONNECTING)
+        self.assertEqual(conditions[0].level, Alert.LEVEL_WARNING)
+
+    @override_settings(COUNTER_ALERT_MIN_SEVERITY=2)
+    def test_severity_two_ignores_the_merely_degraded(self):
+        self.assertEqual(self._health(FakeWorker(seconds_since_frame=120.0)), [],
+                         "a blinking camera should not page anyone at 2am")
+        self.assertEqual(len(self._health(None)), 1,
+                         "but a dead one still should")
+
+    def test_a_deactivated_camera_is_not_a_problem(self):
+        Camera.objects.filter(pk=self.camera.pk).update(is_active=False)
+        self.camera.refresh_from_db()
+        self.assertEqual(self._health(None), [])
+
+    def test_a_finished_clip_is_not_a_problem(self):
+        worker = FakeWorker(alive=False, is_file=True, frames_read=500)
+        clip = Camera.objects.create(name="Clip", source="/tmp/x.avi")
+        conditions = health_conditions([clip], FakeRegistry({clip.pk: worker}))
+        self.assertEqual(conditions, [])
+
+
+@override_settings(**ALERTS_ON)
+class CapacityConditionTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def _fill(self, event, count):
+        base = timezone.localtime() - timedelta(minutes=30)
+        Crossing.objects.bulk_create([
+            Crossing(camera=self.camera, track_id=index, direction=DIRECTION_IN,
+                     occurred_at=base + timedelta(seconds=index), event=event)
+            for index in range(count)
+        ])
+
+    def _event(self, capacity=10, **kwargs):
+        return make_event(name="Expo", offset_hours=-1, duration_hours=4,
+                          capacity=capacity, **kwargs)
+
+    def test_comfortable_is_not_news(self):
+        self._fill(self._event(), 3)
+        self.assertEqual(capacity_conditions(), [])
+
+    def test_near_capacity_is_a_warning(self):
+        self._fill(self._event(capacity=10), 9)
+
+        conditions = capacity_conditions()
+
+        self.assertEqual(len(conditions), 1)
+        self.assertEqual(conditions[0].state, "near")
+        self.assertEqual(conditions[0].level, Alert.LEVEL_WARNING)
+        self.assertIn("near capacity", conditions[0].message)
+        self.assertIn("1 place left", conditions[0].message,
+                      "one place, not one places")
+
+    def test_over_capacity_is_critical(self):
+        self._fill(self._event(capacity=10), 12)
+
+        conditions = capacity_conditions()
+
+        self.assertEqual(conditions[0].state, "over")
+        self.assertEqual(conditions[0].level, Alert.LEVEL_CRITICAL)
+        self.assertIn("12 inside, limit 10 (120.0%)", conditions[0].message)
+
+    def test_an_event_that_is_not_running_is_not_watched(self):
+        past = make_event(name="Yesterday", offset_hours=-30,
+                          duration_hours=2, capacity=5)
+        self._fill(past, 50)
+        self.assertEqual(capacity_conditions(), [])
+
+    def test_an_event_without_a_capacity_is_not_watched(self):
+        self._fill(make_event(name="Open day", offset_hours=-1), 500)
+        self.assertEqual(capacity_conditions(), [])
+
+
+@override_settings(**ALERTS_ON)
+class AlertReconcileTests(TestCase):
+    """Conditions become alerts that open, escalate and resolve."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def _condition(self, state="offline", level=Alert.LEVEL_CRITICAL):
+        return Condition(
+            key=f"health:camera:{self.camera.pk}",
+            kind=Alert.KIND_HEALTH, state=state, level=level,
+            message=f"Door is {state}.", camera=self.camera, event=None,
+        )
+
+    def test_a_new_problem_opens_one_alert(self):
+        opened, escalated, resolved = reconcile_alerts([self._condition()])
+
+        self.assertEqual(len(opened), 1)
+        self.assertEqual((escalated, resolved), ([], []))
+        self.assertEqual(Alert.objects.count(), 1)
+        self.assertTrue(Alert.objects.get().is_open)
+
+    def test_the_same_problem_does_not_open_another(self):
+        reconcile_alerts([self._condition()])
+        opened, _escalated, _resolved = reconcile_alerts([self._condition()])
+
+        self.assertEqual(opened, [],
+                         "a check every 30s must not be a message every 30s")
+        self.assertEqual(Alert.objects.count(), 1)
+
+    def test_the_detail_is_kept_current_without_saying_anything(self):
+        reconcile_alerts([self._condition()])
+        changed = self._condition()._replace(message="Door is offline. Retrying in 8s.")
+        reconcile_alerts([changed])
+
+        alert = Alert.objects.get()
+        self.assertEqual(alert.message, "Door is offline. Retrying in 8s.")
+        self.assertIsNone(alert.notified_at)
+
+    def test_getting_worse_is_not_getting_better(self):
+        reconcile_alerts([self._condition(state="near",
+                                          level=Alert.LEVEL_WARNING)])
+        opened, escalated, resolved = reconcile_alerts([self._condition(state="over")])
+
+        self.assertEqual(len(escalated), 1)
+        self.assertEqual((opened, resolved), ([], []))
+
+        old = Alert.objects.get(state="near")
+        self.assertFalse(old.is_open)
+        self.assertTrue(old.superseded,
+                        "an escalation must not read as a fix")
+        self.assertTrue(Alert.objects.get(state="over").is_open)
+
+    def test_a_problem_going_away_resolves_it(self):
+        reconcile_alerts([self._condition()])
+        _opened, _escalated, resolved = reconcile_alerts([])
+
+        self.assertEqual(len(resolved), 1)
+        self.assertFalse(Alert.objects.get().is_open)
+
+    def test_the_same_problem_returning_is_a_new_alert(self):
+        reconcile_alerts([self._condition()])
+        reconcile_alerts([])
+        opened, _escalated, _resolved = reconcile_alerts([self._condition()])
+
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(Alert.objects.count(), 2)
+        self.assertEqual(Alert.objects.filter(resolved_at__isnull=True).count(), 1)
+
+    def test_two_open_alerts_for_one_problem_are_impossible(self):
+        reconcile_alerts([self._condition()])
+        with self.assertRaises(IntegrityError):
+            Alert.objects.create(
+                kind=Alert.KIND_HEALTH, key=f"health:camera:{self.camera.pk}",
+                state="offline", level=Alert.LEVEL_CRITICAL, message="again",
+            )
+
+
+@override_settings(**ALERTS_ON)
+class AlertGraceTests(TestCase):
+    """Nothing is sent until a problem has proved it is not a blink."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.condition = Condition(
+            key="health:camera:1", kind=Alert.KIND_HEALTH, state="offline",
+            level=Alert.LEVEL_CRITICAL, message="Door is offline.",
+            camera=self.camera, event=None,
+        )
+
+    def test_a_brand_new_problem_waits(self):
+        reconcile_alerts([self.condition])
+        to_announce, to_clear = pending()
+
+        self.assertEqual((to_announce, to_clear), ([], []))
+
+    def test_it_is_announced_once_the_grace_passes(self):
+        past = timezone.now() - timedelta(seconds=90)
+        reconcile_alerts([self.condition], now=past)
+
+        to_announce, _to_clear = pending()
+        self.assertEqual(len(to_announce), 1)
+
+    def test_a_blink_tells_nobody(self):
+        # Appeared and gone again inside the grace period.
+        reconcile_alerts([self.condition])
+        reconcile_alerts([])
+
+        to_announce, to_clear = pending()
+        self.assertEqual((to_announce, to_clear), ([], []),
+                         "two seconds of trouble is not worth a phone buzzing")
+        alert = Alert.objects.get()
+        self.assertFalse(alert.is_open)
+        self.assertIsNone(alert.notified_at)
+
+    def test_a_recovery_is_owed_only_if_the_problem_was_announced(self):
+        past = timezone.now() - timedelta(seconds=90)
+        reconcile_alerts([self.condition], now=past)
+        Alert.objects.update(notified_at=timezone.now())
+        reconcile_alerts([])
+
+        _to_announce, to_clear = pending()
+        self.assertEqual(len(to_clear), 1)
+
+    def test_a_superseded_alert_owes_no_recovery(self):
+        past = timezone.now() - timedelta(seconds=90)
+        reconcile_alerts([self.condition], now=past)
+        Alert.objects.update(notified_at=timezone.now())
+        reconcile_alerts([self.condition._replace(state="worse")])
+
+        _to_announce, to_clear = pending()
+        self.assertEqual(to_clear, [],
+                         "'resolved' would be a lie when it got worse")
+
+
+class FakeResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class WebhookRecorder:
+    """Stands in for urlopen, keeping what would have gone out."""
+
+    def __init__(self, error=None):
+        self.requests = []
+        self.error = error
+
+    def __call__(self, request, timeout=None):
+        self.requests.append(request)
+        if self.error:
+            raise self.error
+        return FakeResponse()
+
+    @property
+    def payloads(self):
+        return [json.loads(request.data.decode()) for request in self.requests]
+
+
+NOWHERE = dict(ALERTS_ON, COUNTER_ALERT_AFTER_SECONDS=0)
+TO_WEBHOOK = dict(NOWHERE, COUNTER_ALERT_WEBHOOK="https://hooks.example.com/abc")
+TO_EMAIL = dict(
+    NOWHERE,
+    COUNTER_ALERT_EMAILS="ops@example.com, manager@example.com",
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+)
+
+
+class AlertDeliveryTests(TestCase):
+    """Getting the message out, and being honest when it did not go."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.alert = Alert.objects.create(
+            kind=Alert.KIND_HEALTH, key="health:camera:1", state="offline",
+            level=Alert.LEVEL_CRITICAL, message="Door is offline.",
+            camera=self.camera,
+        )
+
+    @override_settings(**TO_WEBHOOK)
+    def test_the_webhook_gets_readable_text_and_the_detail(self):
+        recorder = WebhookRecorder()
+        with patch("counter.alerts.urllib.request.urlopen", recorder):
+            delivered, error = deliver(self.alert)
+
+        self.assertTrue(delivered)
+        self.assertEqual(error, "")
+        self.assertEqual(len(recorder.requests), 1)
+
+        request = recorder.requests[0]
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+
+        payload = recorder.payloads[0]
+        # Slack and Teams both render "text"; the rest is for anything else.
+        self.assertEqual(payload["text"],
+                         "[Test venue] CRITICAL: Door is offline.")
+        self.assertEqual(payload["alert"]["state"], "offline")
+        self.assertEqual(payload["alert"]["camera"], "Door")
+        self.assertFalse(payload["alert"]["resolved"])
+
+    @override_settings(**dict(NOWHERE, COUNTER_ALERT_WEBHOOK="file:///etc/passwd"))
+    def test_a_webhook_must_be_http(self):
+        delivered, error = deliver(self.alert)
+
+        self.assertFalse(delivered)
+        self.assertIn("must be http or https", error)
+
+    @override_settings(**TO_EMAIL)
+    def test_email_reaches_every_recipient(self):
+        delivered, error = deliver(self.alert)
+
+        self.assertTrue(delivered)
+        self.assertEqual(error, "")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(sorted(mail.outbox[0].to),
+                         ["manager@example.com", "ops@example.com"])
+        self.assertIn("Door is offline.", mail.outbox[0].subject)
+
+    @override_settings(**NOWHERE)
+    def test_with_nowhere_to_send_it_says_so(self):
+        delivered, error = deliver(self.alert)
+
+        self.assertFalse(delivered)
+        self.assertEqual(error, "No alert channel configured.")
+
+    @override_settings(**TO_WEBHOOK)
+    def test_one_channel_failing_does_not_hide_the_other(self):
+        with override_settings(COUNTER_ALERT_EMAILS="ops@example.com",
+                               EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend"):
+            recorder = WebhookRecorder(error=urllib.error.URLError("no route"))
+            with patch("counter.alerts.urllib.request.urlopen", recorder):
+                delivered, error = deliver(self.alert)
+
+        self.assertTrue(delivered, "the email still went")
+        self.assertIn("webhook:", error, "but the failure is recorded")
+        self.assertEqual(len(mail.outbox), 1)
+
+    @override_settings(**NOWHERE)
+    def test_the_wording_says_what_happened(self):
+        self.assertEqual(notification_text(self.alert),
+                         "[Test venue] CRITICAL: Door is offline.")
+
+        self.alert.level = Alert.LEVEL_WARNING
+        self.assertTrue(notification_text(self.alert).startswith(
+            "[Test venue] Warning:"))
+
+        self.alert.started_at = timezone.now() - timedelta(minutes=12)
+        self.alert.resolved_at = timezone.now()
+        self.assertEqual(
+            notification_text(self.alert, resolved=True),
+            "[Test venue] Resolved after 12m: Door is offline.")
+
+
+@override_settings(**ALERTS_ON)
+class SendPendingTests(TestCase):
+    """What is owed goes out once, and a failure is not lost."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.condition = Condition(
+            key="health:camera:1", kind=Alert.KIND_HEALTH, state="offline",
+            level=Alert.LEVEL_CRITICAL, message="Door is offline.",
+            camera=self.camera, event=None,
+        )
+        reconcile_alerts([self.condition],
+                         now=timezone.now() - timedelta(seconds=90))
+
+    @override_settings(**TO_WEBHOOK)
+    def test_it_goes_out_once_and_not_again(self):
+        recorder = WebhookRecorder()
+        with patch("counter.alerts.urllib.request.urlopen", recorder):
+            sent, failed = send_pending()
+            self.assertEqual((len(sent), failed), (1, []))
+
+            sent_again, _failed = send_pending()
+
+        self.assertEqual(sent_again, [], "an open alert is not a repeating alarm")
+        self.assertEqual(len(recorder.requests), 1)
+        self.assertTrue(Alert.objects.get().delivered)
+
+    @override_settings(**TO_WEBHOOK)
+    def test_a_failed_send_is_retried_rather_than_lost(self):
+        failing = WebhookRecorder(error=urllib.error.URLError("timed out"))
+        with patch("counter.alerts.urllib.request.urlopen", failing):
+            sent, failed = send_pending()
+
+        self.assertEqual((sent, len(failed)), ([], 1))
+        alert = Alert.objects.get()
+        self.assertIsNone(alert.notified_at, "still owed")
+        self.assertIn("timed out", alert.delivery_error)
+
+        working = WebhookRecorder()
+        with patch("counter.alerts.urllib.request.urlopen", working):
+            sent, failed = send_pending()
+
+        self.assertEqual((len(sent), failed), (1, []))
+        self.assertTrue(Alert.objects.get().delivered)
+
+    @override_settings(**NOWHERE)
+    def test_with_nowhere_to_send_it_is_not_retried_for_ever(self):
+        sent, failed = send_pending()
+
+        self.assertEqual((len(sent), failed), (1, []))
+        alert = Alert.objects.get()
+        self.assertIsNotNone(alert.notified_at, "nothing left to try")
+        self.assertFalse(alert.delivered,
+                         "but nobody was told, and it must not claim otherwise")
+        self.assertEqual(alert.delivery_error, "No alert channel configured.")
+
+    @override_settings(**TO_WEBHOOK)
+    def test_recovery_is_announced_to_whoever_heard_the_problem(self):
+        recorder = WebhookRecorder()
+        with patch("counter.alerts.urllib.request.urlopen", recorder):
+            send_pending()
+            reconcile_alerts([])
+            sent, _failed = send_pending()
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(recorder.requests), 2)
+        self.assertIn("Resolved after", recorder.payloads[1]["text"])
+        self.assertTrue(recorder.payloads[1]["alert"]["resolved"])
+
+    @override_settings(**TO_WEBHOOK)
+    def test_a_full_pass_ties_it_together(self):
+        Alert.objects.all().delete()
+        Camera.objects.filter(pk=self.camera.pk).update(is_active=True)
+        recorder = WebhookRecorder()
+
+        with patch("counter.alerts.urllib.request.urlopen", recorder):
+            # Nothing is running, so the camera is offline.
+            outcome = run_checks(registry=FakeRegistry())
+
+        self.assertEqual(len(outcome.opened), 1)
+        self.assertEqual(len(outcome.sent), 1)
+        self.assertIn("is offline", recorder.payloads[0]["text"])
+
+
+@override_settings(**ALERTS_ON)
+class AlertApiTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.old = Alert.objects.create(
+            kind=Alert.KIND_HEALTH, key="health:camera:9", state="offline",
+            level=Alert.LEVEL_CRITICAL, message="Old problem", camera=self.camera,
+            started_at=timezone.now() - timedelta(hours=2),
+            resolved_at=timezone.now() - timedelta(hours=1),
+            notified_at=timezone.now() - timedelta(hours=2),
+        )
+        self.live = Alert.objects.create(
+            kind=Alert.KIND_CAPACITY, key="capacity:event:1", state="over",
+            level=Alert.LEVEL_CRITICAL, message="Hall is over capacity",
+            started_at=timezone.now() - timedelta(minutes=5),
+        )
+
+    def test_open_alerts_come_first(self):
+        payload = self.client.get("/api/v1/alerts/").json()
+
+        self.assertEqual(payload["open"], 1)
+        self.assertEqual([a["message"] for a in payload["alerts"]],
+                         ["Hall is over capacity", "Old problem"])
+        self.assertTrue(payload["alerts"][0]["open"])
+        self.assertFalse(payload["alerts"][1]["open"])
+
+    def test_only_what_is_wrong_now(self):
+        payload = self.client.get("/api/v1/alerts/?open=1").json()
+        self.assertEqual(len(payload["alerts"]), 1)
+
+    def test_filtering_by_kind(self):
+        payload = self.client.get("/api/v1/alerts/?kind=capacity").json()
+        self.assertEqual([a["kind"] for a in payload["alerts"]], ["capacity"])
+
+    def test_an_unknown_kind_is_a_400(self):
+        response = self.client.get("/api/v1/alerts/?kind=weather")
+        self.assertEqual(response.status_code, 400)
+
+    def test_it_says_whether_anyone_would_be_told(self):
+        payload = self.client.get("/api/v1/alerts/").json()
+
+        self.assertTrue(payload["enabled"])
+        self.assertEqual(payload["channels"], [],
+                         "nothing configured, and the dashboard should say so")
+        self.assertFalse(payload["alerts"][0]["delivered"])
+
+    @override_settings(**TO_WEBHOOK)
+    def test_channels_are_listed_when_configured(self):
+        payload = self.client.get("/api/v1/alerts/").json()
+        self.assertEqual(payload["channels"], ["webhook"])
+
+
+@override_settings(**NOWHERE)
+class CheckAlertsCommandTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0", is_active=True)
+
+    def test_dry_run_reports_without_recording(self):
+        out = StringIO()
+        call_command("check_alerts", "--dry-run", stdout=out)
+
+        self.assertIn("Door is offline", out.getvalue())
+        self.assertEqual(Alert.objects.count(), 0,
+                         "a dry run must not leave anything behind")
+
+    def test_a_real_pass_opens_and_reports(self):
+        out = StringIO()
+        call_command("check_alerts", stdout=out)
+
+        self.assertIn("opened:", out.getvalue())
+        self.assertEqual(Alert.objects.count(), 1)
+
+    def test_nothing_wrong_says_so(self):
+        Camera.objects.all().delete()
+        out = StringIO()
+        call_command("check_alerts", "--dry-run", stdout=out)
+        self.assertIn("nothing wrong", out.getvalue())
+
+    @override_settings(**TO_WEBHOOK)
+    def test_a_delivery_failure_exits_non_zero(self):
+        failing = WebhookRecorder(error=urllib.error.URLError("nope"))
+        with patch("counter.alerts.urllib.request.urlopen", failing):
+            with self.assertRaises(SystemExit) as caught:
+                call_command("check_alerts", stderr=StringIO(), stdout=StringIO())
+
+        self.assertEqual(caught.exception.code, 1)
+
+
+class SupervisorAlertHookTests(TestCase):
+    """The supervisor is where alerting lives, at its own slower cadence."""
+
+    def setUp(self):
+        self.supervisor = Supervisor(registry=RecordingRegistry(), interval=1)
+
+    @override_settings(COUNTER_ALERTS_ENABLED=False)
+    def test_nothing_happens_when_alerting_is_off(self):
+        with patch("counter.alerts.run_checks") as checks:
+            self.assertIsNone(self.supervisor.maybe_check_alerts())
+        checks.assert_not_called()
+
+    @override_settings(**dict(ALERTS_ON, COUNTER_ALERT_INTERVAL=30))
+    def test_it_checks_then_waits_its_interval(self):
+        supervisor = Supervisor(registry=RecordingRegistry(), interval=1)
+        with patch("counter.alerts.run_checks") as checks:
+            supervisor.maybe_check_alerts(now=1000.0)
+            supervisor.maybe_check_alerts(now=1010.0)
+            self.assertEqual(checks.call_count, 1,
+                             "reconciling every 10s must not alert every 10s")
+            supervisor.maybe_check_alerts(now=1031.0)
+            self.assertEqual(checks.call_count, 2)
+
+    @override_settings(**ALERTS_ON)
+    def test_a_failing_check_does_not_stop_the_supervisor(self):
+        with patch("counter.alerts.run_checks", side_effect=RuntimeError("boom")):
+            self.assertIsNone(self.supervisor.maybe_check_alerts())
+
+
+@override_settings(**ALERTS_ON)
+class AlertOrderingTests(TestCase):
+    """A long-running problem must not be pushed off the list by fixed ones."""
+
+    def test_an_old_open_alert_outranks_newer_resolved_ones(self):
+        old_open = Alert.objects.create(
+            kind=Alert.KIND_HEALTH, key="health:camera:1", state="offline",
+            level=Alert.LEVEL_CRITICAL, message="Still broken",
+            started_at=timezone.now() - timedelta(days=2),
+        )
+        for index in range(5):
+            Alert.objects.create(
+                kind=Alert.KIND_HEALTH, key=f"health:camera:{index + 2}",
+                state="stalled", level=Alert.LEVEL_WARNING,
+                message=f"Fixed {index}",
+                started_at=timezone.now() - timedelta(minutes=index + 1),
+                resolved_at=timezone.now(),
+            )
+
+        payload = self.client.get("/api/v1/alerts/?limit=3").json()
+
+        self.assertEqual(payload["alerts"][0]["id"], old_open.pk)
+        self.assertEqual(len(payload["alerts"]), 3)

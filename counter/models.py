@@ -305,3 +305,95 @@ class Crossing(models.Model):
 
     def __str__(self):
         return f"{self.camera.name}: {self.direction} #{self.track_id}"
+
+
+class Alert(models.Model):
+    """Something worth telling somebody about, and whether we did.
+
+    An alert is a *condition*, not an event: it opens when something goes
+    wrong, stays open while it is still wrong, and resolves when it is put
+    right. That is what makes "the hall was over capacity from 11:40 to
+    11:52" answerable afterwards, and it is what stops a check every thirty
+    seconds becoming a message every thirty seconds.
+
+    Rows are written as soon as a condition is seen, but notifying waits
+    for ``COUNTER_ALERT_AFTER_SECONDS``: a camera that blinks for two
+    seconds is not worth anyone's phone buzzing, and a condition that
+    clears inside the grace period is resolved having told nobody.
+    """
+
+    KIND_HEALTH = "health"
+    KIND_CAPACITY = "capacity"
+    KIND_CHOICES = [(KIND_HEALTH, "Camera health"), (KIND_CAPACITY, "Capacity")]
+
+    LEVEL_WARNING = "warning"
+    LEVEL_CRITICAL = "critical"
+    LEVEL_CHOICES = [(LEVEL_WARNING, "Warning"), (LEVEL_CRITICAL, "Critical")]
+
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES)
+    key = models.CharField(
+        max_length=120, db_index=True,
+        help_text="Identifies the condition, so the same problem is one alert.",
+    )
+    state = models.CharField(
+        max_length=32,
+        help_text='The state that triggered it: "offline", "over", and so on.',
+    )
+    level = models.CharField(max_length=16, choices=LEVEL_CHOICES,
+                             default=LEVEL_WARNING)
+    message = models.TextField()
+
+    camera = models.ForeignKey(Camera, on_delete=models.SET_NULL, null=True,
+                               blank=True, related_name="alerts")
+    event = models.ForeignKey("Event", on_delete=models.SET_NULL, null=True,
+                              blank=True, related_name="alerts")
+
+    started_at = models.DateTimeField(default=timezone.now, db_index=True)
+    last_seen_at = models.DateTimeField(default=timezone.now)
+    resolved_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # Delivery is recorded rather than assumed: an alert nobody received is
+    # worse than no alert, because the dashboard would imply it was sent.
+    notified_at = models.DateTimeField(null=True, blank=True)
+    resolved_notified_at = models.DateTimeField(null=True, blank=True)
+    delivery_error = models.TextField(blank=True)
+    superseded = models.BooleanField(
+        default=False,
+        help_text=(
+            "Closed because the condition got worse, not because it was "
+            "fixed. No recovery message is owed for these."
+        ),
+    )
+
+    class Meta:
+        ordering = ["-started_at", "-id"]
+        indexes = [models.Index(fields=["key", "resolved_at"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["key"], condition=models.Q(resolved_at__isnull=True),
+                name="one_open_alert_per_key",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.get_level_display()}: {self.message}"
+
+    @property
+    def is_open(self) -> bool:
+        return self.resolved_at is None
+
+    @property
+    def delivered(self) -> bool:
+        """Whether a notification actually went out, not merely that we tried."""
+        return bool(self.notified_at) and not self.delivery_error
+
+    def duration(self, now=None):
+        return (self.resolved_at or now or timezone.now()) - self.started_at
+
+    def duration_label(self, now=None):
+        seconds = int(self.duration(now).total_seconds())
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"

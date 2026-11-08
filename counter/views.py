@@ -9,17 +9,18 @@ from django.http import (
     HttpResponseForbidden,
     StreamingHttpResponse,
 )
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
+from .alerts import alert_channels, alerts_enabled
 from .camera import REGISTRY, mjpeg_frames
 from .daywindow import occupancy_window_start
 from .health import STATUS_OK, build_report
-from .models import Camera, Crossing, Event, active_event_for
+from .models import Alert, Camera, Crossing, Event, active_event_for
 from .permissions import _is_operator
 from .reports import (
     DEFAULT_DAYS,
@@ -491,4 +492,75 @@ def current_event(request):
     return Response({
         "running": bool(running),
         "events": [_event_payload(e, now) for e in running],
+    })
+
+
+# ---------------------------------------------------------------------------
+# alerts
+# ---------------------------------------------------------------------------
+
+def _alert_payload(alert, now=None):
+    now = now or timezone.now()
+    return {
+        "id": alert.pk,
+        "kind": alert.kind,
+        "key": alert.key,
+        "state": alert.state,
+        "level": alert.level,
+        "message": alert.message,
+        "camera": alert.camera.name if alert.camera else None,
+        "camera_id": alert.camera_id,
+        "event": alert.event.name if alert.event else None,
+        "event_id": alert.event_id,
+        "started_at": alert.started_at.isoformat(),
+        "resolved_at": alert.resolved_at.isoformat() if alert.resolved_at else None,
+        "open": alert.is_open,
+        "duration": alert.duration_label(now),
+        # Whether anyone was actually told, which is not the same as
+        # whether we tried.
+        "delivered": alert.delivered,
+        "delivery_error": alert.delivery_error,
+    }
+
+
+@api_view(["GET"])
+def alert_list(request):
+    """Alerts, open ones first then most recent.
+
+    ``?open=1`` for only what is wrong now, ``?kind=health|capacity``,
+    ``?limit=`` (default 50, max 500).
+    """
+    now = timezone.now()
+    alerts = Alert.objects.select_related("camera", "event")
+
+    if (request.query_params.get("open") or "").lower() in ("1", "true", "yes"):
+        alerts = alerts.filter(resolved_at__isnull=True)
+
+    kind = (request.query_params.get("kind") or "").strip()
+    if kind:
+        if kind not in dict(Alert.KIND_CHOICES):
+            return Response({"detail": f"unknown kind '{kind}'"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        alerts = alerts.filter(kind=kind)
+
+    try:
+        limit = min(500, max(1, int(request.query_params.get("limit", 50))))
+    except (TypeError, ValueError):
+        limit = 50
+
+    # Open first, then newest -- ordered in the database, not after the
+    # slice, so a long-running problem cannot be pushed off the end by a
+    # dozen newer ones that are already fixed.
+    rows = list(
+        alerts.annotate(still_open=Q(resolved_at__isnull=True))
+        .order_by("-still_open", "-started_at", "-id")[:limit]
+    )
+    open_count = Alert.objects.filter(resolved_at__isnull=True).count()
+
+    return Response({
+        "count": len(rows),
+        "open": open_count,
+        "enabled": alerts_enabled(),
+        "channels": alert_channels(),
+        "alerts": [_alert_payload(alert, now) for alert in rows],
     })

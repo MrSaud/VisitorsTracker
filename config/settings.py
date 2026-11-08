@@ -166,5 +166,50 @@ COUNTER_PUBLIC_READS = os.environ.get("COUNTER_PUBLIC_READS", "1") == "1"
 # forever. Set this to when the building is reliably empty.
 COUNTER_OCCUPANCY_RESET_AT = os.environ.get("COUNTER_OCCUPANCY_RESET_AT", "00:00")
 
+# ---------------------------------------------------------------------------
+# Alerting
+# ---------------------------------------------------------------------------
+
+# A dashboard only works while somebody is watching it. With this on, a
+# camera that stops counting and a hall that fills past its capacity reach
+# a person instead of waiting to be noticed.
+COUNTER_ALERTS_ENABLED = os.environ.get("COUNTER_ALERTS_ENABLED", "0") == "1"
+
+# Slack/Teams-compatible incoming webhook. The payload carries a "text"
+# field, which both render, plus the structured alert beside it.
+COUNTER_ALERT_WEBHOOK = os.environ.get("COUNTER_ALERT_WEBHOOK", "")
+
+# Comma-separated recipients. Needs the EMAIL_* settings below to be real.
+COUNTER_ALERT_EMAILS = os.environ.get("COUNTER_ALERT_EMAILS", "")
+
+# How long a problem must persist before anyone is told. A camera that
+# blinks for two seconds is not worth a phone buzzing at midnight.
+COUNTER_ALERT_AFTER_SECONDS = float(
+    os.environ.get("COUNTER_ALERT_AFTER_SECONDS", "60"))
+
+# 1 alerts on degraded (stalled, reconnecting) as well as down; 2 only on
+# down (failed, offline).
+COUNTER_ALERT_MIN_SEVERITY = int(
+    os.environ.get("COUNTER_ALERT_MIN_SEVERITY", "1"))
+
+# Seconds between alert checks inside the supervisor.
+COUNTER_ALERT_INTERVAL = float(os.environ.get("COUNTER_ALERT_INTERVAL", "30"))
+
+# Named in every message, so a person with two venues can tell them apart.
+COUNTER_SITE_NAME = os.environ.get("COUNTER_SITE_NAME", "VisitorsTracker")
+
+# Email. The console backend prints instead of sending, which is right for
+# development and useless in a venue: set EMAIL_BACKEND to the SMTP one and
+# fill in the rest when you want alerts to leave the machine.
+EMAIL_BACKEND = os.environ.get(
+    "DJANGO_EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend")
+EMAIL_HOST = os.environ.get("DJANGO_EMAIL_HOST", "localhost")
+EMAIL_PORT = int(os.environ.get("DJANGO_EMAIL_PORT", "25"))
+EMAIL_HOST_USER = os.environ.get("DJANGO_EMAIL_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("DJANGO_EMAIL_PASSWORD", "")
+EMAIL_USE_TLS = os.environ.get("DJANGO_EMAIL_TLS", "0") == "1"
+DEFAULT_FROM_EMAIL = os.environ.get(
+    "DJANGO_FROM_EMAIL", "visitorstracker@localhost")
+
 # Width frames are resized to before detection (smaller = faster).
 COUNTER_FRAME_WIDTH = int(os.environ.get("COUNTER_FRAME_WIDTH", "640"))

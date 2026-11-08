@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Camera, Crossing, Event
+from .models import Alert, Camera, Crossing, Event
 
 
 @admin.register(Camera)
@@ -44,3 +44,28 @@ class CrossingAdmin(admin.ModelAdmin):
     list_display = ("camera", "event", "direction", "track_id", "occurred_at")
     list_filter = ("direction", "camera", "event")
     date_hierarchy = "occurred_at"
+
+
+@admin.register(Alert)
+class AlertAdmin(admin.ModelAdmin):
+    list_display = ("started_at", "level", "kind", "state", "message",
+                    "for_how_long", "was_delivered")
+    list_filter = ("kind", "level", "state", "camera", "event")
+    search_fields = ("message", "key")
+    date_hierarchy = "started_at"
+    readonly_fields = ("kind", "key", "state", "level", "message", "camera",
+                       "event", "started_at", "last_seen_at", "resolved_at",
+                       "notified_at", "resolved_notified_at", "delivery_error",
+                       "superseded")
+
+    def has_add_permission(self, request):
+        # Alerts are observations, not something to type in by hand.
+        return False
+
+    @admin.display(description="For", ordering="started_at")
+    def for_how_long(self, obj):
+        return obj.duration_label() + ("" if obj.is_open else " (resolved)")
+
+    @admin.display(description="Sent", boolean=True)
+    def was_delivered(self, obj):
+        return obj.delivered

@@ -157,6 +157,31 @@
   .alert .title { font-weight: 600; font-size: 14px; }
   .alert ul { margin: 2px 0 0; padding-left: 18px; font-size: 12.5px; }
   .alert li { margin: 2px 0; }
+  .panel-head .muted { color: var(--muted); font-size: 12px; }
+  .alert-rows { display: grid; }
+  .alert-row {
+    display: grid;
+    grid-template-columns: 76px 1fr auto;
+    gap: 12px;
+    align-items: baseline;
+    padding: 10px 18px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .alert-row:first-child { border-top: none; }
+  .alert-row .pip {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    font-weight: 600;
+  }
+  .alert-row.critical .pip { color: var(--out); }
+  .alert-row.warning .pip { color: var(--accent); }
+  .alert-row.resolved { color: var(--muted); }
+  .alert-row.resolved .pip { color: var(--muted); }
+  .alert-row .when { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .alert-row .undelivered {
+    color: var(--out); font-size: 11px; display: block;
+  }
+  .alert-empty { padding: 14px 18px; color: var(--muted); font-size: 13px; }
   .event-card {
     border-radius: 14px;
     border: 1px solid #2a6b45;
@@ -390,6 +415,14 @@
         </div>
       </div>
     </details>
+  </section>
+
+  <section class="panel" id="alerts-panel" hidden>
+    <div class="panel-head">
+      <h2>Alerts</h2>
+      <div class="range"><span class="muted" id="a-channels"></span></div>
+    </div>
+    <div class="alert-rows" id="a-rows"></div>
   </section>
 
   {% if has_cameras %}
@@ -803,6 +836,75 @@ document.getElementById("daily-csv").addEventListener("click", () => {
   window.location = dailyUrl("&format=csv");
 });
 
+// ---- alerts ------------------------------------------------------------
+
+function renderAlerts(data) {
+  const panel = document.getElementById("alerts-panel");
+  const host = document.getElementById("a-rows");
+  const channels = document.getElementById("a-channels");
+
+  // Nothing configured and nothing ever raised: do not take up the space.
+  if (!data.enabled && data.alerts.length === 0) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+
+  channels.textContent = !data.enabled
+    ? "alerting is off"
+    : (data.channels.length
+        ? `${data.open} open · sending to ${data.channels.join(" + ")}`
+        : `${data.open} open · nowhere to send them`);
+
+  host.innerHTML = "";
+  if (data.alerts.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "alert-empty";
+    empty.textContent = "Nothing has gone wrong.";
+    host.appendChild(empty);
+    return;
+  }
+
+  for (const alert of data.alerts) {
+    const row = document.createElement("div");
+    row.className = `alert-row ${alert.level}` + (alert.open ? "" : " resolved");
+
+    const pip = document.createElement("div");
+    pip.className = "pip";
+    pip.textContent = alert.open ? alert.level : "resolved";
+
+    const body = document.createElement("div");
+    body.textContent = alert.message;
+    if (alert.open && !alert.delivered) {
+      const warn = document.createElement("span");
+      warn.className = "undelivered";
+      warn.textContent = alert.delivery_error || "not sent yet";
+      body.appendChild(warn);
+    }
+
+    const when = document.createElement("div");
+    when.className = "when";
+    when.textContent = alert.open
+      ? `for ${alert.duration}`
+      : `${alert.duration} · ${clockTime(alert.resolved_at)}`;
+
+    row.appendChild(pip);
+    row.appendChild(body);
+    row.appendChild(when);
+    host.appendChild(row);
+  }
+}
+
+async function refreshAlerts() {
+  try {
+    const response = await fetch("/api/v1/alerts/?limit=12");
+    if (!response.ok) return;
+    renderAlerts(await response.json());
+  } catch (err) {
+    /* next poll retries */
+  }
+}
+
 // ---- busiest hours -----------------------------------------------------
 
 let hourlyDays = 30;
@@ -925,6 +1027,8 @@ refreshHealth();
 setInterval(refreshEvent, 10000);
 refreshDaily();
 refreshHourly();
+refreshAlerts();
+setInterval(refreshAlerts, 15000);
 setInterval(refreshHealth, 15000);
 setInterval(refreshHourly, 60000);
 setInterval(refresh, POLL_MS);

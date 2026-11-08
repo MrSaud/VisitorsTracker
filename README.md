@@ -345,6 +345,13 @@ All of these are environment variables:
 | `COUNTER_TRACKER` | `sort` | `sort` or `centroid` |
 | `COUNTER_API_TOKEN` | *(unset)* | Shared token for machine write access |
 | `COUNTER_PUBLIC_READS` | `1` | `0` requires auth for reads as well |
+| `COUNTER_ALERTS_ENABLED` | `0` | `1` turns alerting on |
+| `COUNTER_ALERT_WEBHOOK` | *(unset)* | Slack/Teams-compatible incoming webhook |
+| `COUNTER_ALERT_EMAILS` | *(unset)* | Comma-separated recipients; needs the `DJANGO_EMAIL_*` settings |
+| `COUNTER_ALERT_AFTER_SECONDS` | `60` | How long a problem must persist before anyone is told |
+| `COUNTER_ALERT_MIN_SEVERITY` | `1` | `1` alerts on degraded too, `2` only on down |
+| `COUNTER_ALERT_INTERVAL` | `30` | Seconds between alert checks |
+| `COUNTER_SITE_NAME` | `VisitorsTracker` | Named in every message, for people with two venues |
 
 ## API
 
@@ -354,6 +361,7 @@ All of these are environment variables:
 | `GET` | `/api/v1/events/current/` | What is running right now |
 | `GET` | `/api/v1/events/<id>/` | One event, with its hourly profile |
 | `GET` | `/api/v1/health/` | Whether cameras are working — see [Health](#health) |
+| `GET` | `/api/v1/alerts/` | Alert history, open first — see [Alerts](#alerts) |
 | `GET` | `/api/v1/stats/` | Totals across all cameras, plus per-camera detail |
 | `GET` | `/api/v1/daily/` | Crossings per date and daily peaks — see [Visitors per date](#visitors-per-date) |
 | `GET` | `/api/v1/hourly/` | Arrivals by hour of day — see [Busiest hours](#busiest-hours) |
@@ -540,6 +548,92 @@ degraded, **2** down:
 Note it only sees workers in **its own process**, so run it against the
 server's own health endpoint if counting runs elsewhere.
 
+## Alerts
+
+A dashboard only works while somebody is looking at it. Two things are worth
+interrupting a person for: the camera that has stopped counting, because the
+data is being lost as it happens, and the hall filling past its capacity,
+because that is a safety limit.
+
+```bash
+COUNTER_ALERTS_ENABLED=1 \
+COUNTER_ALERT_WEBHOOK='https://hooks.slack.com/services/…' \
+COUNTER_ALERT_EMAILS='ops@example.com' \
+.venv/bin/python manage.py runserver 0.0.0.0:8000 --noreload
+```
+
+The webhook payload carries a `text` field, which Slack and Teams both
+render, with the structured alert beside it for anything else:
+
+```json
+{
+  "text": "[Expo centre] CRITICAL: Main entrance is offline. …",
+  "alert": {"kind": "health", "state": "offline", "level": "critical",
+            "camera": "Main entrance", "resolved": false, "started_at": "…"}
+}
+```
+
+### Conditions, not messages
+
+An alert **opens** when something goes wrong, stays open while it is still
+wrong, and **resolves** when it is put right. That is what makes "the hall
+was over capacity from 11:40 to 11:52" answerable afterwards, and it is what
+stops a check every thirty seconds becoming a message every thirty seconds.
+Three rules follow, and they are the whole design:
+
+- **Nothing is sent inside the grace period.** A camera that blinks for two
+  seconds is not worth a phone buzzing at midnight. A condition that clears
+  before `COUNTER_ALERT_AFTER_SECONDS` (default 60) is recorded and resolved
+  having told nobody.
+- **Getting worse is not getting fixed.** "Near capacity" becoming "over
+  capacity" closes one alert and opens another, and **no "resolved" message
+  goes out for the first** — it is marked superseded instead.
+- **Recovery is news too.** Whoever was told it broke is told when it is
+  working again, with how long it was down.
+
+### What raises one
+
+| Condition | Level |
+|---|---|
+| Camera `failed` or `offline` | critical |
+| Camera `stalled` or `reconnecting` | warning |
+| Running event at ≥ 90% of capacity | warning |
+| Running event at ≥ 100% of capacity | critical |
+
+Set `COUNTER_ALERT_MIN_SEVERITY=2` to be told only about cameras that are
+down, not ones that are merely degraded. `ok`, `disabled` and `finished`
+never raise anything.
+
+### Delivery is recorded, not assumed
+
+An alert nobody received is worse than no alert, because a screen saying
+"alerted" implies somebody was told.
+
+- A **failed** webhook or email leaves the alert owed and retries on the
+  next pass; the error is stored and shown.
+- With **no channel configured** the alert is still recorded and shown on
+  the dashboard, marked `No alert channel configured.` — the API's
+  `delivered` is false, and nothing pretends otherwise.
+
+### Where it runs
+
+Inside the supervisor, at `COUNTER_ALERT_INTERVAL` (default 30s), because
+that is the process that owns the workers and camera health can only be
+judged where they are. For a look from the outside:
+
+```bash
+python manage.py check_alerts --dry-run   # what is wrong, sends nothing
+python manage.py check_alerts             # open, resolve and notify
+```
+
+From cron it sees no workers, so capacity alerts work and every camera reads
+as offline. Keep camera alerting in the counting process.
+
+`/api/v1/alerts/` lists them — `?open=1`, `?kind=health|capacity`, `?limit=`
+— open first so a long-running problem cannot be pushed off the end by a
+dozen newer ones that are already fixed. The dashboard's **Alerts** panel
+shows the same thing, with what is still unsent.
+
 ## "It never counts anything"
 
 Run the probe. It separates the two causes, from your real camera:
@@ -611,9 +705,10 @@ deployment use `supervise`, which also restarts what stops — see
 python manage.py test
 ```
 
-286 tests covering tracker identity through crossings and occlusion,
+335 tests covering tracker identity through crossings and occlusion,
 event scoping and attribution, reconnection after a dropped stream,
-supervisor reconciliation and peak occupancy,
+supervisor reconciliation, peak occupancy, alert grace periods,
+escalation and delivery,
 assignment optimality against brute force, line-crossing direction, the dead
 band,
 the YOLOv8 output decoding, line-setup suggestions, local-date and local-hour

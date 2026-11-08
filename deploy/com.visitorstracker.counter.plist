@@ -44,6 +44,13 @@
     <!-- Never stop trying to reach a camera that is down. -->
     <key>COUNTER_RECONNECT_ATTEMPTS</key>
     <string>0</string>
+    <!-- Tell somebody when a camera stops or a hall fills up. -->
+    <key>COUNTER_ALERTS_ENABLED</key>
+    <string>1</string>
+    <key>COUNTER_ALERT_WEBHOOK</key>
+    <string></string>
+    <key>COUNTER_SITE_NAME</key>
+    <string>__VENUE_NAME__</string>
     <!-- Set these for a real deployment rather than leaving the defaults. -->
     <key>DJANGO_DEBUG</key>
     <string>0</string>

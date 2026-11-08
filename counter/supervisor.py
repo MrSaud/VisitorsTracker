@@ -67,8 +67,11 @@ class Supervisor:
             else getattr(settings, "COUNTER_SUPERVISE_INTERVAL", DEFAULT_INTERVAL)
         )
         self.cooldown = float(cooldown)
+        self.alert_interval = float(
+            getattr(settings, "COUNTER_ALERT_INTERVAL", 30.0) or 30.0)
         self.passes = 0
 
+        self._alerts_checked_at = 0.0
         self._last_start: dict[int, float] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -133,6 +136,29 @@ class Supervisor:
         self.passes += 1
         return ReconcileResult(started, stopped, waiting, finished)
 
+    def maybe_check_alerts(self, now=None):
+        """Run the alert pass, at its own slower cadence.
+
+        It lives here because this is the process that owns the workers,
+        and camera health can only be judged where they are.
+        """
+        from .alerts import alerts_enabled, run_checks
+
+        if not alerts_enabled():
+            return None
+
+        now = time.monotonic() if now is None else now
+        if (self._alerts_checked_at
+                and now - self._alerts_checked_at < self.alert_interval):
+            return None
+        self._alerts_checked_at = now
+
+        try:
+            return run_checks(registry=self.registry)
+        except Exception as exc:  # pragma: no cover - never kill the loop
+            logger.warning("supervisor: alert check failed: %s", exc)
+            return None
+
     # -- lifecycle --------------------------------------------------------
 
     def start(self):
@@ -155,6 +181,7 @@ class Supervisor:
         while not self._stop_event.is_set():
             try:
                 self.reconcile()
+                self.maybe_check_alerts()
             except Exception as exc:  # pragma: no cover - must never die
                 # A migration not yet applied, a locked database, a camera
                 # removed mid-pass: log it and try again next time.
