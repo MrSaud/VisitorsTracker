@@ -162,6 +162,7 @@ All of these are environment variables:
 |---|---|---|
 | `GET` | `/api/v1/stats/` | Totals across all cameras, plus per-camera detail |
 | `GET` | `/api/v1/daily/` | Crossings per date — see [Visitors per date](#visitors-per-date) |
+| `GET` | `/api/v1/hourly/` | Arrivals by hour of day — see [Busiest hours](#busiest-hours) |
 | `GET` | `/api/v1/cameras/` | List cameras |
 | `GET` | `/api/v1/cameras/<id>/` | One camera |
 | `POST` | `/api/v1/cameras/<id>/start/` | Start its worker |
@@ -214,6 +215,42 @@ Two things worth knowing:
 Remember that `in` counts *entry crossings*, not distinct people — someone
 entering three times adds three. See the note on identity under
 [How counting works](#how-counting-works).
+
+## Busiest hours
+
+Per-date answers *how many*. This answers *when* — which hours need staff on
+the desk. The dashboard's **Busiest hours** panel shows the top three hours,
+the span arrivals actually fall in, a 24-hour bar chart and a weekday-by-hour
+heatmap.
+
+```bash
+curl 'http://127.0.0.1:8000/api/v1/hourly/?days=30'
+curl 'http://127.0.0.1:8000/api/v1/hourly/?days=30&matrix=1'
+curl -OJ 'http://127.0.0.1:8000/api/v1/hourly/?days=30&format=csv'
+```
+
+Takes the same window parameters as `/daily/` (`days`, `start`, `end`,
+`camera`, `format=csv`), plus `matrix=1` for the weekday breakdown.
+
+```json
+{
+  "busiest": [{"hour": 10, "label": "10:00", "in": 476, "average_in": 15.87, "share": 27.9}],
+  "opening_span": {"first_hour": 8, "last_hour": 14},
+  "hours": [{"hour": 0, "label": "00:00", "in": 0, "out": 0, "average_in": 0.0, "share": 0.0}]
+}
+```
+
+**Which average to trust.** `average_in` on the profile divides by *every*
+day in the range, closed days included. Over a range spanning weekends that
+understates a working-day peak — a 30-day window covering 8 weekend days
+showed 15.87 at the 10:00 peak where working days actually average ~21.
+
+`matrix=1` fixes that: each cell divides by how many times that weekday
+actually occurred, so a Tuesday average is not diluted by Fridays. Use the
+profile for the shape of a day, and the matrix for staffing a given weekday.
+
+Hours are local, like dates — an arrival at 01:30 Kuwait time is hour 1, not
+the UTC hour 22.
 
 ## "It never counts anything"
 
@@ -282,9 +319,9 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 python manage.py test
 ```
 
-104 tests covering tracker identity, line-crossing direction, the dead band,
-the YOLOv8 output decoding, line-setup suggestions, local-date bucketing,
-occupancy reset behaviour, authentication and the API. Most use a stub detector, so they need
+126 tests covering tracker identity, line-crossing direction, the dead band,
+the YOLOv8 output decoding, line-setup suggestions, local-date and local-hour
+bucketing, occupancy reset behaviour, authentication and the API. Most use a stub detector, so they need
 no camera and no model file; the tests that exercise the real model skip
 automatically when it has not been exported.
 

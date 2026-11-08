@@ -7,6 +7,7 @@ from . import views
 urlpatterns = [
     path("stats/", views.overall_stats, name="overall-stats"),
     path("daily/", views.daily_report, name="daily-report"),
+    path("hourly/", views.hourly_report, name="hourly-report"),
     path("cameras/", views.camera_list, name="camera-list"),
     path("cameras/<int:camera_id>/", views.camera_detail, name="camera-detail"),
     path("cameras/<int:camera_id>/start/", views.camera_start, name="camera-start"),

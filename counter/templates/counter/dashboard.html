@@ -204,6 +204,39 @@
     overflow-x: auto;
   }
   .axis span { flex: 1 0 14px; text-align: center; white-space: nowrap; }
+  .peak-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    border-bottom: 1px solid var(--border);
+  }
+  .peak-row div { padding: 12px 16px; }
+  .peak-row div + div { border-left: 1px solid var(--border); }
+  .peak-row .label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted);
+  }
+  .peak-row .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .heat { padding: 14px 18px 18px; overflow-x: auto; }
+  .heat-grid {
+    display: grid;
+    grid-template-columns: 78px repeat(24, minmax(20px, 1fr));
+    gap: 2px;
+    min-width: 560px;
+  }
+  .heat-grid .hh {
+    font-size: 9.5px; color: var(--muted); text-align: center; padding-bottom: 2px;
+  }
+  .heat-grid .dayname {
+    font-size: 11px; color: var(--muted); display: flex; align-items: center;
+    padding-right: 6px; white-space: nowrap;
+  }
+  .heat-grid .cell {
+    height: 20px; border-radius: 3px; background: #1b1f27;
+  }
+  .heat-legend {
+    display: flex; align-items: center; gap: 8px; margin-top: 10px;
+    font-size: 11px; color: var(--muted);
+  }
+  .heat-legend .swatch { width: 22px; height: 10px; border-radius: 2px; }
   .daily-empty { padding: 28px 18px; color: var(--muted); font-size: 13px; text-align: center; }
   table.daily-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.daily-table th, table.daily-table td {
@@ -263,6 +296,43 @@
           <thead><tr><th>Date</th><th>In</th><th>Out</th><th>Net</th></tr></thead>
           <tbody id="d-rows"></tbody>
         </table>
+      </div>
+    </details>
+  </section>
+
+  <section class="panel" id="hourly-panel">
+    <div class="panel-head">
+      <h2>Busiest hours</h2>
+      <div class="range">
+        <button data-hdays="7">7 days</button>
+        <button data-hdays="30" class="on">30 days</button>
+        <button data-hdays="90">90 days</button>
+        <button id="hourly-csv">Download CSV</button>
+      </div>
+    </div>
+
+    <div class="peak-row">
+      <div><div class="label">Peak hour</div><div class="value" id="h-peak">&mdash;</div></div>
+      <div><div class="label">2nd busiest</div><div class="value" id="h-peak2">&mdash;</div></div>
+      <div><div class="label">3rd busiest</div><div class="value" id="h-peak3">&mdash;</div></div>
+      <div><div class="label">Arrivals between</div><div class="value" id="h-span">&mdash;</div></div>
+    </div>
+
+    <div class="chart" id="h-chart"></div>
+    <div class="axis" id="h-axis"></div>
+
+    <details class="daily-details">
+      <summary>By weekday and hour</summary>
+      <div class="heat">
+        <div class="heat-grid" id="h-heat"></div>
+        <div class="heat-legend">
+          <span>quiet</span>
+          <span class="swatch" style="background:#1b1f27"></span>
+          <span class="swatch" style="background:rgba(61,220,132,0.3)"></span>
+          <span class="swatch" style="background:rgba(61,220,132,0.65)"></span>
+          <span class="swatch" style="background:rgba(61,220,132,1)"></span>
+          <span>busy &middot; average arrivals per hour</span>
+        </div>
       </div>
     </details>
   </section>
@@ -540,8 +610,126 @@ document.getElementById("daily-csv").addEventListener("click", () => {
   window.location = dailyUrl("&format=csv");
 });
 
+// ---- busiest hours -----------------------------------------------------
+
+let hourlyDays = 30;
+
+function hourlyUrl(extra) {
+  return `/api/v1/hourly/?days=${hourlyDays}` + (extra || "");
+}
+
+function describeHour(row) {
+  return row ? `${row.label} (${row.in})` : "—";
+}
+
+function renderHourly(data) {
+  const rows = data.hours;
+
+  document.getElementById("h-peak").textContent = describeHour(data.busiest[0]);
+  document.getElementById("h-peak2").textContent = describeHour(data.busiest[1]);
+  document.getElementById("h-peak3").textContent = describeHour(data.busiest[2]);
+  document.getElementById("h-span").textContent = data.opening_span
+    ? `${String(data.opening_span.first_hour).padStart(2, "0")}:00 – ` +
+      `${String(data.opening_span.last_hour).padStart(2, "0")}:59`
+    : "—";
+
+  const chart = document.getElementById("h-chart");
+  const axis = document.getElementById("h-axis");
+  chart.innerHTML = "";
+  axis.innerHTML = "";
+
+  const peak = Math.max(1, ...rows.map(r => r.in));
+  rows.forEach((row) => {
+    const col = document.createElement("div");
+    col.className = row.in ? "col" : "col zero";
+    col.title = `${row.label}: ${row.in} in, ${row.average_in} per day on average`;
+
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    cap.textContent = row.in || "";
+
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    bar.style.height = `${row.in ? Math.max(4, (row.in / peak) * 100) : 2}%`;
+
+    col.appendChild(cap);
+    col.appendChild(bar);
+    chart.appendChild(col);
+
+    const tick = document.createElement("span");
+    tick.textContent = row.hour % 3 === 0 ? String(row.hour).padStart(2, "0") : "";
+    axis.appendChild(tick);
+  });
+
+  renderHeatmap(data.matrix);
+}
+
+function renderHeatmap(matrix) {
+  const grid = document.getElementById("h-heat");
+  grid.innerHTML = "";
+  if (!matrix) return;
+
+  let hottest = 0;
+  for (const day of matrix) {
+    for (const cell of day.hours) hottest = Math.max(hottest, cell.average_in);
+  }
+
+  const corner = document.createElement("div");
+  grid.appendChild(corner);
+  for (let hour = 0; hour < 24; hour += 1) {
+    const head = document.createElement("div");
+    head.className = "hh";
+    head.textContent = hour % 2 === 0 ? String(hour).padStart(2, "0") : "";
+    grid.appendChild(head);
+  }
+
+  for (const day of matrix) {
+    const name = document.createElement("div");
+    name.className = "dayname";
+    name.textContent = day.name.slice(0, 3);
+    grid.appendChild(name);
+
+    for (const cell of day.hours) {
+      const box = document.createElement("div");
+      box.className = "cell";
+      const intensity = hottest ? cell.average_in / hottest : 0;
+      if (intensity > 0) {
+        box.style.background = `rgba(61, 220, 132, ${0.12 + intensity * 0.88})`;
+      }
+      box.title = `${day.name} ${String(cell.hour).padStart(2, "0")}:00 — ` +
+                  `${cell.average_in} on average (${day.occurrences} such days)`;
+      grid.appendChild(box);
+    }
+  }
+}
+
+async function refreshHourly() {
+  try {
+    const response = await fetch(hourlyUrl("&matrix=1"));
+    if (!response.ok) return;
+    renderHourly(await response.json());
+  } catch (err) {
+    /* next poll retries */
+  }
+}
+
+document.querySelectorAll(".range button[data-hdays]").forEach((button) => {
+  button.addEventListener("click", () => {
+    hourlyDays = Number(button.dataset.hdays);
+    document.querySelectorAll(".range button[data-hdays]")
+      .forEach(b => b.classList.toggle("on", b === button));
+    refreshHourly();
+  });
+});
+
+document.getElementById("hourly-csv").addEventListener("click", () => {
+  window.location = hourlyUrl("&format=csv");
+});
+
 refresh();
 refreshDaily();
+refreshHourly();
+setInterval(refreshHourly, 60000);
 setInterval(refresh, POLL_MS);
 setInterval(refreshDaily, 30000);
 </script>

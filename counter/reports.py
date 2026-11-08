@@ -8,7 +8,7 @@ UTC one. Everything here buckets by the active timezone's date.
 from datetime import date as date_cls, datetime, time, timedelta
 
 from django.db.models import Count
-from django.db.models.functions import TruncDate
+from django.db.models.functions import ExtractHour, TruncDate
 from django.utils import timezone
 
 from .models import CountEvent
@@ -134,3 +134,129 @@ def parse_date(value):
         return datetime.strptime(raw, "%Y-%m-%d").date()
     except ValueError as exc:
         raise ValueError(f"'{raw}' is not a date in YYYY-MM-DD form") from exc
+
+
+# ---------------------------------------------------------------------------
+# hour-of-day reporting
+# ---------------------------------------------------------------------------
+
+HOURS = range(24)
+
+# Monday-first, matching date.weekday().
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                 "Friday", "Saturday", "Sunday"]
+
+
+def _hour_rows(start, end, camera=None):
+    """Raw (local date, local hour, direction) -> count."""
+    begin, finish = _bounds(start, end)
+
+    events = CountEvent.objects.filter(occurred_at__gte=begin, occurred_at__lt=finish)
+    if camera is not None:
+        events = events.filter(camera=camera)
+
+    rows = (
+        events.annotate(
+            day=TruncDate("occurred_at"),
+            hour=ExtractHour("occurred_at"),
+        )
+        .values("day", "hour", "direction")
+        .order_by()
+        .annotate(total=Count("id"))
+    )
+
+    buckets = {}
+    for row in rows:
+        day = row["day"]
+        if isinstance(day, datetime):
+            day = day.date()
+        key = (day, int(row["hour"]))
+        bucket = buckets.setdefault(key, {DIRECTION_IN: 0, DIRECTION_OUT: 0})
+        bucket[row["direction"]] = row["total"]
+    return buckets
+
+
+def hourly_profile(start=None, end=None, days=DEFAULT_DAYS, camera=None):
+    """Crossings by hour of day, averaged over the window.
+
+    ``average_in`` divides by every day in the range, including quiet ones.
+    That is deliberate and predictable, but it flattens weekday peaks when
+    the range spans a weekend -- use :func:`weekday_hour_matrix` when the
+    question is "how many staff on a Tuesday morning".
+    """
+    start, end = resolve_range(start, end, days)
+    buckets = _hour_rows(start, end, camera)
+    span = (end - start).days + 1
+
+    totals = {hour: {DIRECTION_IN: 0, DIRECTION_OUT: 0} for hour in HOURS}
+    for (_day, hour), counts in buckets.items():
+        totals[hour][DIRECTION_IN] += counts.get(DIRECTION_IN, 0)
+        totals[hour][DIRECTION_OUT] += counts.get(DIRECTION_OUT, 0)
+
+    profile = []
+    grand_total = sum(t[DIRECTION_IN] for t in totals.values())
+    for hour in HOURS:
+        total_in = totals[hour][DIRECTION_IN]
+        profile.append({
+            "hour": hour,
+            "label": f"{hour:02d}:00",
+            "in": total_in,
+            "out": totals[hour][DIRECTION_OUT],
+            "average_in": round(total_in / span, 2) if span else 0.0,
+            "share": round(total_in / grand_total * 100, 1) if grand_total else 0.0,
+        })
+    return profile
+
+
+def busiest_hours(profile, count=3):
+    """The ``count`` busiest hours, most visitors first. Silent hours excluded."""
+    active = [row for row in profile if row["in"] > 0]
+    return sorted(active, key=lambda r: r["in"], reverse=True)[:count]
+
+
+def opening_span(profile):
+    """First and last hour with any arrivals, or ``None`` when all quiet."""
+    active = [row["hour"] for row in profile if row["in"] > 0]
+    if not active:
+        return None
+    return {"first_hour": min(active), "last_hour": max(active)}
+
+
+def weekday_hour_matrix(start=None, end=None, days=DEFAULT_DAYS, camera=None):
+    """Average arrivals per weekday and hour.
+
+    Each cell divides by how many times that weekday actually occurred in
+    the range, so a Tuesday average is not diluted by Fridays.
+    """
+    start, end = resolve_range(start, end, days)
+    buckets = _hour_rows(start, end, camera)
+
+    # How many times each weekday falls inside the range.
+    occurrences = {index: 0 for index in range(7)}
+    cursor = start
+    while cursor <= end:
+        occurrences[cursor.weekday()] += 1
+        cursor += timedelta(days=1)
+
+    sums = {(weekday, hour): 0 for weekday in range(7) for hour in HOURS}
+    for (day, hour), counts in buckets.items():
+        sums[(day.weekday(), hour)] += counts.get(DIRECTION_IN, 0)
+
+    matrix = []
+    for weekday in range(7):
+        seen = occurrences[weekday]
+        cells = []
+        for hour in HOURS:
+            total = sums[(weekday, hour)]
+            cells.append({
+                "hour": hour,
+                "in": total,
+                "average_in": round(total / seen, 2) if seen else 0.0,
+            })
+        matrix.append({
+            "weekday": weekday,
+            "name": WEEKDAY_NAMES[weekday],
+            "occurrences": seen,
+            "hours": cells,
+        })
+    return matrix

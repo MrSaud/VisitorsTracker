@@ -20,7 +20,11 @@ from .daywindow import occupancy_window_start, parse_reset_time
 from .models import Camera, CountEvent
 from .reports import (
     MAX_DAYS,
+    busiest_hours,
     daily_counts,
+    hourly_profile,
+    opening_span,
+    weekday_hour_matrix,
     local_today,
     parse_date,
     resolve_range,
@@ -992,3 +996,183 @@ class ApiAuthTests(TestCase):
     def test_stream_is_closed_when_reads_are(self):
         self.assertEqual(
             self.client.get(f"/api/v1/cameras/{self.camera.pk}/stream/").status_code, 403)
+
+
+class HourlyProfileTests(TestCase):
+    """Hour-of-day aggregation, in local time."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.other = Camera.objects.create(name="Side", source="1")
+
+    def _event(self, when, direction=DIRECTION_IN, camera=None):
+        CountEvent.objects.create(camera=camera or self.camera, track_id=1,
+                                  direction=direction, occurred_at=when)
+
+    def _profile(self, **kwargs):
+        kwargs.setdefault("start", date(2026, 3, 2))
+        kwargs.setdefault("end", date(2026, 3, 2))
+        return {r["hour"]: r for r in hourly_profile(**kwargs)}
+
+    def test_hours_are_local_not_utc(self):
+        # 22:30 UTC on the 1st is 01:30 on the 2nd in Kuwait.
+        self._event(datetime(2026, 3, 1, 22, 30, tzinfo=dt_timezone.utc))
+        profile = self._profile()
+        self.assertEqual(profile[1]["in"], 1)
+        self.assertEqual(profile[22]["in"], 0, "must not bucket by the UTC hour")
+
+    def test_all_twenty_four_hours_are_present(self):
+        rows = hourly_profile(start=date(2026, 3, 2), end=date(2026, 3, 2))
+        self.assertEqual(len(rows), 24)
+        self.assertEqual([r["hour"] for r in rows], list(range(24)))
+
+    def test_labels_are_zero_padded(self):
+        rows = hourly_profile(start=date(2026, 3, 2), end=date(2026, 3, 2))
+        self.assertEqual(rows[0]["label"], "00:00")
+        self.assertEqual(rows[9]["label"], "09:00")
+        self.assertEqual(rows[23]["label"], "23:00")
+
+    def test_in_and_out_separated_per_hour(self):
+        morning = datetime(2026, 3, 2, 6, 0, tzinfo=dt_timezone.utc)   # 09:00 local
+        for _ in range(5):
+            self._event(morning)
+        self._event(morning, direction=DIRECTION_OUT)
+        profile = self._profile()
+        self.assertEqual((profile[9]["in"], profile[9]["out"]), (5, 1))
+
+    def test_average_divides_by_days_in_range(self):
+        # 10 arrivals at 09:00 local spread over 5 days -> average 2.0/day.
+        for day in range(2, 7):
+            for _ in range(2):
+                self._event(datetime(2026, 3, day, 6, 0, tzinfo=dt_timezone.utc))
+        profile = self._profile(start=date(2026, 3, 2), end=date(2026, 3, 6))
+        self.assertEqual(profile[9]["in"], 10)
+        self.assertEqual(profile[9]["average_in"], 2.0)
+
+    def test_share_is_a_percentage_of_arrivals(self):
+        self._event(datetime(2026, 3, 2, 6, 0, tzinfo=dt_timezone.utc))   # 09:00
+        self._event(datetime(2026, 3, 2, 6, 0, tzinfo=dt_timezone.utc))   # 09:00
+        self._event(datetime(2026, 3, 2, 9, 0, tzinfo=dt_timezone.utc))   # 12:00
+        self._event(datetime(2026, 3, 2, 10, 0, tzinfo=dt_timezone.utc))  # 13:00
+        profile = self._profile()
+        self.assertEqual(profile[9]["share"], 50.0)
+        self.assertEqual(profile[12]["share"], 25.0)
+
+    def test_camera_filter(self):
+        when = datetime(2026, 3, 2, 6, 0, tzinfo=dt_timezone.utc)
+        self._event(when)
+        self._event(when, camera=self.other)
+        self.assertEqual(self._profile()[9]["in"], 2)
+        self.assertEqual(self._profile(camera=self.camera)[9]["in"], 1)
+
+    def test_empty_range_is_all_zeros(self):
+        profile = self._profile()
+        self.assertEqual(sum(r["in"] for r in profile.values()), 0)
+        self.assertTrue(all(r["share"] == 0.0 for r in profile.values()))
+
+
+class BusiestHoursTests(TestCase):
+    def _profile(self, counts):
+        return [
+            {"hour": hour, "label": f"{hour:02d}:00", "in": counts.get(hour, 0),
+             "out": 0, "average_in": 0.0, "share": 0.0}
+            for hour in range(24)
+        ]
+
+    def test_returns_busiest_first(self):
+        rows = busiest_hours(self._profile({9: 40, 10: 12, 11: 25, 14: 3}))
+        self.assertEqual([r["hour"] for r in rows], [9, 11, 10])
+
+    def test_silent_hours_are_excluded(self):
+        rows = busiest_hours(self._profile({9: 2}))
+        self.assertEqual(len(rows), 1)
+
+    def test_no_data_gives_empty_list(self):
+        self.assertEqual(busiest_hours(self._profile({})), [])
+
+    def test_opening_span_spans_first_to_last_arrival(self):
+        span = opening_span(self._profile({7: 3, 9: 20, 17: 4}))
+        self.assertEqual(span, {"first_hour": 7, "last_hour": 17})
+
+    def test_opening_span_is_none_when_quiet(self):
+        self.assertIsNone(opening_span(self._profile({})))
+
+
+class WeekdayHourMatrixTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def _event(self, when):
+        CountEvent.objects.create(camera=self.camera, track_id=1,
+                                  direction=DIRECTION_IN, occurred_at=when)
+
+    def test_shape_is_seven_days_by_twenty_four_hours(self):
+        matrix = weekday_hour_matrix(start=date(2026, 3, 2), end=date(2026, 3, 8))
+        self.assertEqual(len(matrix), 7)
+        self.assertEqual([d["name"] for d in matrix][0], "Monday")
+        self.assertTrue(all(len(d["hours"]) == 24 for d in matrix))
+
+    def test_average_divides_by_occurrences_of_that_weekday(self):
+        # 2026-03-02 and 2026-03-09 are both Mondays.
+        for day in (2, 9):
+            for _ in range(4):
+                self._event(datetime(2026, 3, day, 6, 0, tzinfo=dt_timezone.utc))
+        matrix = weekday_hour_matrix(start=date(2026, 3, 2), end=date(2026, 3, 15))
+        monday = matrix[0]
+        self.assertEqual(monday["occurrences"], 2)
+        cell = monday["hours"][9]
+        self.assertEqual(cell["in"], 8)
+        self.assertEqual(cell["average_in"], 4.0, "8 arrivals over 2 Mondays")
+
+    def test_a_weekday_absent_from_the_range_averages_zero(self):
+        matrix = weekday_hour_matrix(start=date(2026, 3, 2), end=date(2026, 3, 3))
+        by_name = {d["name"]: d for d in matrix}
+        self.assertEqual(by_name["Friday"]["occurrences"], 0)
+        self.assertTrue(all(c["average_in"] == 0.0 for c in by_name["Friday"]["hours"]))
+
+    def test_weekdays_do_not_bleed_into_each_other(self):
+        self._event(datetime(2026, 3, 2, 6, 0, tzinfo=dt_timezone.utc))   # Monday
+        self._event(datetime(2026, 3, 3, 6, 0, tzinfo=dt_timezone.utc))   # Tuesday
+        matrix = weekday_hour_matrix(start=date(2026, 3, 2), end=date(2026, 3, 3))
+        self.assertEqual(matrix[0]["hours"][9]["in"], 1)
+        self.assertEqual(matrix[1]["hours"][9]["in"], 1)
+        self.assertEqual(matrix[2]["hours"][9]["in"], 0)
+
+
+class HourlyApiTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        for _ in range(6):
+            CountEvent.objects.create(
+                camera=self.camera, track_id=1, direction=DIRECTION_IN,
+                occurred_at=datetime(2026, 3, 3, 6, 0, tzinfo=dt_timezone.utc),
+            )
+
+    def test_returns_twenty_four_hours_and_peaks(self):
+        body = self.client.get("/api/v1/hourly/?start=2026-03-03&end=2026-03-03").json()
+        self.assertEqual(len(body["hours"]), 24)
+        self.assertEqual(body["busiest"][0]["hour"], 9)
+        self.assertEqual(body["busiest"][0]["in"], 6)
+        self.assertEqual(body["opening_span"], {"first_hour": 9, "last_hour": 9})
+
+    def test_matrix_is_opt_in(self):
+        base = "/api/v1/hourly/?start=2026-03-03&end=2026-03-03"
+        self.assertNotIn("matrix", self.client.get(base).json())
+        self.assertIn("matrix", self.client.get(base + "&matrix=1").json())
+
+    def test_csv_export(self):
+        response = self.client.get(
+            "/api/v1/hourly/?start=2026-03-03&end=2026-03-03&format=csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "text/csv")
+        lines = response.content.decode().strip().splitlines()
+        self.assertEqual(lines[0], "hour,in,out,average_in,share_percent")
+        self.assertEqual(len(lines), 25)
+        self.assertTrue(lines[10].startswith("09:00,6,0,6.0,100.0"))
+
+    def test_bad_params_are_400(self):
+        self.assertEqual(self.client.get("/api/v1/hourly/?days=lots").status_code, 400)
+        self.assertEqual(self.client.get("/api/v1/hourly/?camera=9999").status_code, 400)
+
+    def test_dashboard_includes_the_panel(self):
+        self.assertContains(self.client.get("/"), "Busiest hours")

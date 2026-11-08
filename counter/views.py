@@ -18,7 +18,17 @@ from .camera import REGISTRY, mjpeg_frames
 from .daywindow import occupancy_window_start
 from .models import Camera, CountEvent
 from .permissions import _is_operator
-from .reports import DEFAULT_DAYS, daily_counts, parse_date, resolve_range, summarise
+from .reports import (
+    DEFAULT_DAYS,
+    busiest_hours,
+    daily_counts,
+    hourly_profile,
+    opening_span,
+    parse_date,
+    resolve_range,
+    summarise,
+    weekday_hour_matrix,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -276,3 +286,53 @@ def daily_report(request):
         "summary": summarise(rows),
         "days": rows,
     })
+
+
+@api_view(["GET"])
+def hourly_report(request):
+    """Arrivals by hour of day, for staffing decisions.
+
+    Same window parameters as the daily report. ``?matrix=1`` adds a
+    weekday-by-hour breakdown, which is what you want when Sunday and
+    Friday look nothing alike. ``?format=csv`` downloads the profile.
+    """
+    try:
+        start, end, days, camera = _daily_params(request)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    profile = hourly_profile(start=start, end=end, days=days, camera=camera)
+    window_start, window_end = resolve_range(start, end, days)
+
+    params = request.query_params
+    if (params.get("format") or "").lower() == "csv":
+        label = f"{window_start.isoformat()}_{window_end.isoformat()}"
+        if camera is not None:
+            label = f"camera{camera.pk}_{label}"
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = (
+            f'attachment; filename="visitors_by_hour_{label}.csv"'
+        )
+        writer = csv.writer(response)
+        writer.writerow(["hour", "in", "out", "average_in", "share_percent"])
+        for row in profile:
+            writer.writerow([row["label"], row["in"], row["out"],
+                             row["average_in"], row["share"]])
+        return response
+
+    payload = {
+        "start": window_start.isoformat(),
+        "end": window_end.isoformat(),
+        "camera_id": camera.pk if camera else None,
+        "camera_name": camera.name if camera else None,
+        "days": (window_end - window_start).days + 1,
+        "busiest": busiest_hours(profile),
+        "opening_span": opening_span(profile),
+        "hours": profile,
+    }
+
+    if (params.get("matrix") or "").lower() in ("1", "true", "yes"):
+        payload["matrix"] = weekday_hour_matrix(
+            start=start, end=end, days=days, camera=camera)
+
+    return Response(payload)
