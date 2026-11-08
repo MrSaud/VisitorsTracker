@@ -38,11 +38,34 @@ python manage.py run_counter --source 0 --name "Front door"
 
 ### Camera permission on macOS
 
-The first time a webcam is opened, macOS asks the process for camera access.
-If frames never arrive, grant access to the app running the server — Terminal,
-iTerm or your editor — under **System Settings > Privacy & Security > Camera**,
-then restart the server. The worker reports this as an error on the dashboard
-rather than failing silently.
+macOS grants camera access to the **application that owns the process**, not
+to Python. So the question is never "can this script use the camera", it is
+"is the app that launched it allowed to". The worker reports a refusal as an
+error on the dashboard rather than failing silently:
+
+```
+Could not open video source 0. Check that the process running this has camera
+access in System Settings > Privacy & Security > Camera, and that no other app
+is holding the device.
+```
+
+Grant access to the launching app under **System Settings > Privacy &
+Security > Camera**, then restart the server.
+
+**The trap:** that pane lists only apps that have already asked, and it has
+no button to add one. An editor or assistant whose request macOS rejected
+outright never appears, so there is nothing to switch on and no way to put it
+there. A server started from inside one can never open a webcam.
+
+Terminal is normally in the list already, so launch it from Terminal instead:
+
+```bash
+open -a Terminal scripts/run_macos_webcam.command
+```
+
+That script starts the server with `COUNTER_AUTOSTART=1` under Terminal, which
+owns the permission. None of this applies to RTSP or HTTP cameras — only local
+capture devices sit behind that prompt.
 
 ## How counting works
 
