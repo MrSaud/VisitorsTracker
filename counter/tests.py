@@ -6,17 +6,34 @@ a model file, or any particular machine speed.
 
 import pathlib
 import tempfile
+import time as time_module
+from io import StringIO
+from unittest.mock import patch
 from datetime import date, datetime, time, timedelta, timezone as dt_timezone
 from unittest import skipUnless
 
 import cv2
 import numpy as np
 from django.contrib.auth.models import User
+from django.core.management import call_command
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 from .camera import CounterWorker
 from .daywindow import occupancy_window_start, parse_reset_time
+from .health import (
+    DISABLED,
+    FAILED,
+    FINISHED,
+    OFFLINE,
+    OK,
+    STALLED,
+    STATUS_DEGRADED,
+    STATUS_DOWN,
+    STATUS_OK,
+    camera_health,
+    overall_status,
+)
 from .models import Camera, CountEvent
 from .reports import (
     MAX_DAYS,
@@ -1176,3 +1193,251 @@ class HourlyApiTests(TestCase):
 
     def test_dashboard_includes_the_panel(self):
         self.assertContains(self.client.get("/"), "Busiest hours")
+
+
+class FakeWorker:
+    """Stands in for a CounterWorker without threads or a camera."""
+
+    def __init__(self, alive=True, seconds_since_frame=1.0, error=None,
+                 frames_read=100, fps=20.0, started_ago=100.0, is_file=False):
+        self._alive = alive
+        self.is_file = is_file
+        self.seconds_since_frame = seconds_since_frame
+        self.error = error
+        self.frames_read = frames_read
+        self.fps = fps
+        self.started_at = (time_module.monotonic() - started_ago
+                           if started_ago is not None else None)
+
+    def is_alive(self):
+        return self._alive
+
+
+class FakeRegistry:
+    def __init__(self, workers=None):
+        self._workers = workers or {}
+
+    def get(self, pk):
+        return self._workers.get(pk)
+
+
+@override_settings(COUNTER_STALE_FRAME_SECONDS=30)
+class CameraHealthTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0", is_active=True)
+
+    def test_delivering_frames_is_ok(self):
+        row = camera_health(self.camera, FakeWorker(seconds_since_frame=2.0))
+        self.assertEqual(row["state"], OK)
+        self.assertTrue(row["healthy"])
+
+    def test_frozen_stream_is_stalled_not_ok(self):
+        """The failure a naive 'is it running?' check misses entirely."""
+        row = camera_health(self.camera, FakeWorker(alive=True, seconds_since_frame=300.0))
+        self.assertEqual(row["state"], STALLED)
+        self.assertFalse(row["healthy"])
+        self.assertIn("No frame for 300s", row["detail"])
+
+    def test_just_under_threshold_is_still_ok(self):
+        row = camera_health(self.camera, FakeWorker(seconds_since_frame=29.0))
+        self.assertEqual(row["state"], OK)
+
+    def test_just_over_threshold_is_stalled(self):
+        row = camera_health(self.camera, FakeWorker(seconds_since_frame=31.0))
+        self.assertEqual(row["state"], STALLED)
+
+    def test_worker_with_error_is_failed(self):
+        row = camera_health(
+            self.camera,
+            FakeWorker(alive=False, error="Could not open video source 0."),
+        )
+        self.assertEqual(row["state"], FAILED)
+        self.assertIn("Could not open", row["detail"])
+
+    def test_active_camera_with_no_worker_is_offline(self):
+        """The post-restart case: meant to be running, silently isn't."""
+        row = camera_health(self.camera, None)
+        self.assertEqual(row["state"], OFFLINE)
+        self.assertFalse(row["healthy"])
+        self.assertIn("marked active", row["detail"])
+
+    def test_deactivating_clears_a_stale_failure(self):
+        """Turning a camera off must silence it, not alarm forever."""
+        self.camera.is_active = False
+        row = camera_health(
+            self.camera, FakeWorker(alive=False, error="Could not open source."))
+        self.assertEqual(row["state"], DISABLED)
+        self.assertTrue(row["healthy"])
+
+    def test_finished_video_file_is_not_a_fault(self):
+        row = camera_health(
+            self.camera,
+            FakeWorker(alive=False, is_file=True, frames_read=80),
+        )
+        self.assertEqual(row["state"], FINISHED)
+        self.assertTrue(row["healthy"])
+        self.assertIn("80 frames", row["detail"])
+
+    def test_file_that_produced_nothing_is_still_offline(self):
+        row = camera_health(
+            self.camera,
+            FakeWorker(alive=False, is_file=True, frames_read=0),
+        )
+        self.assertEqual(row["state"], OFFLINE)
+
+    def test_live_camera_that_died_is_offline_not_finished(self):
+        row = camera_health(
+            self.camera,
+            FakeWorker(alive=False, is_file=False, frames_read=5000),
+        )
+        self.assertEqual(row["state"], OFFLINE)
+
+    def test_inactive_camera_with_no_worker_is_disabled_not_a_fault(self):
+        self.camera.is_active = False
+        row = camera_health(self.camera, None)
+        self.assertEqual(row["state"], DISABLED)
+        self.assertTrue(row["healthy"], "a deliberately stopped camera is not a fault")
+
+    def test_starting_up_is_not_immediately_stalled(self):
+        row = camera_health(
+            self.camera,
+            FakeWorker(seconds_since_frame=None, started_ago=3.0),
+        )
+        self.assertEqual(row["state"], OK)
+        self.assertEqual(row["detail"], "Starting up.")
+
+    def test_never_produced_a_frame_eventually_stalls(self):
+        row = camera_health(
+            self.camera,
+            FakeWorker(seconds_since_frame=None, started_ago=120.0),
+        )
+        self.assertEqual(row["state"], STALLED)
+        self.assertIn("without delivering a frame", row["detail"])
+
+    def test_last_event_age_is_reported(self):
+        when = timezone.now() - timedelta(minutes=45)
+        row = camera_health(self.camera, FakeWorker(), last_event_at=when)
+        self.assertAlmostEqual(row["minutes_since_event"], 45.0, delta=0.5)
+        self.assertIsNotNone(row["last_event_at"])
+
+    def test_no_events_yet_is_not_an_error(self):
+        row = camera_health(self.camera, FakeWorker(), last_event_at=None)
+        self.assertIsNone(row["minutes_since_event"])
+        self.assertTrue(row["healthy"])
+
+
+class OverallStatusTests(TestCase):
+    def _row(self, state):
+        return {"state": state, "healthy": state in (OK, DISABLED)}
+
+    def test_all_ok(self):
+        self.assertEqual(overall_status([self._row(OK), self._row(DISABLED)]), STATUS_OK)
+
+    def test_stalled_is_degraded(self):
+        self.assertEqual(
+            overall_status([self._row(OK), self._row(STALLED)]), STATUS_DEGRADED)
+
+    def test_failed_is_down(self):
+        self.assertEqual(
+            overall_status([self._row(OK), self._row(FAILED)]), STATUS_DOWN)
+
+    def test_offline_is_down(self):
+        self.assertEqual(overall_status([self._row(OFFLINE)]), STATUS_DOWN)
+
+    def test_worst_state_wins(self):
+        self.assertEqual(
+            overall_status([self._row(STALLED), self._row(OFFLINE)]), STATUS_DOWN)
+
+    def test_no_cameras_is_ok(self):
+        self.assertEqual(overall_status([]), STATUS_OK)
+
+
+@override_settings(COUNTER_STALE_FRAME_SECONDS=30)
+class HealthApiTests(TestCase):
+    def setUp(self):
+        self.good = Camera.objects.create(name="Good", source="0", is_active=True)
+        self.bad = Camera.objects.create(name="Bad", source="1", is_active=True)
+
+    def _patch_registry(self, workers):
+        return patch("counter.views.REGISTRY", FakeRegistry(workers))
+
+    def test_all_healthy(self):
+        workers = {self.good.pk: FakeWorker(), self.bad.pk: FakeWorker()}
+        with self._patch_registry(workers):
+            body = self.client.get("/api/v1/health/").json()
+        self.assertEqual(body["status"], STATUS_OK)
+        self.assertTrue(body["healthy"])
+        self.assertEqual(body["problems"], [])
+
+    def test_offline_camera_is_reported(self):
+        with self._patch_registry({self.good.pk: FakeWorker()}):
+            response = self.client.get("/api/v1/health/")
+        body = response.json()
+        self.assertEqual(response.status_code, 200, "plain check stays 200")
+        self.assertEqual(body["status"], STATUS_DOWN)
+        self.assertEqual(len(body["problems"]), 1)
+        self.assertEqual(body["problems"][0]["camera_name"], "Bad")
+
+    def test_strict_mode_returns_503(self):
+        with self._patch_registry({self.good.pk: FakeWorker()}):
+            response = self.client.get("/api/v1/health/?strict=1")
+        self.assertEqual(response.status_code, 503)
+
+    def test_strict_mode_is_200_when_healthy(self):
+        workers = {self.good.pk: FakeWorker(), self.bad.pk: FakeWorker()}
+        with self._patch_registry(workers):
+            self.assertEqual(
+                self.client.get("/api/v1/health/?strict=1").status_code, 200)
+
+    def test_stalled_camera_is_degraded(self):
+        workers = {self.good.pk: FakeWorker(),
+                   self.bad.pk: FakeWorker(seconds_since_frame=500.0)}
+        with self._patch_registry(workers):
+            body = self.client.get("/api/v1/health/").json()
+        self.assertEqual(body["status"], STATUS_DEGRADED)
+
+    def test_last_event_time_comes_from_the_database(self):
+        CountEvent.objects.create(camera=self.good, track_id=1,
+                                  direction=DIRECTION_IN)
+        workers = {self.good.pk: FakeWorker(), self.bad.pk: FakeWorker()}
+        with self._patch_registry(workers):
+            body = self.client.get("/api/v1/health/").json()
+        rows = {r["camera_name"]: r for r in body["cameras"]}
+        self.assertIsNotNone(rows["Good"]["last_event_at"])
+        self.assertIsNone(rows["Bad"]["last_event_at"])
+
+    def test_health_is_readable_without_auth(self):
+        with self._patch_registry({}):
+            self.assertEqual(self.client.get("/api/v1/health/").status_code, 200)
+
+    def test_dashboard_has_the_alert_container(self):
+        self.assertContains(self.client.get("/"), 'id="health-alert"')
+
+
+@override_settings(COUNTER_STALE_FRAME_SECONDS=30)
+class CheckHealthCommandTests(TestCase):
+    def test_exit_zero_when_healthy(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=True)
+        with patch("counter.management.commands.check_health.REGISTRY",
+                   FakeRegistry({camera.pk: FakeWorker()})):
+            call_command("check_health", stdout=StringIO())   # no SystemExit
+
+    def test_exit_two_when_a_camera_is_offline(self):
+        Camera.objects.create(name="Door", source="0", is_active=True)
+        with patch("counter.management.commands.check_health.REGISTRY",
+                   FakeRegistry({})):
+            with self.assertRaises(SystemExit) as caught:
+                call_command("check_health", stdout=StringIO(), stderr=StringIO())
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_exit_one_when_degraded(self):
+        camera = Camera.objects.create(name="Door", source="0", is_active=True)
+        worker = FakeWorker(seconds_since_frame=900.0)
+        with patch("counter.management.commands.check_health.REGISTRY",
+                   FakeRegistry({camera.pk: worker})):
+            with self.assertRaises(SystemExit) as caught:
+                call_command("check_health", stdout=StringIO(), stderr=StringIO())
+        self.assertEqual(caught.exception.code, 1)
+
+    def test_no_cameras_is_not_a_failure(self):
+        call_command("check_health", stdout=StringIO())

@@ -126,6 +126,11 @@ COUNTER_DETECT_EVERY = int(os.environ.get("COUNTER_DETECT_EVERY", "3"))
 # Frames a track may go unseen before it is dropped.
 COUNTER_MAX_DISAPPEARED = int(os.environ.get("COUNTER_MAX_DISAPPEARED", "25"))
 
+# A worker with no new frame for this long is reported as stalled. A frozen
+# stream otherwise looks identical to a healthy one.
+COUNTER_STALE_FRAME_SECONDS = float(
+    os.environ.get("COUNTER_STALE_FRAME_SECONDS", "30"))
+
 # Shared token for machine clients: Authorization: Token <value>.
 # Unset means no machine client can write; staff sessions still can.
 COUNTER_API_TOKEN = os.environ.get("COUNTER_API_TOKEN", "")

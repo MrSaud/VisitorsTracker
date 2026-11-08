@@ -66,6 +66,11 @@ class CounterWorker(threading.Thread):
         self.frames_read = 0
         self.started_at: float | None = None
         self.fps = 0.0
+        # Wall-clock time of the most recent frame. A worker can be alive
+        # and still be delivering nothing -- a frozen stream looks exactly
+        # like a healthy one unless this is checked.
+        self.last_frame_at: float | None = None
+        self.finished_at: float | None = None
 
     # -- public API -------------------------------------------------------
 
@@ -91,7 +96,15 @@ class CounterWorker(threading.Thread):
                 self._condition.wait(timeout=timeout)
             return self._jpeg, self._frame_seq
 
+    @property
+    def seconds_since_frame(self):
+        """Seconds since the last delivered frame, or None if none yet."""
+        if self.last_frame_at is None:
+            return None
+        return max(0.0, time.time() - self.last_frame_at)
+
     def stats(self) -> dict:
+        since_frame = self.seconds_since_frame
         return {
             "camera_id": self.camera_pk,
             "camera_name": self.camera_name,
@@ -99,6 +112,8 @@ class CounterWorker(threading.Thread):
             "detector": self.detector_name,
             "error": self.error,
             "frames_read": self.frames_read,
+            "seconds_since_frame": (
+                round(since_frame, 1) if since_frame is not None else None),
             "fps": round(self.fps, 2),
             "session_in": self.counter.total_in,
             "session_out": self.counter.total_out,
@@ -117,6 +132,7 @@ class CounterWorker(threading.Thread):
                 "camera access in System Settings > Privacy & Security > Camera."
             )
             logger.error("camera %s: %s", self.camera_pk, self.error)
+            self.finished_at = time.time()
             with self._condition:
                 self._condition.notify_all()
             return
@@ -177,6 +193,7 @@ class CounterWorker(threading.Thread):
                         # Processing is slower than the clip; don't accumulate debt.
                         next_frame_at = time.monotonic()
         finally:
+            self.finished_at = time.time()
             capture.release()
             close_old_connections()
             with self._condition:
@@ -188,9 +205,11 @@ class CounterWorker(threading.Thread):
         ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if not ok:
             return
+        now = time.time()
         with self._condition:
             self._jpeg = buffer.tobytes()
             self._frame_seq += 1
+            self.last_frame_at = now
             self._condition.notify_all()
 
     def _persist(self, events):

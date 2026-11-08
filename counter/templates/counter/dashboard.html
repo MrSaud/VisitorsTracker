@@ -144,6 +144,19 @@
   }
   a { color: var(--inside); }
 
+  .alert {
+    border-radius: 12px;
+    padding: 14px 18px;
+    display: grid;
+    gap: 6px;
+    border: 1px solid #6f3a3a;
+    background: #2a1a1a;
+    color: #ffb4a8;
+  }
+  .alert.degraded { border-color: #7a6326; background: #2a2416; color: #ffdf9e; }
+  .alert .title { font-weight: 600; font-size: 14px; }
+  .alert ul { margin: 2px 0 0; padding-left: 18px; font-size: 12.5px; }
+  .alert li { margin: 2px 0; }
   .panel {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -260,6 +273,11 @@
 </header>
 
 <main>
+  <div class="alert" id="health-alert" hidden>
+    <div class="title" id="health-title"></div>
+    <ul id="health-list"></ul>
+  </div>
+
   <section class="totals">
     <div class="tile"><div class="label">Total in</div><div class="value v-in" id="t-in">&mdash;</div></div>
     <div class="tile"><div class="label">Total out</div><div class="value v-out" id="t-out">&mdash;</div></div>
@@ -527,6 +545,40 @@ document.addEventListener("click", async (event) => {
   await refresh();
 });
 
+// ---- camera health -----------------------------------------------------
+
+async function refreshHealth() {
+  const box = document.getElementById("health-alert");
+  try {
+    const response = await fetch("/api/v1/health/");
+    if (!response.ok) return;
+    const report = await response.json();
+
+    if (report.healthy || report.problems.length === 0) {
+      box.hidden = true;
+      return;
+    }
+
+    box.hidden = false;
+    box.classList.toggle("degraded", report.status === "degraded");
+    document.getElementById("health-title").textContent =
+      report.status === "down"
+        ? `${report.problems.length} camera(s) not working`
+        : `${report.problems.length} camera(s) degraded`;
+
+    const list = document.getElementById("health-list");
+    list.innerHTML = "";
+    for (const problem of report.problems) {
+      const item = document.createElement("li");
+      item.textContent = `${problem.camera_name} — ${problem.state}` +
+        (problem.detail ? `: ${problem.detail}` : "");
+      list.appendChild(item);
+    }
+  } catch (err) {
+    /* next poll retries */
+  }
+}
+
 // ---- visitors per date -------------------------------------------------
 
 let dailyDays = 30;
@@ -727,8 +779,10 @@ document.getElementById("hourly-csv").addEventListener("click", () => {
 });
 
 refresh();
+refreshHealth();
 refreshDaily();
 refreshHourly();
+setInterval(refreshHealth, 15000);
 setInterval(refreshHourly, 60000);
 setInterval(refresh, POLL_MS);
 setInterval(refreshDaily, 30000);

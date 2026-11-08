@@ -9,6 +9,7 @@ from django.http import (
     HttpResponseForbidden,
     StreamingHttpResponse,
 )
+from django.db.models import Max
 from django.shortcuts import get_object_or_404, render
 from rest_framework import status
 from rest_framework.decorators import api_view
@@ -16,6 +17,7 @@ from rest_framework.response import Response
 
 from .camera import REGISTRY, mjpeg_frames
 from .daywindow import occupancy_window_start
+from .health import STATUS_OK, build_report
 from .models import Camera, CountEvent
 from .permissions import _is_operator
 from .reports import (
@@ -336,3 +338,37 @@ def hourly_report(request):
             start=start, end=end, days=days, camera=camera)
 
     return Response(payload)
+
+
+# ---------------------------------------------------------------------------
+# health
+# ---------------------------------------------------------------------------
+
+def _last_event_times(cameras):
+    """Most recent crossing per camera, in one query."""
+    rows = (
+        CountEvent.objects.filter(camera__in=cameras)
+        .values("camera_id")
+        .order_by()
+        .annotate(last=Max("occurred_at"))
+    )
+    return {row["camera_id"]: row["last"] for row in rows}
+
+
+@api_view(["GET"])
+def health(request):
+    """Whether the cameras are actually working.
+
+    Always 200 by default so a dashboard can poll it. Monitoring tools that
+    alert on status codes should pass ``?strict=1``, which returns 503 when
+    anything is wrong.
+    """
+    cameras = list(Camera.objects.all())
+    report = build_report(cameras, REGISTRY, _last_event_times(cameras))
+
+    strict = (request.query_params.get("strict") or "").lower() in ("1", "true", "yes")
+    code = status.HTTP_200_OK
+    if strict and report["status"] != STATUS_OK:
+        code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return Response(report, status=code)

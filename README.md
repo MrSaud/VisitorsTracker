@@ -153,6 +153,7 @@ All of these are environment variables:
 | `COUNTER_MAX_DISAPPEARED` | `25` | Frames a track survives unseen |
 | `COUNTER_FRAME_WIDTH` | `640` | Frames are downscaled to this width before detection |
 | `COUNTER_OCCUPANCY_RESET_AT` | `00:00` | Local time occupancy returns to zero |
+| `COUNTER_STALE_FRAME_SECONDS` | `30` | No frame for this long means stalled |
 | `COUNTER_API_TOKEN` | *(unset)* | Shared token for machine write access |
 | `COUNTER_PUBLIC_READS` | `1` | `0` requires auth for reads as well |
 
@@ -160,6 +161,7 @@ All of these are environment variables:
 
 | Method | Path | Purpose |
 |---|---|---|
+| `GET` | `/api/v1/health/` | Whether cameras are working — see [Health](#health) |
 | `GET` | `/api/v1/stats/` | Totals across all cameras, plus per-camera detail |
 | `GET` | `/api/v1/daily/` | Crossings per date — see [Visitors per date](#visitors-per-date) |
 | `GET` | `/api/v1/hourly/` | Arrivals by hour of day — see [Busiest hours](#busiest-hours) |
@@ -252,6 +254,57 @@ profile for the shape of a day, and the matrix for staffing a given weekday.
 Hours are local, like dates — an arrival at 01:30 Kuwait time is hour 1, not
 the UTC hour 22.
 
+## Health
+
+The dangerous failure here is the quiet one. A camera that dies on a Thursday
+night raises nothing — the counts simply stop, and Sunday's report is wrong
+without looking wrong. A frozen stream is worse: the worker stays alive and
+"running" while delivering no frames at all.
+
+So health is judged on evidence of work, not on whether something was
+started. The dashboard shows a banner when anything is wrong.
+
+```bash
+curl 'http://127.0.0.1:8000/api/v1/health/'
+python manage.py check_health
+```
+
+| State | Meaning | Healthy? |
+|---|---|---|
+| `ok` | Alive and delivering frames | ✅ |
+| `stalled` | Alive, but no frame for `COUNTER_STALE_FRAME_SECONDS` (default 30) | ❌ |
+| `failed` | Stopped with an error — the reason is reported | ❌ |
+| `offline` | Marked active, but nothing is running. The post-restart case | ❌ |
+| `disabled` | Not active, so nothing is expected | ✅ |
+| `finished` | A video file played to its end | ✅ |
+
+Those roll up into one word: `ok`, `degraded` (something stalled) or `down`
+(something failed or is offline).
+
+Two deliberate choices, both to avoid alarms nobody will trust:
+
+- **Deactivating a camera clears a stale failure.** Turning one off means
+  stop expecting it to run; an error from an earlier run must not alarm
+  forever.
+- **A finished video file is not a fault.** Live cameras never end on their
+  own, so this cannot mask a real failure.
+
+### For monitoring
+
+`/api/v1/health/` returns 200 regardless so a dashboard can poll it. Pass
+`?strict=1` to get **503** when anything is wrong, which uptime checks can
+alert on.
+
+`check_health` is the cron-friendly form, exiting **0** healthy, **1**
+degraded, **2** down:
+
+```bash
+*/5 * * * * cd /path/to/VisitorsTracker && .venv/bin/python manage.py check_health --quiet
+```
+
+Note it only sees workers in **its own process**, so run it against the
+server's own health endpoint if counting runs elsewhere.
+
 ## "It never counts anything"
 
 Run the probe. It separates the two causes, from your real camera:
@@ -319,9 +372,10 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 python manage.py test
 ```
 
-126 tests covering tracker identity, line-crossing direction, the dead band,
+159 tests covering tracker identity, line-crossing direction, the dead band,
 the YOLOv8 output decoding, line-setup suggestions, local-date and local-hour
-bucketing, occupancy reset behaviour, authentication and the API. Most use a stub detector, so they need
+bucketing, occupancy reset behaviour, camera health states, authentication
+and the API. Most use a stub detector, so they need
 no camera and no model file; the tests that exercise the real model skip
 automatically when it has not been exported.
 
