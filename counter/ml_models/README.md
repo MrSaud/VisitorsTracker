@@ -1,17 +1,33 @@
 # Detector models
 
-The project runs out of the box with OpenCV's built-in HOG pedestrian
-detector, which needs no files in this folder.
+`COUNTER_DETECTOR` defaults to `auto`:
 
-For better accuracy, drop a YOLOv8 ONNX export here and switch backends:
+- a YOLOv8 ONNX model in this folder is used when present,
+- otherwise OpenCV's built-in HOG pedestrian detector runs, so the project
+  works immediately after `pip install` with nothing in here.
+
+## Exporting a model
 
 ```bash
-pip install ultralytics
-python -c "from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx', opset=12)"
-mv yolov8n.onnx counter/ml_models/
-
-export COUNTER_DETECTOR=onnx
+./scripts/export_yolo.sh          # yolov8n, the default
+./scripts/export_yolo.sh yolov8s  # more accurate, slower
 ```
 
-The loader falls back to HOG if the file is missing or unreadable, so a bad
-export never takes the app down. `.onnx` files are gitignored.
+The script builds a temporary venv for `ultralytics` + `torch` and throws it
+away afterwards. Those are **export-time only** — at runtime the model is read
+through `cv2.dnn`, so the project venv stays small.
+
+For a non-default model, point the app at it:
+
+```bash
+export COUNTER_ONNX_MODEL=yolov8s.onnx
+```
+
+## Notes
+
+- `.onnx` and `.pt` files are gitignored; they are build artefacts, so export
+  them per machine rather than committing ~12MB of weights.
+- A missing or corrupt model never takes the cameras down: the loader logs a
+  warning and falls back to HOG.
+- `people.jpg`, if present, is a local fixture for the detection test and is
+  also gitignored. `scripts/export_yolo.sh` does not fetch it.

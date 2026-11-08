@@ -43,8 +43,8 @@ rather than failing silently.
 
 ## How counting works
 
-1. **Detect** — OpenCV HOG pedestrian detector by default; optionally a
-   YOLOv8 ONNX model (see `counter/ml_models/README.md`).
+1. **Detect** — a YOLOv8 ONNX model when one is present, otherwise OpenCV's
+   built-in HOG pedestrian detector. See [Detector](#detector) below.
 2. **Track** — a nearest-centroid tracker assigns a stable id to each person,
    so one visitor is counted once rather than once per frame.
 3. **Count** — each track's centroid is compared against the counting line.
@@ -58,15 +58,42 @@ come out backwards for its mounting angle.
 Detection runs on every *N*th frame (`COUNTER_DETECT_EVERY`, default 3) and
 tracking fills the gaps, which is what makes CPU-only operation workable.
 
+## Detector
+
+`COUNTER_DETECTOR=auto` (the default) uses a YOLOv8 ONNX model when one exists
+in `counter/ml_models/`, and falls back to HOG otherwise. Export one with:
+
+```bash
+./scripts/export_yolo.sh            # yolov8n
+./scripts/export_yolo.sh yolov8s    # more accurate, slower
+```
+
+`ultralytics` and `torch` are needed only to *export*; the script builds a
+throwaway venv for them and discards it. At runtime the model is read through
+`cv2.dnn`, so they are not in `requirements.txt`.
+
+Measured on the project's test photo (four people, Apple silicon, 640x480
+frames):
+
+| Detector | People found | Per frame | Effective video fps at `DETECT_EVERY=3` |
+|---|---|---|---|
+| HOG | 1 of 4 | ~12 ms | ~250 |
+| YOLOv8n | 4 of 4 | ~41 ms | ~74 |
+
+HOG is roughly 3x faster but misses most people at an angle; YOLOv8n is the
+right default for a real entrance, and still has headroom well beyond camera
+frame rates. A missing or corrupt model never stops the cameras — the loader
+logs a warning and uses HOG.
+
 ## Tuning
 
 All of these are environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `COUNTER_DETECTOR` | `hog` | `hog` or `onnx` |
+| `COUNTER_DETECTOR` | `auto` | `auto`, `onnx` or `hog` |
 | `COUNTER_ONNX_MODEL` | `yolov8n.onnx` | Model file in `counter/ml_models/` |
-| `COUNTER_MIN_CONFIDENCE` | `0.45` | Detection threshold. For HOG this is an SVM score (~0.2–1.5), not a probability |
+| `COUNTER_MIN_CONFIDENCE` | *(per backend)* | Detection threshold. Unset, HOG uses 0.45 and YOLO 0.35 — HOG scores are SVM decision values, YOLO scores are probabilities, so one shared number suits neither |
 | `COUNTER_DETECT_EVERY` | `3` | Detect on every Nth frame |
 | `COUNTER_MAX_DISAPPEARED` | `25` | Frames a track survives unseen |
 | `COUNTER_FRAME_WIDTH` | `640` | Frames are downscaled to this width before detection |
@@ -101,8 +128,10 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 python manage.py test
 ```
 
-The suite covers tracker identity, line-crossing direction, the dead band and
-the API, using a stub detector so it needs no camera and no model file.
+45 tests covering tracker identity, line-crossing direction, the dead band,
+the YOLOv8 output decoding and the API. Most use a stub detector, so they need
+no camera and no model file; the tests that exercise the real model skip
+automatically when it has not been exported.
 
 ## Notes
 

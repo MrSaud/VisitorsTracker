@@ -6,6 +6,7 @@ a model file, or any particular machine speed.
 
 import pathlib
 import tempfile
+from unittest import skipUnless
 
 import cv2
 import numpy as np
@@ -14,6 +15,9 @@ from django.test import TestCase, TransactionTestCase
 from .camera import CounterWorker
 from .models import Camera, CountEvent
 from .vision import (
+    DEFAULT_HOG_CONFIDENCE,
+    DEFAULT_ONNX_CONFIDENCE,
+    PERSON_CLASS_ID,
     DIRECTION_IN,
     DIRECTION_OUT,
     HORIZONTAL,
@@ -21,8 +25,11 @@ from .vision import (
     CentroidTracker,
     HogPersonDetector,
     LineCounter,
+    OnnxPersonDetector,
     VisitorCounter,
+    build_detector,
     non_max_suppression,
+    resolve_model_path,
 )
 
 FRAME_H, FRAME_W = 240, 320
@@ -360,3 +367,167 @@ class WorkerEndToEndTests(TransactionTestCase):
         self.assertIsNotNone(worker.error)
         self.assertIn("Could not open video source", worker.error)
         self.assertEqual(CountEvent.objects.count(), 0)
+
+
+class OnnxDecodeTests(TestCase):
+    """Decode maths for the YOLOv8 head, exercised without the model file.
+
+    The network is stubbed so these run on any machine; the separate
+    ``OnnxModelTests`` cover the real exported model when it is present.
+    """
+
+    INPUT = 640
+
+    def _detector(self, forward_output):
+        """An OnnxPersonDetector with a canned forward pass."""
+        detector = object.__new__(OnnxPersonDetector)
+        detector.min_confidence = 0.45
+        detector.input_size = self.INPUT
+
+        class FakeNet:
+            def setInput(self, blob):
+                self.blob = blob
+
+            def forward(self_inner):
+                return forward_output
+
+        detector._net = FakeNet()
+        return detector
+
+    @staticmethod
+    def _row(cx, cy, w, h, person_score, num_classes=80, other=None):
+        row = np.zeros(4 + num_classes, dtype=np.float32)
+        row[:4] = (cx, cy, w, h)
+        row[4 + PERSON_CLASS_ID] = person_score
+        if other is not None:
+            index, score = other
+            row[4 + index] = score
+        return row
+
+    @staticmethod
+    def _output(rows, total=8400):
+        """Shape real rows like an actual YOLOv8 head: (1, 84, 8400).
+
+        Padding to the true candidate count matters -- the decoder works out
+        tensor orientation from which axis is larger, so a toy 2-row tensor
+        would be read sideways and prove nothing.
+        """
+        rows = np.stack(rows).astype(np.float32)
+        pad = np.zeros((total - len(rows), rows.shape[1]), dtype=np.float32)
+        return np.concatenate([rows, pad], axis=0).T[np.newaxis, ...]
+
+    def test_box_maps_back_through_letterbox(self):
+        # 640x480 frame -> scale 1.0, dy 80 (letterboxed top and bottom).
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        # Target box (100, 100) - (200, 300): centre (150, 200), 100x200.
+        # In padded space that centre sits at y = 200 + 80 = 280.
+        rows = [
+            self._row(150, 280, 100, 200, 0.92),
+            self._row(400, 400, 50, 50, 0.10),          # below threshold
+        ]
+        detections = self._detector(self._output(rows)).detect(frame)
+
+        self.assertEqual(len(detections), 1)
+        box, score = detections[0]
+        self.assertAlmostEqual(score, 0.92, places=4)
+        for actual, expected in zip(box, (100.0, 100.0, 200.0, 300.0)):
+            self.assertAlmostEqual(actual, expected, delta=0.5)
+
+    def test_non_person_winning_class_is_rejected(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        # Person score clears the bar, but class 2 (car) wins the row.
+        rows = [self._row(150, 280, 100, 200, 0.50, other=(2, 0.95))]
+        detections = self._detector(self._output(rows)).detect(frame)
+        self.assertEqual(detections, [])
+
+    def test_boxes_are_clipped_to_the_frame(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        # A huge box centred near the top-left spills past the edges.
+        rows = [self._row(20, 100, 400, 400, 0.90)]
+        detections = self._detector(self._output(rows)).detect(frame)
+        self.assertEqual(len(detections), 1)
+        x1, y1, x2, y2 = detections[0][0]
+        self.assertGreaterEqual(x1, 0.0)
+        self.assertGreaterEqual(y1, 0.0)
+        self.assertLessEqual(x2, 640.0)
+        self.assertLessEqual(y2, 480.0)
+
+    def test_overlapping_duplicates_are_suppressed(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        rows = [
+            self._row(150, 280, 100, 200, 0.80),
+            self._row(152, 282, 100, 200, 0.95),   # near-identical, higher score
+            self._row(500, 280, 100, 200, 0.85),   # well separated
+        ]
+        detections = self._detector(self._output(rows)).detect(frame)
+        self.assertEqual(len(detections), 2)
+        self.assertAlmostEqual(max(s for _b, s in detections), 0.95, places=4)
+
+    def test_empty_and_malformed_output_are_handled(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        nothing = [self._row(150, 280, 100, 200, 0.01)]
+        self.assertEqual(self._detector(self._output(nothing)).detect(frame), [])
+        # A 1-D output is not a detection head at all.
+        self.assertEqual(self._detector(np.zeros((10,), dtype=np.float32)).detect(frame), [])
+
+
+class DetectorSelectionTests(TestCase):
+    def test_hog_is_forced_when_requested(self):
+        detector = build_detector("hog", 0.45)
+        self.assertIsInstance(detector, HogPersonDetector)
+
+    def test_each_backend_has_its_own_default_threshold(self):
+        hog = HogPersonDetector()
+        self.assertAlmostEqual(hog.min_confidence, DEFAULT_HOG_CONFIDENCE)
+        self.assertNotAlmostEqual(DEFAULT_HOG_CONFIDENCE, DEFAULT_ONNX_CONFIDENCE)
+
+    def test_explicit_threshold_overrides_the_default(self):
+        self.assertAlmostEqual(HogPersonDetector(0.8).min_confidence, 0.8)
+
+    def test_missing_model_falls_back_to_hog(self):
+        detector = build_detector("onnx", 0.45, model_name="definitely-not-here.onnx")
+        self.assertIsInstance(detector, HogPersonDetector)
+
+    def test_auto_without_model_is_hog(self):
+        detector = build_detector("auto", 0.45, model_name="definitely-not-here.onnx")
+        self.assertIsInstance(detector, HogPersonDetector)
+
+    @skipUnless(resolve_model_path().exists(), "yolov8n.onnx not exported")
+    def test_auto_prefers_the_model_when_present(self):
+        detector = build_detector("auto", 0.45)
+        self.assertIsInstance(detector, OnnxPersonDetector)
+        self.assertEqual(detector.name, "onnx")
+
+
+@skipUnless(resolve_model_path().exists(), "yolov8n.onnx not exported")
+class OnnxModelTests(TestCase):
+    """Runs the genuinely exported model. Skipped when it has not been built."""
+
+    FIXTURE = pathlib.Path(__file__).resolve().parent / "ml_models" / "people.jpg"
+
+    def test_model_loads_and_runs_on_a_blank_frame(self):
+        detector = OnnxPersonDetector(resolve_model_path())
+        detections = detector.detect(np.zeros((480, 640, 3), dtype=np.uint8))
+        self.assertIsInstance(detections, list)
+        self.assertEqual(detections, [], "a blank frame should contain no people")
+
+    @skipUnless(FIXTURE.exists(), "no people.jpg fixture")
+    def test_finds_real_people_in_a_photograph(self):
+        image = cv2.imread(str(self.FIXTURE))
+        self.assertIsNotNone(image, "fixture could not be decoded")
+
+        # Default threshold, i.e. what the app actually runs with.
+        detector = OnnxPersonDetector(resolve_model_path())
+        detections = detector.detect(image)
+
+        # The fixture holds four people; the faintest scores ~0.44, which the
+        # old shared 0.45 cutoff used to discard.
+        self.assertGreaterEqual(len(detections), 4, "expected all four people")
+        height, width = image.shape[:2]
+        for box, score in detections:
+            x1, y1, x2, y2 = box
+            self.assertGreater(x2, x1)
+            self.assertGreater(y2, y1)
+            self.assertGreaterEqual(score, detector.min_confidence)
+            self.assertLessEqual(x2, width + 1)
+            self.assertLessEqual(y2, height + 1)

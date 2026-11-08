@@ -16,3 +16,4 @@ media/
 # Large detector weights - fetch these locally, don't commit them
 counter/ml_models/*.onnx
 counter/ml_models/*.pt
+counter/ml_models/people.jpg

@@ -15,6 +15,7 @@ Two detector backends are available:
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,10 +23,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 MODEL_DIR = Path(__file__).resolve().parent / "ml_models"
 
 # COCO class index for "person" in a standard YOLOv8 export.
 PERSON_CLASS_ID = 0
+
+# HOG scores are SVM decision values; YOLO scores are probabilities. They are
+# different scales, so a single shared threshold suits neither. These are the
+# per-backend defaults, used when no explicit threshold is configured.
+DEFAULT_HOG_CONFIDENCE = 0.45
+DEFAULT_ONNX_CONFIDENCE = 0.35
 
 HORIZONTAL = "horizontal"
 VERTICAL = "vertical"
@@ -90,8 +99,10 @@ class HogPersonDetector:
 
     name = "hog"
 
-    def __init__(self, min_confidence: float = 0.45):
-        self.min_confidence = float(min_confidence)
+    def __init__(self, min_confidence: float | None = None):
+        self.min_confidence = (
+            DEFAULT_HOG_CONFIDENCE if min_confidence is None else float(min_confidence)
+        )
         self._hog = cv2.HOGDescriptor()
         self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
@@ -122,11 +133,13 @@ class OnnxPersonDetector:
 
     name = "onnx"
 
-    def __init__(self, model_path, min_confidence: float = 0.45, input_size: int = 640):
+    def __init__(self, model_path, min_confidence: float | None = None, input_size: int = 640):
         self.model_path = Path(model_path)
         if not self.model_path.exists():
             raise FileNotFoundError(f"ONNX model not found: {self.model_path}")
-        self.min_confidence = float(min_confidence)
+        self.min_confidence = (
+            DEFAULT_ONNX_CONFIDENCE if min_confidence is None else float(min_confidence)
+        )
         self.input_size = int(input_size)
         self._net = cv2.dnn.readNetFromONNX(str(self.model_path))
 
@@ -138,48 +151,100 @@ class OnnxPersonDetector:
         self._net.setInput(blob)
         output = self._net.forward()
 
-        # YOLOv8 exports (1, 4 + num_classes, num_boxes); transpose to rows.
+        # A YOLOv8 export is (1, 4 + num_classes, num_boxes). Transpose so each
+        # row is one candidate box. Everything below stays vectorised: there are
+        # 8400 candidates per frame, and a Python loop over them would not keep up.
         predictions = np.squeeze(output)
         if predictions.ndim != 2:
             return []
+        # Orientation: a detection head always has far more candidate boxes
+        # (8400 at 640px) than features per box (84 for COCO), so the smaller
+        # axis is the feature axis.
         if predictions.shape[0] < predictions.shape[1]:
             predictions = predictions.T
 
-        boxes, scores = [], []
-        for row in predictions:
-            class_scores = row[4:]
-            if class_scores.size <= PERSON_CLASS_ID:
-                continue
-            confidence = float(class_scores[PERSON_CLASS_ID])
-            if confidence < self.min_confidence:
-                continue
-            # Only keep rows where "person" is the winning class.
-            if int(np.argmax(class_scores)) != PERSON_CLASS_ID:
-                continue
-            cx, cy, w, h = (float(v) for v in row[:4])
-            x1 = (cx - w / 2 - dx) / scale
-            y1 = (cy - h / 2 - dy) / scale
-            x2 = (cx + w / 2 - dx) / scale
-            y2 = (cy + h / 2 - dy) / scale
-            boxes.append([x1, y1, x2, y2])
-            scores.append(confidence)
+        if predictions.shape[1] <= 4 + PERSON_CLASS_ID:
+            return []
+
+        class_scores = predictions[:, 4:]
+        person_scores = class_scores[:, PERSON_CLASS_ID]
+
+        # Keep candidates that clear the threshold AND whose winning class is
+        # "person", so a confident car does not become a visitor.
+        keep_mask = person_scores >= self.min_confidence
+        if not keep_mask.any():
+            return []
+        keep_mask &= class_scores.argmax(axis=1) == PERSON_CLASS_ID
+        if not keep_mask.any():
+            return []
+
+        candidates = predictions[keep_mask]
+        scores = person_scores[keep_mask].astype(np.float32)
+
+        cx, cy, w, h = (candidates[:, i] for i in range(4))
+        half_w, half_h = w / 2.0, h / 2.0
+        boxes = np.stack(
+            [
+                (cx - half_w - dx) / scale,
+                (cy - half_h - dy) / scale,
+                (cx + half_w - dx) / scale,
+                (cy + half_h - dy) / scale,
+            ],
+            axis=1,
+        )
+
+        # Clip to the frame so a box hanging off the edge cannot skew a centroid.
+        height, width = frame.shape[:2]
+        boxes[:, 0] = boxes[:, 0].clip(0, width)
+        boxes[:, 2] = boxes[:, 2].clip(0, width)
+        boxes[:, 1] = boxes[:, 1].clip(0, height)
+        boxes[:, 3] = boxes[:, 3].clip(0, height)
 
         keep = non_max_suppression(boxes, scores, iou_threshold=0.45)
-        return [(boxes[i], scores[i]) for i in keep]
+        return [([float(v) for v in boxes[i]], float(scores[i])) for i in keep]
 
 
-def build_detector(backend: str, min_confidence: float, model_name: str = "yolov8n.onnx"):
-    """Return a detector, falling back to HOG when the ONNX model is absent."""
-    backend = (backend or "hog").strip().lower()
-    if backend == "onnx":
-        candidate = Path(model_name)
-        if not candidate.is_absolute():
-            candidate = MODEL_DIR / candidate
-        try:
-            return OnnxPersonDetector(candidate, min_confidence=min_confidence)
-        except (FileNotFoundError, cv2.error):
-            # Fall through to HOG so the app still runs without the model.
-            pass
+def resolve_model_path(model_name: str = "yolov8n.onnx") -> Path:
+    """Model names are resolved inside ``counter/ml_models/`` unless absolute."""
+    candidate = Path(model_name)
+    return candidate if candidate.is_absolute() else MODEL_DIR / candidate
+
+
+def build_detector(
+    backend: str,
+    min_confidence: float | None = None,
+    model_name: str = "yolov8n.onnx",
+):
+    """Build a detector for ``backend``.
+
+    ``auto``  use the ONNX model when it is present, otherwise HOG.
+    ``onnx``  use the ONNX model, falling back to HOG with a warning.
+    ``hog``   always the built-in detector.
+
+    The fallback matters: a missing or corrupt model file degrades counting
+    accuracy, but it must never stop the cameras from running.
+
+    ``min_confidence`` of ``None`` lets each backend apply its own default.
+    """
+    backend = (backend or "auto").strip().lower()
+
+    if backend in ("auto", "onnx"):
+        model_path = resolve_model_path(model_name)
+        if model_path.exists():
+            try:
+                return OnnxPersonDetector(model_path, min_confidence=min_confidence)
+            except (OSError, cv2.error) as exc:
+                logger.warning(
+                    "Could not load ONNX detector %s (%s); falling back to HOG.",
+                    model_path, exc,
+                )
+        elif backend == "onnx":
+            logger.warning(
+                "COUNTER_DETECTOR=onnx but %s does not exist; falling back to HOG. "
+                "See counter/ml_models/README.md to export one.",
+                model_path,
+            )
+
     return HogPersonDetector(min_confidence=min_confidence)
 
 

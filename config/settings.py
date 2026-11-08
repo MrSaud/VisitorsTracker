@@ -96,14 +96,18 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # VisitorsTracker settings
 # ---------------------------------------------------------------------------
 
-# Detector backend: "hog" needs no model file. "onnx" uses COUNTER_ONNX_MODEL.
-COUNTER_DETECTOR = os.environ.get("COUNTER_DETECTOR", "hog")
+# Detector backend: "auto" uses the ONNX model when present and HOG otherwise.
+# Force one with "onnx" or "hog".
+COUNTER_DETECTOR = os.environ.get("COUNTER_DETECTOR", "auto")
 
 # Optional ONNX person detector (YOLOv8n export). Dropped in counter/ml_models/.
 COUNTER_ONNX_MODEL = os.environ.get("COUNTER_ONNX_MODEL", "yolov8n.onnx")
 
-# Minimum detection confidence.
-COUNTER_MIN_CONFIDENCE = float(os.environ.get("COUNTER_MIN_CONFIDENCE", "0.45"))
+# Minimum detection confidence. Leave unset so each backend uses its own
+# default (HOG 0.45 as an SVM score, YOLO 0.35 as a probability) -- the two
+# are different scales and one shared number drops real detections.
+_min_confidence = os.environ.get("COUNTER_MIN_CONFIDENCE", "").strip()
+COUNTER_MIN_CONFIDENCE = float(_min_confidence) if _min_confidence else None
 
 # Detect on every Nth frame; tracking fills the gaps (1 = every frame).
 COUNTER_DETECT_EVERY = int(os.environ.get("COUNTER_DETECT_EVERY", "3"))
