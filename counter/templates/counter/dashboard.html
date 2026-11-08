@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisitorsTracker</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e8eaed;
+    --muted: #9aa3b2;
+    --in: #3ddc84;
+    --out: #ff8a65;
+    --inside: #64b5f6;
+    --accent: #ffd54f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  main { padding: 24px; display: grid; gap: 24px; }
+  .totals {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+  }
+  .tile {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .tile .label {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  .tile .value { font-size: 34px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .v-in { color: var(--in); }
+  .v-out { color: var(--out); }
+  .v-inside { color: var(--inside); }
+  .cameras { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
+  .camera {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .camera h2 { font-size: 16px; margin: 0; }
+  .camera-head {
+    padding: 14px 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .src { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .viewport {
+    background: #000;
+    aspect-ratio: 4 / 3;
+    display: grid;
+    place-items: center;
+    position: relative;
+  }
+  .viewport img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .placeholder { color: var(--muted); font-size: 13px; text-align: center; padding: 24px; }
+  .camera-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border-top: 1px solid var(--border);
+  }
+  .camera-stats div { padding: 12px 14px; text-align: center; }
+  .camera-stats div + div { border-left: 1px solid var(--border); }
+  .camera-stats .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+  .camera-stats .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .controls { padding: 12px 16px; display: flex; gap: 8px; flex-wrap: wrap; border-top: 1px solid var(--border); }
+  button {
+    font: inherit;
+    font-size: 13px;
+    padding: 7px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: #3d4452; background: #252a34; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary { background: #1f6f43; border-color: #2a8d56; }
+  button.danger { background: #6f2a2a; border-color: #8d3a3a; }
+  .pill {
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .pill.on { color: var(--in); border-color: #2a6b45; background: #12271b; }
+  .meta { padding: 0 16px 14px; color: var(--muted); font-size: 12px; }
+  .error {
+    margin: 0 16px 14px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: #2a1a1a;
+    border: 1px solid #6f3a3a;
+    color: #ffb4a8;
+    font-size: 12.5px;
+  }
+  .empty {
+    background: var(--panel);
+    border: 1px dashed var(--border);
+    border-radius: 14px;
+    padding: 40px 24px;
+    text-align: center;
+    color: var(--muted);
+  }
+  .empty code {
+    display: block;
+    margin-top: 12px;
+    font-size: 13px;
+    color: var(--accent);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  a { color: var(--inside); }
+</style>
+</head>
+<body>
+<header>
+  <h1>VisitorsTracker</h1>
+  <span class="sub">Camera-based visitor counting &middot; <a href="/admin/">admin</a> &middot; <a href="/api/v1/stats/">API</a></span>
+</header>
+
+<main>
+  <section class="totals">
+    <div class="tile"><div class="label">Total in</div><div class="value v-in" id="t-in">&mdash;</div></div>
+    <div class="tile"><div class="label">Total out</div><div class="value v-out" id="t-out">&mdash;</div></div>
+    <div class="tile"><div class="label">Inside now</div><div class="value v-inside" id="t-inside">&mdash;</div></div>
+    <div class="tile"><div class="label">Today in</div><div class="value" id="t-today">&mdash;</div></div>
+    <div class="tile"><div class="label">Cameras running</div><div class="value" id="t-running">&mdash;</div></div>
+  </section>
+
+  {% if has_cameras %}
+  <section class="cameras">
+    {% for camera in cameras %}
+    <article class="camera" data-camera="{{ camera.pk }}">
+      <div class="camera-head">
+        <div>
+          <h2>{{ camera.name }}</h2>
+          <div class="src">{{ camera.source }}</div>
+        </div>
+        <span class="pill" data-role="state">checking&hellip;</span>
+      </div>
+
+      <div class="viewport" data-role="viewport">
+        <div class="placeholder" data-role="placeholder">Not running &mdash; press Start to open this camera.</div>
+      </div>
+
+      <div class="error" data-role="error" hidden></div>
+
+      <div class="camera-stats">
+        <div><div class="label">In</div><div class="value v-in" data-role="in">&mdash;</div></div>
+        <div><div class="label">Out</div><div class="value v-out" data-role="out">&mdash;</div></div>
+        <div><div class="label">Inside</div><div class="value v-inside" data-role="inside">&mdash;</div></div>
+      </div>
+
+      <div class="controls">
+        <button class="primary" data-action="start">Start</button>
+        <button data-action="stop">Stop</button>
+        <button class="danger" data-action="reset">Reset counts</button>
+      </div>
+
+      <div class="meta" data-role="meta"></div>
+    </article>
+    {% endfor %}
+  </section>
+  {% else %}
+  <div class="empty">
+    No cameras configured yet. Add one in the <a href="/admin/counter/camera/add/">admin</a>,
+    or create a webcam entry from the shell:
+    <code>python manage.py run_counter --source 0 --name "Front door"</code>
+  </div>
+  {% endif %}
+</main>
+
+<script>
+const CSRF = "{{ csrf_token }}";
+const POLL_MS = 2000;
+
+async function postJSON(url) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "X-CSRFToken": CSRF },
+  });
+  let body = null;
+  try { body = await response.json(); } catch (err) { body = null; }
+  return { ok: response.ok, status: response.status, body: body };
+}
+
+function setText(root, role, value) {
+  const node = root.querySelector(`[data-role="${role}"]`);
+  if (node) node.textContent = value;
+}
+
+function showStream(card, cameraId) {
+  const viewport = card.querySelector('[data-role="viewport"]');
+  if (viewport.querySelector("img")) return;
+  viewport.innerHTML = "";
+  const img = document.createElement("img");
+  img.alt = "live view";
+  img.src = `/api/v1/cameras/${cameraId}/stream/?t=${Date.now()}`;
+  viewport.appendChild(img);
+}
+
+function hideStream(card, message) {
+  const viewport = card.querySelector('[data-role="viewport"]');
+  viewport.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "placeholder";
+  div.setAttribute("data-role", "placeholder");
+  div.textContent = message;
+  viewport.appendChild(div);
+}
+
+function applyCamera(card, data) {
+  const pill = card.querySelector('[data-role="state"]');
+  const errorBox = card.querySelector('[data-role="error"]');
+
+  setText(card, "in", data.totals.in);
+  setText(card, "out", data.totals.out);
+  setText(card, "inside", data.totals.inside);
+
+  if (data.running) {
+    pill.textContent = "running";
+    pill.classList.add("on");
+    showStream(card, data.id);
+  } else {
+    pill.textContent = "stopped";
+    pill.classList.remove("on");
+    if (!card.dataset.starting) hideStream(card, "Not running — press Start to open this camera.");
+  }
+
+  const live = data.live;
+  if (live) {
+    const bits = [];
+    bits.push(`detector ${live.detector}`);
+    if (data.running) {
+      bits.push(`${live.fps.toFixed(1)} fps`);
+      bits.push(`${live.frames_read} frames`);
+      bits.push(`${live.active_tracks} tracked`);
+      bits.push(`session in ${live.session_in} / out ${live.session_out}`);
+    }
+    setText(card, "meta", bits.join(" · "));
+    if (live.error) {
+      errorBox.textContent = live.error;
+      errorBox.hidden = false;
+    } else {
+      errorBox.hidden = true;
+    }
+  } else {
+    setText(card, "meta", "");
+  }
+
+  card.querySelector('[data-action="start"]').disabled = data.running;
+  card.querySelector('[data-action="stop"]').disabled = !data.running;
+}
+
+async function refresh() {
+  try {
+    const response = await fetch("/api/v1/stats/");
+    if (!response.ok) return;
+    const data = await response.json();
+
+    document.getElementById("t-in").textContent = data.totals.in;
+    document.getElementById("t-out").textContent = data.totals.out;
+    document.getElementById("t-inside").textContent = data.totals.inside;
+    document.getElementById("t-today").textContent = data.today.in;
+    document.getElementById("t-running").textContent = data.running_cameras;
+
+    for (const camera of data.cameras) {
+      const card = document.querySelector(`[data-camera="${camera.id}"]`);
+      if (card) applyCamera(card, camera);
+    }
+  } catch (err) {
+    /* transient fetch failure; the next poll will retry */
+  }
+}
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const card = button.closest("[data-camera]");
+  if (!card) return;
+
+  const cameraId = card.dataset.camera;
+  const action = button.dataset.action;
+  const errorBox = card.querySelector('[data-role="error"]');
+
+  if (action === "reset" && !confirm("Delete all recorded crossings for this camera?")) {
+    return;
+  }
+
+  button.disabled = true;
+  if (action === "start") card.dataset.starting = "1";
+
+  const result = await postJSON(`/api/v1/cameras/${cameraId}/${action}/`);
+
+  if (action === "start") delete card.dataset.starting;
+
+  if (!result.ok) {
+    const detail = (result.body && result.body.detail) || `request failed (${result.status})`;
+    errorBox.textContent = detail;
+    errorBox.hidden = false;
+  }
+
+  await refresh();
+});
+
+refresh();
+setInterval(refresh, POLL_MS);
+</script>
+</body>
+</html>
