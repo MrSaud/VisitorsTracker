@@ -1,7 +1,7 @@
 """Background workers that read cameras, count crossings and serve frames.
 
 One :class:`CounterWorker` thread per camera owns the ``cv2.VideoCapture``,
-runs detection/tracking, writes :class:`~counter.models.CountEvent` rows and
+runs detection/tracking, writes :class:`~counter.models.Crossing` rows and
 keeps the most recent annotated frame as JPEG bytes. HTTP requests never touch
 the capture device; they only read the cached frame, so any number of browser
 tabs can watch one camera.
@@ -28,6 +28,11 @@ FRAME_WAIT_TIMEOUT = 5.0
 
 # Consecutive read failures tolerated before a live camera is abandoned.
 MAX_READ_FAILURES = 30
+
+# How long a resolved event is reused before being looked up again. Crossings
+# are infrequent, but this keeps a busy doorway from querying per person while
+# still noticing an event starting or ending within a few seconds.
+EVENT_CACHE_SECONDS = 10.0
 
 
 class CounterWorker(threading.Thread):
@@ -63,6 +68,9 @@ class CounterWorker(threading.Thread):
             max_disappeared=settings.COUNTER_MAX_DISAPPEARED,
             frame_width=settings.COUNTER_FRAME_WIDTH,
         )
+
+        self._event_id = None
+        self._event_checked_at = 0.0
 
         self._stop_event = threading.Event()
         self._condition = threading.Condition()
@@ -219,24 +227,46 @@ class CounterWorker(threading.Thread):
             self.last_frame_at = now
             self._condition.notify_all()
 
+    def _current_event_id(self):
+        """Which event, if any, is running for this camera right now."""
+        now = time.monotonic()
+        if now - self._event_checked_at < EVENT_CACHE_SECONDS:
+            return self._event_id
+
+        from .models import Camera, active_event_for
+
+        self._event_checked_at = now
+        try:
+            close_old_connections()
+            camera = Camera.objects.filter(pk=self.camera_pk).first()
+            event = active_event_for(camera) if camera else None
+            self._event_id = event.pk if event else None
+        except Exception as exc:  # pragma: no cover - counting must continue
+            logger.warning("camera %s: could not resolve the current event: %s",
+                           self.camera_pk, exc)
+            self._event_id = None
+        return self._event_id
+
     def _persist(self, events):
-        from .models import CountEvent
+        from .models import Crossing
 
         now = timezone.now()
+        event_id = self._current_event_id()
         rows = [
-            CountEvent(
+            Crossing(
                 camera_id=self.camera_pk,
                 track_id=track_id,
                 direction=direction,
                 occurred_at=now,
+                event_id=event_id,
             )
             for track_id, direction in events
         ]
         try:
             close_old_connections()
-            CountEvent.objects.bulk_create(rows)
+            Crossing.objects.bulk_create(rows)
         except Exception as exc:  # pragma: no cover - keep the camera alive
-            logger.warning("camera %s: could not save %d event(s): %s",
+            logger.warning("camera %s: could not save %d crossing(s): %s",
                            self.camera_pk, len(rows), exc)
 
 

@@ -157,6 +157,32 @@
   .alert .title { font-weight: 600; font-size: 14px; }
   .alert ul { margin: 2px 0 0; padding-left: 18px; font-size: 12.5px; }
   .alert li { margin: 2px 0; }
+  .event-card {
+    border-radius: 14px;
+    border: 1px solid #2a6b45;
+    background: linear-gradient(180deg, #13251c 0%, var(--panel) 100%);
+    padding: 16px 18px;
+    display: grid;
+    gap: 12px;
+  }
+  .event-card.over { border-color: #8d3a3a; background: #2a1a1a; }
+  .event-card.near { border-color: #7a6326; background: #2a2416; }
+  .event-head { display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; flex-wrap: wrap; }
+  .event-head h2 { margin: 0; font-size: 17px; }
+  .event-when { color: var(--muted); font-size: 12.5px; }
+  .event-figures { display: grid; gap: 10px;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
+  .event-figures .label { font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.07em; color: var(--muted); }
+  .event-figures .value { font-size: 26px; font-weight: 600;
+    font-variant-numeric: tabular-nums; }
+  .capacity-bar { height: 8px; border-radius: 999px; background: #22262f; overflow: hidden; }
+  .capacity-bar span { display: block; height: 100%; background: var(--in);
+    border-radius: 999px; transition: width 0.3s; }
+  .event-card.near .capacity-bar span { background: var(--accent); }
+  .event-card.over .capacity-bar span { background: var(--out); }
+  .capacity-note { font-size: 12px; color: var(--muted); }
   .panel {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -277,6 +303,8 @@
     <div class="title" id="health-title"></div>
     <ul id="health-list"></ul>
   </div>
+
+  <div id="event-now"></div>
 
   <section class="totals">
     <div class="tile"><div class="label">Total in</div><div class="value v-in" id="t-in">&mdash;</div></div>
@@ -502,7 +530,7 @@ async function refresh() {
     document.getElementById("t-out").textContent = data.totals.out;
     document.getElementById("t-inside").textContent = data.occupancy.inside;
     const resetNote = document.getElementById("t-inside-note");
-    if (resetNote) resetNote.textContent = `since ${data.occupancy.resets_at}`;
+    if (resetNote) resetNote.textContent = data.occupancy.scope;
     document.getElementById("t-today").textContent = data.today.in;
     document.getElementById("t-running").textContent = data.running_cameras;
 
@@ -544,6 +572,82 @@ document.addEventListener("click", async (event) => {
 
   await refresh();
 });
+
+// ---- the running event -------------------------------------------------
+
+function formatRemaining(seconds) {
+  if (seconds <= 0) return "ending now";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours >= 1) return `${hours}h ${minutes}m left`;
+  return `${minutes}m left`;
+}
+
+function renderEvent(event) {
+  const card = document.createElement("div");
+  const capacity = event.capacity;
+  card.className = "event-card" + (capacity ? ` ${capacity.level}` : "");
+
+  const head = document.createElement("div");
+  head.className = "event-head";
+  const title = document.createElement("h2");
+  title.textContent = event.name;
+  const when = document.createElement("div");
+  when.className = "event-when";
+  when.textContent = formatRemaining(event.seconds_remaining ?? 0) +
+    (event.covers_all_cameras ? " · all cameras"
+      : ` · ${event.cameras.map(c => c.name).join(", ")}`);
+  head.appendChild(title);
+  head.appendChild(when);
+  card.appendChild(head);
+
+  const figures = document.createElement("div");
+  figures.className = "event-figures";
+  const cells = [
+    ["Attendance", event.attendance.in, "v-in"],
+    ["Left", event.attendance.out, "v-out"],
+    ["Inside now", event.attendance.inside, "v-inside"],
+  ];
+  if (capacity) cells.push(["Capacity", capacity.capacity, ""]);
+  for (const [label, value, cls] of cells) {
+    const cell = document.createElement("div");
+    cell.innerHTML = `<div class="label"></div><div class="value ${cls}"></div>`;
+    cell.querySelector(".label").textContent = label;
+    cell.querySelector(".value").textContent = value;
+    figures.appendChild(cell);
+  }
+  card.appendChild(figures);
+
+  if (capacity) {
+    const bar = document.createElement("div");
+    bar.className = "capacity-bar";
+    const fill = document.createElement("span");
+    fill.style.width = `${Math.min(100, capacity.percent)}%`;
+    bar.appendChild(fill);
+    card.appendChild(bar);
+
+    const note = document.createElement("div");
+    note.className = "capacity-note";
+    note.textContent = capacity.level === "over"
+      ? `Over capacity by ${capacity.inside - capacity.capacity}`
+      : `${capacity.percent}% full · ${capacity.remaining} places left`;
+    card.appendChild(note);
+  }
+  return card;
+}
+
+async function refreshEvent() {
+  const host = document.getElementById("event-now");
+  try {
+    const response = await fetch("/api/v1/events/current/");
+    if (!response.ok) return;
+    const data = await response.json();
+    host.innerHTML = "";
+    for (const event of data.events) host.appendChild(renderEvent(event));
+  } catch (err) {
+    /* next poll retries */
+  }
+}
 
 // ---- camera health -----------------------------------------------------
 
@@ -779,7 +883,9 @@ document.getElementById("hourly-csv").addEventListener("click", () => {
 });
 
 refresh();
+refreshEvent();
 refreshHealth();
+setInterval(refreshEvent, 10000);
 refreshDaily();
 refreshHourly();
 setInterval(refreshHealth, 15000);

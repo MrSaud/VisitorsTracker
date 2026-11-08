@@ -11,6 +11,7 @@ from django.http import (
 )
 from django.db.models import Max
 from django.shortcuts import get_object_or_404, render
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -18,7 +19,7 @@ from rest_framework.response import Response
 from .camera import REGISTRY, mjpeg_frames
 from .daywindow import occupancy_window_start
 from .health import STATUS_OK, build_report
-from .models import Camera, CountEvent
+from .models import Camera, Crossing, Event, active_event_for
 from .permissions import _is_operator
 from .reports import (
     DEFAULT_DAYS,
@@ -154,25 +155,26 @@ def camera_stop(request, camera_id: int):
 
 
 @api_view(["GET"])
-def camera_events(request, camera_id: int):
+def camera_crossings(request, camera_id: int):
     camera = get_object_or_404(Camera, pk=camera_id)
     try:
         limit = min(500, max(1, int(request.query_params.get("limit", 50))))
     except (TypeError, ValueError):
         limit = 50
-    events = camera.events.all()[:limit]
+    crossings = camera.crossings.all()[:limit]
     return Response(
         {
             "camera_id": camera.pk,
-            "count": len(events),
-            "events": [
+            "count": len(crossings),
+            "crossings": [
                 {
-                    "id": event.pk,
-                    "track_id": event.track_id,
-                    "direction": event.direction,
-                    "occurred_at": event.occurred_at.isoformat(),
+                    "id": crossing.pk,
+                    "track_id": crossing.track_id,
+                    "direction": crossing.direction,
+                    "occurred_at": crossing.occurred_at.isoformat(),
+                    "event_id": crossing.event_id,
                 }
-                for event in events
+                for crossing in crossings
             ],
         }
     )
@@ -182,7 +184,7 @@ def camera_events(request, camera_id: int):
 def camera_reset(request, camera_id: int):
     """Delete this camera's recorded crossings. Does not stop the worker."""
     camera = get_object_or_404(Camera, pk=camera_id)
-    deleted, _ = CountEvent.objects.filter(camera=camera).delete()
+    deleted, _ = Crossing.objects.filter(camera=camera).delete()
     return Response({"camera_id": camera.pk, "deleted": deleted})
 
 
@@ -198,6 +200,18 @@ def overall_stats(request):
     occupied = sum(c["occupancy"]["inside"] for c in per_camera)
     occupancy_net = sum(c["occupancy"]["net"] for c in per_camera)
 
+    # Say what occupancy is actually measured from. While an event runs it
+    # counts from the event, not the daily reset, and a tile reading
+    # "since 00:00" would then be wrong.
+    scoped = {c["occupancy"]["event_name"] for c in per_camera
+              if c["occupancy"]["event_name"]}
+    if len(scoped) == 1:
+        scope_label = f"since {scoped.pop()} began"
+    elif scoped:
+        scope_label = "since each event began"
+    else:
+        scope_label = f"since {settings.COUNTER_OCCUPANCY_RESET_AT}"
+
     return Response(
         {
             "totals": {"in": total_in, "out": total_out},
@@ -206,6 +220,7 @@ def overall_stats(request):
                 "net": occupancy_net,
                 "since": occupancy_window_start().isoformat(),
                 "resets_at": settings.COUNTER_OCCUPANCY_RESET_AT,
+                "scope": scope_label,
             },
             "today": {
                 "in": sum(c["today"]["in"] for c in per_camera),
@@ -247,7 +262,15 @@ def _daily_params(request):
         except (ValueError, Camera.DoesNotExist):
             raise ValueError(f"no camera with id '{raw_camera}'")
 
-    return start, end, days, camera
+    event = None
+    raw_event = (params.get("event") or "").strip()
+    if raw_event:
+        try:
+            event = Event.objects.get(pk=int(raw_event))
+        except (ValueError, Event.DoesNotExist):
+            raise ValueError(f"no event with id '{raw_event}'")
+
+    return start, end, days, camera, event
 
 
 @api_view(["GET"])
@@ -258,11 +281,11 @@ def daily_report(request):
     ``?camera=<id>`` narrows to one camera, ``?format=csv`` downloads it.
     """
     try:
-        start, end, days, camera = _daily_params(request)
+        start, end, days, camera, event = _daily_params(request)
     except ValueError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-    rows = daily_counts(start=start, end=end, days=days, camera=camera)
+    rows = daily_counts(start=start, end=end, days=days, camera=camera, event=event)
     window_start, window_end = resolve_range(start, end, days)
 
     params = request.query_params
@@ -285,6 +308,8 @@ def daily_report(request):
         "end": window_end.isoformat(),
         "camera_id": camera.pk if camera else None,
         "camera_name": camera.name if camera else None,
+        "event_id": event.pk if event else None,
+        "event_name": event.name if event else None,
         "summary": summarise(rows),
         "days": rows,
     })
@@ -299,11 +324,11 @@ def hourly_report(request):
     Friday look nothing alike. ``?format=csv`` downloads the profile.
     """
     try:
-        start, end, days, camera = _daily_params(request)
+        start, end, days, camera, event = _daily_params(request)
     except ValueError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-    profile = hourly_profile(start=start, end=end, days=days, camera=camera)
+    profile = hourly_profile(start=start, end=end, days=days, camera=camera, event=event)
     window_start, window_end = resolve_range(start, end, days)
 
     params = request.query_params
@@ -327,6 +352,8 @@ def hourly_report(request):
         "end": window_end.isoformat(),
         "camera_id": camera.pk if camera else None,
         "camera_name": camera.name if camera else None,
+        "event_id": event.pk if event else None,
+        "event_name": event.name if event else None,
         "days": (window_end - window_start).days + 1,
         "busiest": busiest_hours(profile),
         "opening_span": opening_span(profile),
@@ -335,7 +362,7 @@ def hourly_report(request):
 
     if (params.get("matrix") or "").lower() in ("1", "true", "yes"):
         payload["matrix"] = weekday_hour_matrix(
-            start=start, end=end, days=days, camera=camera)
+            start=start, end=end, days=days, camera=camera, event=event)
 
     return Response(payload)
 
@@ -347,7 +374,7 @@ def hourly_report(request):
 def _last_event_times(cameras):
     """Most recent crossing per camera, in one query."""
     rows = (
-        CountEvent.objects.filter(camera__in=cameras)
+        Crossing.objects.filter(camera__in=cameras)
         .values("camera_id")
         .order_by()
         .annotate(last=Max("occurred_at"))
@@ -372,3 +399,86 @@ def health(request):
         code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return Response(report, status=code)
+
+
+# ---------------------------------------------------------------------------
+# events
+# ---------------------------------------------------------------------------
+
+def _event_payload(event, now=None):
+    now = now or timezone.now()
+    running = event.is_running(now)
+    payload = {
+        "id": event.pk,
+        "name": event.name,
+        "starts_at": event.starts_at.isoformat(),
+        "ends_at": event.ends_at.isoformat(),
+        "is_active": event.is_active,
+        "running": running,
+        "finished": event.has_finished(now),
+        "cameras": [{"id": c.pk, "name": c.name} for c in event.cameras.all()],
+        "covers_all_cameras": not event.cameras.exists(),
+        "attendance": event.totals(),
+        "capacity": event.capacity_state(),
+        "notes": event.notes,
+    }
+    if running:
+        payload["seconds_remaining"] = max(
+            0, int((event.ends_at - now).total_seconds()))
+    return payload
+
+
+@api_view(["GET"])
+def event_list(request):
+    """Scheduled events, newest first.
+
+    ``?running=1`` narrows to what is happening now; ``?camera=<id>`` to
+    events covering a particular camera.
+    """
+    now = timezone.now()
+    events = Event.objects.prefetch_related("cameras")
+
+    raw_camera = (request.query_params.get("camera") or "").strip()
+    if raw_camera:
+        try:
+            camera = Camera.objects.get(pk=int(raw_camera))
+        except (ValueError, Camera.DoesNotExist):
+            return Response({"detail": f"no camera with id '{raw_camera}'"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        events = [e for e in events if e.covers_camera(camera)]
+
+    only_running = (request.query_params.get("running") or "").lower() in (
+        "1", "true", "yes")
+    if only_running:
+        events = [e for e in events if e.is_running(now)]
+
+    return Response({
+        "count": len(list(events)),
+        "events": [_event_payload(e, now) for e in events],
+    })
+
+
+@api_view(["GET"])
+def event_detail(request, event_id: int):
+    event = get_object_or_404(
+        Event.objects.prefetch_related("cameras"), pk=event_id)
+    payload = _event_payload(event)
+    payload["hours"] = hourly_profile(
+        start=timezone.localtime(event.starts_at).date(),
+        end=timezone.localtime(event.ends_at).date(),
+        event=event,
+    )
+    payload["busiest"] = busiest_hours(payload["hours"])
+    return Response(payload)
+
+
+@api_view(["GET"])
+def current_event(request):
+    """What is running right now, across all cameras."""
+    now = timezone.now()
+    running = [e for e in Event.objects.prefetch_related("cameras")
+               if e.is_running(now)]
+    return Response({
+        "running": bool(running),
+        "events": [_event_payload(e, now) for e in running],
+    })

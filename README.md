@@ -4,6 +4,9 @@ Camera-based visitor counting in Django. A background worker reads each
 camera, detects people, tracks them across frames and counts them as they
 cross a virtual line — giving you **in**, **out** and **inside now**.
 
+Counting can be scoped to a scheduled **event**: create one in the admin and
+crossings are attributed to it for as long as it runs. See [Events](#events).
+
 ## Setup
 
 ```bash
@@ -228,6 +231,9 @@ All of these are environment variables:
 
 | Method | Path | Purpose |
 |---|---|---|
+| `GET` | `/api/v1/events/` | Scheduled events, with attendance |
+| `GET` | `/api/v1/events/current/` | What is running right now |
+| `GET` | `/api/v1/events/<id>/` | One event, with its hourly profile |
 | `GET` | `/api/v1/health/` | Whether cameras are working — see [Health](#health) |
 | `GET` | `/api/v1/stats/` | Totals across all cameras, plus per-camera detail |
 | `GET` | `/api/v1/daily/` | Crossings per date — see [Visitors per date](#visitors-per-date) |
@@ -236,10 +242,46 @@ All of these are environment variables:
 | `GET` | `/api/v1/cameras/<id>/` | One camera |
 | `POST` | `/api/v1/cameras/<id>/start/` | Start its worker |
 | `POST` | `/api/v1/cameras/<id>/stop/` | Stop its worker |
-| `GET` | `/api/v1/cameras/<id>/events/?limit=50` | Recent crossings |
+| `GET` | `/api/v1/cameras/<id>/crossings/?limit=50` | Recent crossings |
 | `POST` | `/api/v1/cameras/<id>/reset/` | Delete recorded crossings |
 | `GET` | `/api/v1/cameras/<id>/stream/` | Annotated MJPEG live stream |
 | `GET` | `/api/v1/cameras/<id>/snapshot/` | Latest annotated frame as JPEG |
+
+## Events
+
+An **event** is something being counted: an exhibition, a conference, an open
+day. Create one at `/admin/counter/event/add/` with a name, a start and an
+end. While it runs, every crossing is stamped with it, so attendance can be
+reported per event rather than only per date.
+
+| Field | Meaning |
+|---|---|
+| `starts_at` / `ends_at` | When counting is attributed to this event |
+| `cameras` | **Leave empty to cover every camera.** Set it to scope the event to particular entrances |
+| `capacity` | Optional. The dashboard warns as occupancy approaches it, and turns red once over |
+| `is_active` | Untick to stop attributing crossings without deleting the event |
+
+While an event runs, the dashboard shows a card with live attendance, who is
+still inside, and a capacity bar. Reports accept `?event=<id>`:
+
+```bash
+curl 'http://127.0.0.1:8000/api/v1/events/current/'
+curl 'http://127.0.0.1:8000/api/v1/hourly/?event=3'
+curl -OJ 'http://127.0.0.1:8000/api/v1/daily/?event=3&format=csv'
+```
+
+### How it behaves
+
+- **Occupancy counts from the event start.** Anyone inside beforehand is not
+  part of it. A multi-day event still gets the daily reset, because the later
+  of the two boundaries wins and the venue empties overnight.
+- **Overlapping events: the most recently started wins.** Scheduling a
+  session inside a longer programme is normal, and the inner one is the more
+  specific answer.
+- **Deleting an event keeps its crossings.** They simply become
+  unattributed, so history is never lost.
+- **Crossings outside any event are still recorded**, with no event attached,
+  and still appear in the date and hour reports.
 
 ## Visitors per date
 
@@ -439,7 +481,8 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 python manage.py test
 ```
 
-190 tests covering tracker identity through crossings and occlusion,
+224 tests covering tracker identity through crossings and occlusion,
+event scoping and attribution,
 assignment optimality against brute force, line-crossing direction, the dead
 band,
 the YOLOv8 output decoding, line-setup suggestions, local-date and local-hour

@@ -16,6 +16,7 @@ from unittest import skipUnless
 import cv2
 import numpy as np
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
@@ -42,7 +43,7 @@ from .health import (
     camera_health,
     overall_status,
 )
-from .models import Camera, CountEvent
+from .models import Camera, Crossing, Event, active_event_for
 from .reports import (
     MAX_DAYS,
     busiest_hours,
@@ -284,13 +285,13 @@ class CameraModelTests(TestCase):
     def test_totals_derive_from_events(self):
         camera = Camera.objects.create(name="Door", source="0")
         for direction in (DIRECTION_IN, DIRECTION_IN, DIRECTION_IN, DIRECTION_OUT):
-            CountEvent.objects.create(camera=camera, track_id=1, direction=direction)
+            Crossing.objects.create(camera=camera, track_id=1, direction=direction)
         self.assertEqual(camera.totals(), {"in": 3, "out": 1})
         self.assertEqual(camera.occupancy()["inside"], 2)
 
     def test_inside_clamps_at_zero(self):
         camera = Camera.objects.create(name="Door", source="0")
-        CountEvent.objects.create(camera=camera, track_id=1, direction=DIRECTION_OUT)
+        Crossing.objects.create(camera=camera, track_id=1, direction=DIRECTION_OUT)
         occupancy = camera.occupancy()
         self.assertEqual(occupancy["inside"], 0)
         # The raw net stays visible so a reversed camera is diagnosable.
@@ -300,9 +301,9 @@ class CameraModelTests(TestCase):
 class ApiTests(TestCase):
     def setUp(self):
         self.camera = Camera.objects.create(name="Front door", source="0")
-        CountEvent.objects.create(camera=self.camera, track_id=1, direction=DIRECTION_IN)
-        CountEvent.objects.create(camera=self.camera, track_id=2, direction=DIRECTION_IN)
-        CountEvent.objects.create(camera=self.camera, track_id=3, direction=DIRECTION_OUT)
+        Crossing.objects.create(camera=self.camera, track_id=1, direction=DIRECTION_IN)
+        Crossing.objects.create(camera=self.camera, track_id=2, direction=DIRECTION_IN)
+        Crossing.objects.create(camera=self.camera, track_id=3, direction=DIRECTION_OUT)
 
     def test_dashboard_renders(self):
         response = self.client.get("/")
@@ -324,8 +325,8 @@ class ApiTests(TestCase):
         self.assertEqual(detail.status_code, 200)
         self.assertFalse(detail.json()["running"])
 
-    def test_events_endpoint_respects_limit(self):
-        response = self.client.get(f"/api/v1/cameras/{self.camera.pk}/events/?limit=2")
+    def test_crossings_endpoint_respects_limit(self):
+        response = self.client.get(f"/api/v1/cameras/{self.camera.pk}/crossings/?limit=2")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["count"], 2)
 
@@ -335,7 +336,7 @@ class ApiTests(TestCase):
         response = self.client.post(f"/api/v1/cameras/{self.camera.pk}/reset/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["deleted"], 3)
-        self.assertEqual(CountEvent.objects.count(), 0)
+        self.assertEqual(Crossing.objects.count(), 0)
 
     def test_stream_404_when_not_running(self):
         response = self.client.get(f"/api/v1/cameras/{self.camera.pk}/stream/")
@@ -401,7 +402,7 @@ class WorkerEndToEndTests(TransactionTestCase):
             self.assertEqual(worker.counter.total_in, 1)
             self.assertEqual(worker.counter.total_out, 0)
 
-            events = list(CountEvent.objects.filter(camera=camera))
+            events = list(Crossing.objects.filter(camera=camera))
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].direction, DIRECTION_IN)
             self.assertEqual(camera.totals(), {"in": 1, "out": 0})
@@ -416,7 +417,7 @@ class WorkerEndToEndTests(TransactionTestCase):
         self.assertFalse(worker.is_alive())
         self.assertIsNotNone(worker.error)
         self.assertIn("Could not open video source", worker.error)
-        self.assertEqual(CountEvent.objects.count(), 0)
+        self.assertEqual(Crossing.objects.count(), 0)
 
 
 class OnnxDecodeTests(TestCase):
@@ -677,7 +678,7 @@ class DailyCountsTests(TestCase):
         self.other = Camera.objects.create(name="Side", source="1")
 
     def _event(self, when, direction=DIRECTION_IN, camera=None):
-        return CountEvent.objects.create(
+        return Crossing.objects.create(
             camera=camera or self.camera, track_id=1,
             direction=direction, occurred_at=when,
         )
@@ -772,7 +773,7 @@ class DailyApiTests(TestCase):
     def setUp(self):
         self.camera = Camera.objects.create(name="Door", source="0")
         for _ in range(4):
-            CountEvent.objects.create(
+            Crossing.objects.create(
                 camera=self.camera, track_id=1, direction=DIRECTION_IN,
                 occurred_at=datetime(2026, 3, 3, 9, 0, tzinfo=dt_timezone.utc),
             )
@@ -870,7 +871,7 @@ class OccupancyDoesNotDriftTests(TestCase):
         self.camera = Camera.objects.create(name="Door", source="0")
 
     def _event(self, when, direction):
-        CountEvent.objects.create(camera=self.camera, track_id=1,
+        Crossing.objects.create(camera=self.camera, track_id=1,
                                   direction=direction, occurred_at=when)
 
     @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
@@ -929,7 +930,7 @@ class ApiAuthTests(TestCase):
 
     def setUp(self):
         self.camera = Camera.objects.create(name="Door", source="0")
-        CountEvent.objects.create(camera=self.camera, track_id=1,
+        Crossing.objects.create(camera=self.camera, track_id=1,
                                   direction=DIRECTION_IN)
         self.staff = User.objects.create_user("op", password="x", is_staff=True)
         self.normal = User.objects.create_user("visitor", password="x")
@@ -954,7 +955,7 @@ class ApiAuthTests(TestCase):
     def test_anonymous_cannot_reset(self):
         response = self.client.post(f"/api/v1/cameras/{self.camera.pk}/reset/")
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(CountEvent.objects.count(), 1, "history must survive")
+        self.assertEqual(Crossing.objects.count(), 1, "history must survive")
 
     def test_anonymous_cannot_stop_a_camera(self):
         self.assertEqual(
@@ -964,13 +965,13 @@ class ApiAuthTests(TestCase):
         self.client.force_login(self.normal)
         response = self.client.post(f"/api/v1/cameras/{self.camera.pk}/reset/")
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(CountEvent.objects.count(), 1)
+        self.assertEqual(Crossing.objects.count(), 1)
 
     def test_staff_may_write(self):
         self.client.force_login(self.staff)
         response = self.client.post(f"/api/v1/cameras/{self.camera.pk}/reset/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(CountEvent.objects.count(), 0)
+        self.assertEqual(Crossing.objects.count(), 0)
 
     def test_valid_token_may_write(self):
         response = self.client.post(
@@ -978,7 +979,7 @@ class ApiAuthTests(TestCase):
             HTTP_AUTHORIZATION="Token test-token-value",
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(CountEvent.objects.count(), 0)
+        self.assertEqual(Crossing.objects.count(), 0)
 
     def test_wrong_token_is_rejected(self):
         response = self.client.post(
@@ -986,7 +987,7 @@ class ApiAuthTests(TestCase):
             HTTP_AUTHORIZATION="Token not-the-token",
         )
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(CountEvent.objects.count(), 1)
+        self.assertEqual(Crossing.objects.count(), 1)
 
     def test_malformed_authorization_header_is_rejected(self):
         response = self.client.post(
@@ -1003,7 +1004,7 @@ class ApiAuthTests(TestCase):
             HTTP_AUTHORIZATION="Token anything-at-all",
         )
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(CountEvent.objects.count(), 1)
+        self.assertEqual(Crossing.objects.count(), 1)
 
     # -- dashboard ------------------------------------------------------
 
@@ -1031,7 +1032,7 @@ class HourlyProfileTests(TestCase):
         self.other = Camera.objects.create(name="Side", source="1")
 
     def _event(self, when, direction=DIRECTION_IN, camera=None):
-        CountEvent.objects.create(camera=camera or self.camera, track_id=1,
+        Crossing.objects.create(camera=camera or self.camera, track_id=1,
                                   direction=direction, occurred_at=when)
 
     def _profile(self, **kwargs):
@@ -1128,7 +1129,7 @@ class WeekdayHourMatrixTests(TestCase):
         self.camera = Camera.objects.create(name="Door", source="0")
 
     def _event(self, when):
-        CountEvent.objects.create(camera=self.camera, track_id=1,
+        Crossing.objects.create(camera=self.camera, track_id=1,
                                   direction=DIRECTION_IN, occurred_at=when)
 
     def test_shape_is_seven_days_by_twenty_four_hours(self):
@@ -1168,7 +1169,7 @@ class HourlyApiTests(TestCase):
     def setUp(self):
         self.camera = Camera.objects.create(name="Door", source="0")
         for _ in range(6):
-            CountEvent.objects.create(
+            Crossing.objects.create(
                 camera=self.camera, track_id=1, direction=DIRECTION_IN,
                 occurred_at=datetime(2026, 3, 3, 6, 0, tzinfo=dt_timezone.utc),
             )
@@ -1405,7 +1406,7 @@ class HealthApiTests(TestCase):
         self.assertEqual(body["status"], STATUS_DEGRADED)
 
     def test_last_event_time_comes_from_the_database(self):
-        CountEvent.objects.create(camera=self.good, track_id=1,
+        Crossing.objects.create(camera=self.good, track_id=1,
                                   direction=DIRECTION_IN)
         workers = {self.good.pk: FakeWorker(), self.bad.pk: FakeWorker()}
         with self._patch_registry(workers):
@@ -1725,3 +1726,295 @@ class BuildTrackerTests(TestCase):
         self.assertIsNotNone(build_tracker("sort", detector=Prob()).high_confidence)
         self.assertIsNone(build_tracker("sort", detector=Svm()).high_confidence)
         self.assertIsNone(build_tracker("sort", detector=None).high_confidence)
+
+
+def make_event(name="Open day", offset_hours=-1, duration_hours=4, **kwargs):
+    start = timezone.now() + timedelta(hours=offset_hours)
+    return Event.objects.create(
+        name=name,
+        starts_at=start,
+        ends_at=start + timedelta(hours=duration_hours),
+        **kwargs,
+    )
+
+
+class EventModelTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.other = Camera.objects.create(name="Side", source="1")
+
+    def test_running_while_between_its_times(self):
+        event = make_event(offset_hours=-1, duration_hours=4)
+        self.assertTrue(event.is_running())
+        self.assertFalse(event.has_finished())
+
+    def test_not_running_before_it_starts(self):
+        event = make_event(offset_hours=2)
+        self.assertFalse(event.is_running())
+
+    def test_not_running_after_it_ends(self):
+        event = make_event(offset_hours=-10, duration_hours=2)
+        self.assertFalse(event.is_running())
+        self.assertTrue(event.has_finished())
+
+    def test_deactivating_stops_it_running(self):
+        event = make_event(is_active=False)
+        self.assertFalse(event.is_running())
+
+    def test_end_must_follow_start(self):
+        event = Event(
+            name="Backwards",
+            starts_at=timezone.now(),
+            ends_at=timezone.now() - timedelta(hours=1),
+        )
+        with self.assertRaises(ValidationError):
+            event.clean()
+
+    def test_no_cameras_means_every_camera(self):
+        event = make_event()
+        self.assertTrue(event.covers_camera(self.camera))
+        self.assertTrue(event.covers_camera(self.other))
+        self.assertTrue(event.totals() is not None)
+
+    def test_listing_cameras_restricts_it(self):
+        event = make_event()
+        event.cameras.add(self.camera)
+        self.assertTrue(event.covers_camera(self.camera))
+        self.assertFalse(event.covers_camera(self.other))
+
+    def test_totals_count_only_its_own_crossings(self):
+        event = make_event()
+        other = make_event("Other")
+        for _ in range(4):
+            Crossing.objects.create(camera=self.camera, track_id=1,
+                                    direction=DIRECTION_IN, event=event)
+        Crossing.objects.create(camera=self.camera, track_id=2,
+                                direction=DIRECTION_OUT, event=event)
+        Crossing.objects.create(camera=self.camera, track_id=3,
+                                direction=DIRECTION_IN, event=other)
+        Crossing.objects.create(camera=self.camera, track_id=4,
+                                direction=DIRECTION_IN)      # unattributed
+
+        self.assertEqual(event.totals(), {"in": 4, "out": 1, "inside": 3, "net": 3})
+
+    def test_capacity_state_levels(self):
+        event = make_event(capacity=10)
+        for _ in range(5):
+            Crossing.objects.create(camera=self.camera, track_id=1,
+                                    direction=DIRECTION_IN, event=event)
+        self.assertEqual(event.capacity_state()["level"], "ok")
+        self.assertEqual(event.capacity_state()["remaining"], 5)
+
+        for _ in range(4):
+            Crossing.objects.create(camera=self.camera, track_id=1,
+                                    direction=DIRECTION_IN, event=event)
+        self.assertEqual(event.capacity_state()["level"], "near")
+
+        for _ in range(3):
+            Crossing.objects.create(camera=self.camera, track_id=1,
+                                    direction=DIRECTION_IN, event=event)
+        state = event.capacity_state()
+        self.assertEqual(state["level"], "over")
+        self.assertEqual(state["remaining"], 0)
+
+    def test_no_capacity_means_no_state(self):
+        self.assertIsNone(make_event().capacity_state())
+
+    def test_deleting_an_event_keeps_its_crossings(self):
+        event = make_event()
+        Crossing.objects.create(camera=self.camera, track_id=1,
+                                direction=DIRECTION_IN, event=event)
+        event.delete()
+        self.assertEqual(Crossing.objects.count(), 1,
+                         "history must survive removing the event")
+        self.assertIsNone(Crossing.objects.first().event_id)
+
+
+class ActiveEventForTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.other = Camera.objects.create(name="Side", source="1")
+
+    def test_none_when_nothing_scheduled(self):
+        self.assertIsNone(active_event_for(self.camera))
+
+    def test_finds_the_running_event(self):
+        event = make_event()
+        self.assertEqual(active_event_for(self.camera), event)
+
+    def test_ignores_events_for_other_cameras(self):
+        event = make_event()
+        event.cameras.add(self.other)
+        self.assertIsNone(active_event_for(self.camera))
+
+    def test_ignores_inactive_and_finished_events(self):
+        make_event("Off", is_active=False)
+        make_event("Past", offset_hours=-10, duration_hours=2)
+        make_event("Future", offset_hours=5)
+        self.assertIsNone(active_event_for(self.camera))
+
+    def test_most_recently_started_wins_when_nested(self):
+        make_event("All-day programme", offset_hours=-5, duration_hours=10)
+        session = make_event("Keynote", offset_hours=-1, duration_hours=2)
+        self.assertEqual(active_event_for(self.camera), session,
+                         "the inner session is the more specific answer")
+
+    def test_camera_specific_event_is_found_among_others(self):
+        make_event("Elsewhere", offset_hours=-2).cameras.add(self.other)
+        mine = make_event("Mine", offset_hours=-1)
+        self.assertEqual(active_event_for(self.camera), mine)
+
+
+class EventOccupancyTests(TestCase):
+    """Occupancy during an event counts from when the event began."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
+    def test_people_inside_before_the_event_are_not_counted(self):
+        now = timezone.now()
+        event = Event.objects.create(
+            name="Evening show",
+            starts_at=now - timedelta(hours=1),
+            ends_at=now + timedelta(hours=2),
+        )
+        # Earlier the same day, before the event started.
+        for _ in range(12):
+            Crossing.objects.create(camera=self.camera, track_id=1,
+                                    direction=DIRECTION_IN,
+                                    occurred_at=now - timedelta(hours=3))
+        # During the event.
+        for _ in range(3):
+            Crossing.objects.create(camera=self.camera, track_id=2,
+                                    direction=DIRECTION_IN,
+                                    occurred_at=now - timedelta(minutes=10),
+                                    event=event)
+
+        occupancy = self.camera.occupancy()
+        self.assertEqual(occupancy["inside"], 3)
+        self.assertEqual(occupancy["event_name"], "Evening show")
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
+    def test_falls_back_to_the_daily_reset_with_no_event(self):
+        Crossing.objects.create(camera=self.camera, track_id=1,
+                                direction=DIRECTION_IN)
+        occupancy = self.camera.occupancy()
+        self.assertEqual(occupancy["inside"], 1)
+        self.assertIsNone(occupancy["event_id"])
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="00:00")
+    def test_multi_day_event_still_resets_daily(self):
+        now = timezone.now()
+        event = Event.objects.create(
+            name="Three-day expo",
+            starts_at=now - timedelta(days=2),
+            ends_at=now + timedelta(days=1),
+        )
+        # Yesterday's visitors, who went home.
+        for _ in range(40):
+            Crossing.objects.create(camera=self.camera, track_id=1,
+                                    direction=DIRECTION_IN, event=event,
+                                    occurred_at=now - timedelta(days=1))
+        Crossing.objects.create(camera=self.camera, track_id=2,
+                                direction=DIRECTION_IN, event=event)
+
+        self.assertEqual(self.camera.occupancy()["inside"], 1,
+                         "the later of event start and daily reset wins")
+        self.assertEqual(event.totals()["in"], 41,
+                         "event attendance still spans the whole run")
+
+
+class EventApiTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.event = make_event("Open day", capacity=100)
+        for _ in range(7):
+            Crossing.objects.create(camera=self.camera, track_id=1,
+                                    direction=DIRECTION_IN, event=self.event)
+
+    def test_list(self):
+        body = self.client.get("/api/v1/events/").json()
+        self.assertEqual(body["count"], 1)
+        row = body["events"][0]
+        self.assertEqual(row["name"], "Open day")
+        self.assertTrue(row["running"])
+        self.assertTrue(row["covers_all_cameras"])
+        self.assertEqual(row["attendance"]["in"], 7)
+        self.assertEqual(row["capacity"]["capacity"], 100)
+
+    def test_running_filter(self):
+        make_event("Later", offset_hours=10)
+        self.assertEqual(self.client.get("/api/v1/events/").json()["count"], 2)
+        self.assertEqual(
+            self.client.get("/api/v1/events/?running=1").json()["count"], 1)
+
+    def test_camera_filter(self):
+        other = Camera.objects.create(name="Side", source="1")
+        self.event.cameras.add(self.camera)
+        self.assertEqual(
+            self.client.get(f"/api/v1/events/?camera={self.camera.pk}").json()["count"], 1)
+        self.assertEqual(
+            self.client.get(f"/api/v1/events/?camera={other.pk}").json()["count"], 0)
+
+    def test_unknown_camera_is_400(self):
+        self.assertEqual(self.client.get("/api/v1/events/?camera=999").status_code, 400)
+
+    def test_detail_includes_an_hourly_profile(self):
+        body = self.client.get(f"/api/v1/events/{self.event.pk}/").json()
+        self.assertEqual(body["name"], "Open day")
+        self.assertEqual(len(body["hours"]), 24)
+        self.assertEqual(body["busiest"][0]["in"], 7)
+
+    def test_detail_404(self):
+        self.assertEqual(self.client.get("/api/v1/events/999/").status_code, 404)
+
+    def test_current_event(self):
+        body = self.client.get("/api/v1/events/current/").json()
+        self.assertTrue(body["running"])
+        self.assertEqual(body["events"][0]["name"], "Open day")
+        self.assertGreater(body["events"][0]["seconds_remaining"], 0)
+
+    def test_current_is_empty_when_nothing_runs(self):
+        self.event.delete()
+        body = self.client.get("/api/v1/events/current/").json()
+        self.assertFalse(body["running"])
+        self.assertEqual(body["events"], [])
+
+    def test_reports_filter_by_event(self):
+        other = make_event("Other")
+        Crossing.objects.create(camera=self.camera, track_id=9,
+                                direction=DIRECTION_IN, event=other)
+
+        everything = self.client.get("/api/v1/daily/?days=1").json()
+        mine = self.client.get(f"/api/v1/daily/?days=1&event={self.event.pk}").json()
+        self.assertEqual(everything["summary"]["in"], 8)
+        self.assertEqual(mine["summary"]["in"], 7)
+        self.assertEqual(mine["event_name"], "Open day")
+
+    def test_hourly_filters_by_event(self):
+        body = self.client.get(
+            f"/api/v1/hourly/?days=1&event={self.event.pk}").json()
+        self.assertEqual(sum(h["in"] for h in body["hours"]), 7)
+        self.assertEqual(body["event_id"], self.event.pk)
+
+    def test_unknown_event_in_report_is_400(self):
+        self.assertEqual(self.client.get("/api/v1/daily/?event=999").status_code, 400)
+
+    def test_dashboard_has_the_event_host(self):
+        self.assertContains(self.client.get("/"), 'id="event-now"')
+
+
+class OccupancyScopeLabelTests(TestCase):
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    @override_settings(COUNTER_OCCUPANCY_RESET_AT="06:00")
+    def test_label_names_the_daily_reset_with_no_event(self):
+        body = self.client.get("/api/v1/stats/").json()
+        self.assertEqual(body["occupancy"]["scope"], "since 06:00")
+
+    def test_label_names_the_running_event(self):
+        make_event("Science Fair")
+        body = self.client.get("/api/v1/stats/").json()
+        self.assertEqual(body["occupancy"]["scope"], "since Science Fair began")

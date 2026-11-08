@@ -11,7 +11,7 @@ from django.db.models import Count
 from django.db.models.functions import ExtractHour, TruncDate
 from django.utils import timezone
 
-from .models import CountEvent
+from .models import Crossing
 from .vision import DIRECTION_IN, DIRECTION_OUT
 
 # Guard rails for the API: one day minimum, about two years maximum.
@@ -60,7 +60,7 @@ def _bounds(start: date_cls, end: date_cls):
     return begin, finish
 
 
-def daily_counts(start=None, end=None, days=DEFAULT_DAYS, camera=None):
+def daily_counts(start=None, end=None, days=DEFAULT_DAYS, camera=None, event=None):
     """One row per local date between start and end, zero-filled.
 
     Gaps are filled so a quiet day reads as 0 rather than vanishing -- a
@@ -69,12 +69,14 @@ def daily_counts(start=None, end=None, days=DEFAULT_DAYS, camera=None):
     start, end = resolve_range(start, end, days)
     begin, finish = _bounds(start, end)
 
-    events = CountEvent.objects.filter(occurred_at__gte=begin, occurred_at__lt=finish)
+    crossings = Crossing.objects.filter(occurred_at__gte=begin, occurred_at__lt=finish)
     if camera is not None:
-        events = events.filter(camera=camera)
+        crossings = crossings.filter(camera=camera)
+    if event is not None:
+        crossings = crossings.filter(event=event)
 
     rows = (
-        events.annotate(day=TruncDate("occurred_at"))
+        crossings.annotate(day=TruncDate("occurred_at"))
         .values("day", "direction")
         .order_by()
         .annotate(total=Count("id"))
@@ -147,16 +149,18 @@ WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
                  "Friday", "Saturday", "Sunday"]
 
 
-def _hour_rows(start, end, camera=None):
+def _hour_rows(start, end, camera=None, event=None):
     """Raw (local date, local hour, direction) -> count."""
     begin, finish = _bounds(start, end)
 
-    events = CountEvent.objects.filter(occurred_at__gte=begin, occurred_at__lt=finish)
+    crossings = Crossing.objects.filter(occurred_at__gte=begin, occurred_at__lt=finish)
     if camera is not None:
-        events = events.filter(camera=camera)
+        crossings = crossings.filter(camera=camera)
+    if event is not None:
+        crossings = crossings.filter(event=event)
 
     rows = (
-        events.annotate(
+        crossings.annotate(
             day=TruncDate("occurred_at"),
             hour=ExtractHour("occurred_at"),
         )
@@ -176,7 +180,7 @@ def _hour_rows(start, end, camera=None):
     return buckets
 
 
-def hourly_profile(start=None, end=None, days=DEFAULT_DAYS, camera=None):
+def hourly_profile(start=None, end=None, days=DEFAULT_DAYS, camera=None, event=None):
     """Crossings by hour of day, averaged over the window.
 
     ``average_in`` divides by every day in the range, including quiet ones.
@@ -185,7 +189,7 @@ def hourly_profile(start=None, end=None, days=DEFAULT_DAYS, camera=None):
     question is "how many staff on a Tuesday morning".
     """
     start, end = resolve_range(start, end, days)
-    buckets = _hour_rows(start, end, camera)
+    buckets = _hour_rows(start, end, camera, event)
     span = (end - start).days + 1
 
     totals = {hour: {DIRECTION_IN: 0, DIRECTION_OUT: 0} for hour in HOURS}
@@ -222,14 +226,14 @@ def opening_span(profile):
     return {"first_hour": min(active), "last_hour": max(active)}
 
 
-def weekday_hour_matrix(start=None, end=None, days=DEFAULT_DAYS, camera=None):
+def weekday_hour_matrix(start=None, end=None, days=DEFAULT_DAYS, camera=None, event=None):
     """Average arrivals per weekday and hour.
 
     Each cell divides by how many times that weekday actually occurred in
     the range, so a Tuesday average is not diluted by Fridays.
     """
     start, end = resolve_range(start, end, days)
-    buckets = _hour_rows(start, end, camera)
+    buckets = _hour_rows(start, end, camera, event)
 
     # How many times each weekday falls inside the range.
     occurrences = {index: 0 for index in range(7)}
