@@ -22,43 +22,66 @@ import sys
 
 
 def attach_console():
-    """Borrow the console that launched us, on Windows.
+    """Get a console for a windowed build, so prompts have somewhere to go.
 
-    A windowed build has no stdout, so a management command would run
-    with its prompts and its output going nowhere -- createsuperuser in
-    particular would appear to hang. AttachConsole(-1) takes the console
-    of the process that started us, which is the cmd window somebody
-    typed into. There is nothing to attach to when double-clicked, and
-    that is fine: nobody is reading it.
+    A windowed build has sys.stdin set to None, and ``input()`` raises
+    "lost sys.stdin" the moment anything asks a question --
+    createsuperuser being the one that matters.
+
+    Attaching to the parent's console is the tidy answer and it does not
+    work here: PyInstaller's onefile bootloader starts the real program as
+    a *child*, so ATTACH_PARENT_PROCESS reaches the bootloader, which is
+    itself windowed and has no console to borrow. So fall back to opening
+    one. It is a second window rather than the shell you typed into, which
+    is not elegant, but a prompt you can answer beats a traceback.
+
+    Returns the kind of console obtained, or "" for none.
     """
     if not sys.platform.startswith("win"):
-        return False
-    try:
-        import ctypes
+        return "inherited"
 
-        ATTACH_PARENT_PROCESS = -1
-        if not ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
-            return False
-        for name, stream in (("stdin", "r"), ("stdout", "w"), ("stderr", "w")):
-            try:
-                setattr(sys, name, open("CON" + ("IN$" if stream == "r" else "OUT$"),
-                                        stream))
-            except OSError:
-                pass
-        return True
-    except Exception:
-        return False
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    ATTACH_PARENT_PROCESS = -1
+
+    kind = ""
+    if kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
+        kind = "attached"
+    elif kernel32.AllocConsole():
+        kind = "allocated"
+    else:
+        return ""
+
+    # The streams are None until something is opened on the new console.
+    for name, path, mode in (("stdin", "CONIN$", "r"),
+                             ("stdout", "CONOUT$", "w"),
+                             ("stderr", "CONOUT$", "w")):
+        try:
+            setattr(sys, name, open(path, mode, buffering=1))
+        except OSError:
+            return ""
+    return kind
 
 
 def main():
     if len(sys.argv) > 1:
-        attach_console()
+        console = attach_console()
         from counter.desktop import production_defaults
 
         production_defaults()
         from django.core.management import execute_from_command_line
 
-        execute_from_command_line(sys.argv)
+        try:
+            execute_from_command_line(sys.argv)
+        finally:
+            if console == "allocated":
+                # The console goes away with the process, taking the
+                # result with it. Hold it open long enough to read.
+                try:
+                    input("\nDone. Press Enter to close this window.")
+                except Exception:
+                    pass
         return
 
     from counter.desktop import main as run_window

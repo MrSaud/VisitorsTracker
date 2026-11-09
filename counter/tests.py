@@ -4930,3 +4930,69 @@ class CrashLoggingTests(TestCase):
         # startup line at least says which directory to look in.
         text = (pathlib.Path(settings.BASE_DIR) / "counter" / "desktop.py").read_text()
         self.assertIn("VisitorsTracker starting, data directory", text)
+
+
+class FrozenManagementCommandTests(TestCase):
+    """A frozen install has to be able to make its first administrator.
+
+    The exe opened the window and nothing else, so createsuperuser was
+    unreachable: the dashboard's admin link led to a login nobody could
+    pass and the staff-only controls were closed for good. The Windows
+    build came up with zero users and no way to add one.
+    """
+
+    def entry_source(self):
+        return (pathlib.Path(settings.BASE_DIR) / "app_main.py").read_text()
+
+    def test_arguments_run_a_command_instead_of_opening_a_window(self):
+        source = self.entry_source()
+        self.assertIn("execute_from_command_line", source)
+        self.assertIn("len(sys.argv) > 1", source)
+
+    def test_no_arguments_still_opens_the_window(self):
+        self.assertIn("run_window()", self.entry_source())
+
+    def test_it_gets_a_console_on_windows_one_way_or_another(self):
+        # A windowed build has sys.stdin = None and input() raises
+        # "lost sys.stdin". Attaching to the parent is not enough on its
+        # own: PyInstaller's onefile bootloader runs the program as a
+        # child, so ATTACH_PARENT_PROCESS reaches the bootloader, which is
+        # windowed and has no console to lend.
+        source = self.entry_source()
+        self.assertIn("AttachConsole", source)
+        self.assertIn("AllocConsole", source,
+                      "attaching alone fails in a onefile build")
+        self.assertLess(source.index("AttachConsole"), source.index("AllocConsole"),
+                        "borrow the caller's console before opening a new one")
+
+    def test_an_allocated_console_is_held_open_to_be_read(self):
+        # It closes with the process, taking the result with it.
+        source = self.entry_source()
+        self.assertIn("Press Enter to close", source)
+        self.assertIn('console == "allocated"', source)
+
+    def test_the_command_still_runs_if_no_console_can_be_had(self):
+        # --noinput commands work without one; only prompts need it.
+        source = self.entry_source()
+        attach = source.index("console = attach_console()")
+        execute = source.index("execute_from_command_line(sys.argv)")
+        self.assertLess(attach, execute)
+        self.assertNotIn("if not console:\n            return", source)
+
+    def test_a_command_actually_runs_through_the_entry_script(self):
+        import subprocess
+
+        result = subprocess.run(
+            [sys.executable, str(pathlib.Path(settings.BASE_DIR) / "app_main.py"),
+             "check_setup"],
+            capture_output=True, text=True, timeout=300,
+            cwd=str(settings.BASE_DIR))
+        self.assertEqual(result.returncode, 0, result.stderr[-500:])
+        self.assertIn("Dependencies", result.stdout)
+
+    def test_the_settings_are_configured_before_the_command_runs(self):
+        # Otherwise the command fails with ImproperlyConfigured instead of
+        # doing its job.
+        source = self.entry_source()
+        self.assertLess(source.index("production_defaults()"),
+                        source.index("execute_from_command_line"))
