@@ -25,6 +25,7 @@ import time as time_module
 from io import StringIO
 from unittest.mock import patch
 from datetime import date, datetime, time, timedelta, timezone as dt_timezone
+from datetime import date as date_cls
 from unittest import skipUnless
 
 import cv2
@@ -5295,3 +5296,86 @@ class FirstRunBannerTests(TestCase):
         with override_settings(DATA_DIR=self.data_dir):
             page = self.client.get("/").content.decode()
         self.assertNotIn("First run", page)
+
+
+class DashboardDateFilterTests(TestCase):
+    """From/to pickers on the visitors-per-date panel."""
+
+    def page(self):
+        return self.client.get("/").content.decode()
+
+    def test_the_controls_are_on_the_page(self):
+        page = self.page()
+        for marker in ('id="d-from"', 'id="d-to"', 'id="d-clear"',
+                       'type="date"'):
+            self.assertIn(marker, page)
+
+    def test_the_inputs_cannot_be_set_past_today(self):
+        # Nothing is ever recorded in the future.
+        self.assertIn("dFrom.max = todayIso", self.page())
+
+    def test_one_date_alone_does_not_take_over(self):
+        # "From the 3rd" could mean to today or to the end of the data;
+        # guessing either way draws a chart nobody asked for.
+        self.assertIn("from && to ? { from, to } : null", self.page())
+
+    def test_the_effective_window_is_reflected_back(self):
+        # The server swaps a reversed range and caps a long one, so the
+        # inputs would otherwise show something that was never queried.
+        page = self.page()
+        self.assertIn("if (data.start) dFrom.value = data.start", page)
+        self.assertIn("if (data.end) dTo.value = data.end", page)
+
+
+class DailyRangeApiTests(TestCase):
+    """What the pickers send, and what comes back."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.event = Event.objects.create(
+            name="Run", starts_at=timezone.now() - timedelta(days=10),
+            ends_at=timezone.now() + timedelta(days=1))
+
+    def get(self, query):
+        return self.client.get(f"/api/v1/daily/?{query}").json()
+
+    def test_an_explicit_window_is_honoured(self):
+        today = timezone.localdate()
+        start = today - timedelta(days=3)
+        data = self.get(f"start={start.isoformat()}&end={today.isoformat()}")
+        self.assertEqual(data["start"], start.isoformat())
+        self.assertEqual(data["end"], today.isoformat())
+        self.assertEqual(len(data["days"]), 4)
+
+    def test_a_reversed_window_is_swapped_not_refused(self):
+        today = timezone.localdate()
+        start = today - timedelta(days=3)
+        data = self.get(f"start={today.isoformat()}&end={start.isoformat()}")
+        self.assertEqual(data["start"], start.isoformat())
+        self.assertEqual(data["end"], today.isoformat())
+
+    def test_a_single_day_is_allowed(self):
+        today = timezone.localdate().isoformat()
+        data = self.get(f"start={today}&end={today}")
+        self.assertEqual(len(data["days"]), 1)
+
+    def test_an_absurd_window_is_capped_and_says_so(self):
+        # The response carries the window actually used, which is what the
+        # inputs are set from.
+        from counter.reports import MAX_DAYS
+
+        data = self.get("start=2000-01-01&end=2026-12-31")
+        span = (date_cls.fromisoformat(data["end"])
+                - date_cls.fromisoformat(data["start"])).days + 1
+        self.assertLessEqual(span, MAX_DAYS)
+        self.assertEqual(span, MAX_DAYS, "a huge window should hit the cap")
+
+    def test_the_csv_honours_the_same_window(self):
+        today = timezone.localdate()
+        start = today - timedelta(days=2)
+        response = self.client.get(
+            f"/api/v1/daily/?start={start.isoformat()}"
+            f"&end={today.isoformat()}&format=csv")
+        rows = response.content.decode().splitlines()
+        self.assertEqual(len(rows) - 1, 3)
+        self.assertIn(start.isoformat(), response["Content-Disposition"])
