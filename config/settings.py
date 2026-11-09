@@ -5,7 +5,7 @@ from pathlib import Path
 
 # The counting defaults live beside the code that measured them, so a
 # settings file cannot quietly disagree with them.
-from counter.vision import DEFAULT_CONFIRM_FRAMES
+from counter.vision import DEFAULT_COMMIT_FRACTION
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -127,12 +127,13 @@ COUNTER_MIN_CONFIDENCE = float(_min_confidence) if _min_confidence else None
 # Detect on every Nth frame; tracking fills the gaps (1 = every frame).
 COUNTER_DETECT_EVERY = int(os.environ.get("COUNTER_DETECT_EVERY", "3"))
 
-# Frames a track must hold the far side of the line before the crossing is
-# counted. Guards against somebody standing in the doorway shifting their
-# weight, which flips sides on every sway. Higher is steadier but will miss
-# somebody who sprints through; see "Loitering" in the README.
-COUNTER_LINE_CONFIRM_FRAMES = int(
-    os.environ.get("COUNTER_LINE_CONFIRM_FRAMES", str(DEFAULT_CONFIRM_FRAMES)))
+# How far past the line a track must get before the crossing is counted,
+# as a fraction of its own width or height. This is the only guard against
+# somebody standing in the doorway shifting their weight, which flips sides
+# on every sway. Higher is steadier but will miss somebody who stops just
+# over the line; see "Loitering" in the README.
+COUNTER_LINE_COMMIT_FRACTION = float(
+    os.environ.get("COUNTER_LINE_COMMIT_FRACTION", str(DEFAULT_COMMIT_FRACTION)))
 
 # Frames a track may go unseen before it is dropped.
 COUNTER_MAX_DISAPPEARED = int(os.environ.get("COUNTER_MAX_DISAPPEARED", "25"))

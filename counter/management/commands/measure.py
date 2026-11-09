@@ -139,7 +139,7 @@ class Command(BaseCommand):
                 position=options["line"],
                 orientation=options["orientation"],
                 invert=options["invert"],
-                confirm_frames=settings.COUNTER_LINE_CONFIRM_FRAMES,
+                commit_fraction=settings.COUNTER_LINE_COMMIT_FRACTION,
             ),
             detect_every=options["detect_every"],
             max_disappeared=settings.COUNTER_MAX_DISAPPEARED,

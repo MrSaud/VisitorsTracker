@@ -6,6 +6,7 @@ a model file, or any particular machine speed.
 
 import csv
 import itertools
+import math
 import json
 import os
 import pathlib
@@ -95,7 +96,7 @@ from .vision import (
     HORIZONTAL,
     VERTICAL,
     CentroidTracker,
-    DEFAULT_CONFIRM_FRAMES,
+    DEFAULT_COMMIT_FRACTION,
     HogPersonDetector,
     LINE_POSITION_MAX,
     LINE_POSITION_MIN,
@@ -3514,10 +3515,14 @@ class LineHysteresisTests(TestCase):
     """One person hesitating in a doorway used to count as eleven.
 
     A track that hovers across the line flips sides on every sway, and each
-    flip was a crossing. Two guards now have to be satisfied -- held for a
-    few frames, or clearly past the line -- and either will do, because a
-    sprinter has no frames to spare and a slow walker near the frame edge
-    never gets far past it.
+    flip was a crossing. The guard is distance: a crossing counts once the
+    track is clear of the line by a fraction of its own size, which a sway
+    never manages at any speed.
+
+    There was a second guard, a frame count, and either one would commit the
+    crossing. It was measured and removed: a frame count cannot tell a slow
+    sway from a walk, because a sway lingers at the far end of its arc for
+    as long as a walk takes to leave.
     """
 
     LINE_Y = 120          # a 240px frame, line at 0.5
@@ -3552,8 +3557,7 @@ class LineHysteresisTests(TestCase):
     def test_the_old_rule_really_did_inflate(self):
         # Guards the guard: if this ever stops failing, the scenario has
         # drifted and the test above proves nothing.
-        total = sum(self._run(self._sway(40), confirm_frames=1,
-                              commit_fraction=0.0))
+        total = sum(self._run(self._sway(40), commit_fraction=0.0))
         self.assertGreater(total, 5,
                            "counting on the first flip should inflate here")
 
@@ -3572,23 +3576,42 @@ class LineHysteresisTests(TestCase):
         self.assertEqual(self._run(ys), (2, 1))
 
     def test_distance_alone_is_enough_for_a_fast_crossing(self):
-        # Two frames past the line, which is too few to "hold" it, but far
+        # One frame past the line, which is too few to "hold" it, but far
         # enough that it cannot be a sway.
-        counted = self._run([40, 60, 90, 220], confirm_frames=99)
+        counted = self._run([40, 60, 90, 220])
         self.assertEqual(counted[0], 1,
                          "a sprinter has no frames to spare")
 
-    def test_frames_alone_are_enough_for_a_slow_one(self):
-        # Never gets far past the line, but stays there deliberately.
-        counted = self._run([40, 60, 90, 135, 137, 136, 138],
-                            commit_fraction=0.0)
-        self.assertEqual(counted[0], 1,
-                         "a slow, deliberate crossing must still count")
+    def test_a_slow_sway_is_not_counted_however_long_it_lasts(self):
+        """The failure that the frame count let through.
 
-    def test_neither_guard_means_no_crossing(self):
-        counted = self._run([40, 60, 90, 135], confirm_frames=99,
-                            commit_fraction=10.0)
+        A person seated at a webcam, or standing in a doorway holding it
+        open, drifts across the line and back on a slow arc. Each far end of
+        that arc held the new side for many frames, so the frame-count guard
+        committed a crossing every time: 45 seconds of it produced 29.
+        """
+        line, amplitude, period = 120, 40, 60      # 3 seconds at 20fps
+        ys = [40, 60, 90]
+        for frame in range(900):                   # 45 seconds
+            ys.append(line + amplitude * math.sin(2 * math.pi * frame / period))
+        total = sum(self._run(ys))
+        self.assertEqual(total, 0,
+                         f"a slow sway counted {total} crossings")
+
+    def test_not_getting_clear_of_the_line_means_no_crossing(self):
+        counted = self._run([40, 60, 90, 135], commit_fraction=10.0)
         self.assertEqual(counted, (0, 0))
+
+    def test_stopping_just_over_the_line_is_not_counted(self):
+        """A known cost of dropping the frame count, recorded on purpose.
+
+        Somebody who steps over the line and stops short of their own body
+        width -- holding a door, turning to talk -- is not counted. The
+        frame count used to catch this, at the price of counting every sway.
+        """
+        counted = self._run([40, 60, 90, 135] + [137] * 200)
+        self.assertEqual(counted, (0, 0),
+                         "if this starts counting, the trade-off has changed")
 
 
 class CommitDistanceTests(TestCase):
@@ -3604,7 +3627,7 @@ class CommitDistanceTests(TestCase):
         self.assertFalse(line._is_clear_of_line(near, 40))
         self.assertTrue(line._is_clear_of_line(far, 40))
 
-    def test_a_missing_box_falls_back_to_the_frame_count(self):
+    def test_a_missing_box_is_never_clear_of_the_line(self):
         line = LineCounter(position=0.5)
         self.assertFalse(line._is_clear_of_line(
             Track(track_id=1, centroid=(0, 0), box=None), 500))
@@ -3738,18 +3761,17 @@ class MeasureCommandTests(TransactionTestCase):
 class CountingDefaultsAgreeTests(TestCase):
     """The settings file must not quietly disagree with the measured default.
 
-    It did: vision was tuned to 2 after measuring that 3 misses a normal
-    walk when the line is not centred, while settings still said 3 -- so
-    every real camera ran on the number that had been rejected, and only
-    the unit tests saw the tuned one.
+    It did once: vision was tuned after measuring, settings still held the
+    rejected number, so every real camera ran on the number that had been
+    rejected and only the unit tests saw the tuned one.
     """
 
-    def test_the_confirm_frames_default_is_the_one_that_was_measured(self):
-        self.assertEqual(settings.COUNTER_LINE_CONFIRM_FRAMES,
-                         DEFAULT_CONFIRM_FRAMES)
+    def test_the_commit_fraction_default_is_the_one_that_was_measured(self):
+        self.assertEqual(settings.COUNTER_LINE_COMMIT_FRACTION,
+                         DEFAULT_COMMIT_FRACTION)
 
     def test_a_worker_gets_it(self):
         camera = Camera.objects.create(name="Door", source="0")
         worker = CounterWorker(camera)
-        self.assertEqual(worker.counter.line.confirm_frames,
-                         DEFAULT_CONFIRM_FRAMES)
+        self.assertEqual(worker.counter.line.commit_fraction,
+                         DEFAULT_COMMIT_FRACTION)

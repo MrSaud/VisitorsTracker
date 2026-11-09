@@ -37,19 +37,19 @@ PERSON_CLASS_ID = 0
 #
 # Somebody shifting their weight in a doorway flips sides on every sway, and
 # each flip used to be a crossing: at 30px of movement one person became
-# eleven. Two independent guards, because neither covers every case:
+# eleven. The guard is distance -- how far past the line they actually get,
+# as a fraction of their own box, so it holds at any distance from the
+# camera. Measured, a sway of even +/-50px only carries the tracked centroid
+# 32px past the line, while a walk reaches 70-110px at any speed from a
+# stroll to a sprint. That gap is the signal.
 #
-# * distance -- how far past the line they actually get. Measured, a sway of
-#   even +/-50px only carries the tracked centroid 32px past, while a walk
-#   reaches 70-110px at any speed from a stroll to a sprint. That gap is the
-#   real signal, and unlike a frame count it does not care how fast they move.
-#   It is a fraction of the person's own box, so it holds at any distance
-#   from the camera.
-# * frames -- held long enough to be deliberate. This is what catches the
-#   slow crossing that never gets far past a line drawn near the frame edge.
-#
-# Either one commits the crossing. A sway satisfies neither.
-DEFAULT_CONFIRM_FRAMES = 2
+# There was a second guard here, a frame count: held the new side for N
+# frames. It was measured and removed. A frame count cannot tell a slow sway
+# from a walk, because a sway lingers at the far end of its arc for as long
+# as a walk takes to leave -- 45 seconds of a person seated at a webcam
+# produced 29 false crossings at N=2, and 29 again at N=10. Raising it does
+# not help; the distance guard alone counted the same real crossings on
+# footage and none of the sway.
 DEFAULT_COMMIT_FRACTION = 0.6
 
 # How close to the frame edge a suggested line may sit. Past these a
@@ -286,10 +286,6 @@ class Track:
     box: tuple
     disappeared: int = 0
     side: int = 0
-    # A side change has to be held before it is believed; these carry the
-    # change that is being considered. See LineCounter.update.
-    pending_side: int = 0
-    pending_frames: int = 0
     trail: deque = field(default_factory=lambda: deque(maxlen=24))
 
 
@@ -397,14 +393,12 @@ class LineCounter:
         orientation: str = HORIZONTAL,
         invert: bool = False,
         margin: int = 10,
-        confirm_frames: int = DEFAULT_CONFIRM_FRAMES,
         commit_fraction: float = DEFAULT_COMMIT_FRACTION,
     ):
         self.position = float(position)
         self.orientation = orientation if orientation in (HORIZONTAL, VERTICAL) else HORIZONTAL
         self.invert = bool(invert)
         self.margin = int(margin)
-        self.confirm_frames = max(1, int(confirm_frames))
         self.commit_fraction = max(0.0, float(commit_fraction))
         self.total_in = 0
         self.total_out = 0
@@ -432,10 +426,15 @@ class LineCounter:
 
     def _is_clear_of_line(self, track, delta) -> bool:
         """Far enough past the line that it cannot be a sway."""
-        if not self.commit_fraction:
-            return False
+        if self.commit_fraction <= 0:
+            # No distance asked for, so the dead band is the only guard and
+            # the first flip counts. This is the old, inflating behaviour,
+            # kept reachable so a test can demonstrate it.
+            return True
         extent = self._axis_extent(track.box)
         if extent <= 0:
+            # No box to scale against. Better to miss the crossing than to
+            # count an unknown amount of sway as visitors.
             return False
         return abs(delta) >= extent * self.commit_fraction
 
@@ -448,8 +447,7 @@ class LineCounter:
             value = self._axis_value(track.centroid)
             delta = value - line
 
-            # Inside the dead band we do not commit to a side, and a change
-            # that was building is left where it is rather than advanced.
+            # Inside the dead band we do not commit to a side at all.
             if abs(delta) < self.margin:
                 continue
 
@@ -460,30 +458,17 @@ class LineCounter:
                 # First sighting: note which side they started on. Nothing is
                 # counted, because we never saw them cross anything.
                 track.side = side
-                track.pending_side = 0
-                track.pending_frames = 0
                 continue
 
             if side == previous:
-                # Back where they were, so whatever change was building is
-                # abandoned. This is the sway that used to be counted.
-                track.pending_side = 0
-                track.pending_frames = 0
+                # Back where they were, and they were never clear of the
+                # line, so there is nothing to abandon. This is the sway.
                 continue
 
-            # They are on the other side. It is a crossing only once they
-            # stay there: somebody hesitating in a doorway passes over the
-            # line a dozen times and walks through it once.
-            if track.pending_side == side:
-                track.pending_frames += 1
-            else:
-                track.pending_side = side
-                track.pending_frames = 1
-
-            # Either guard is enough: long enough to be deliberate, or far
-            # enough past the line to be unmistakable.
-            held = track.pending_frames >= self.confirm_frames
-            if not held and not self._is_clear_of_line(track, delta):
+            # They are on the other side. It counts once they are clear of
+            # the line by a fraction of their own width: somebody hesitating
+            # in a doorway crosses it constantly and never gets clear of it.
+            if not self._is_clear_of_line(track, delta):
                 continue
 
             # -1 -> 1 means crossing in the direction of increasing axis.
@@ -497,8 +482,6 @@ class LineCounter:
                 self.total_out += 1
             events.append((track.track_id, direction))
             track.side = side
-            track.pending_side = 0
-            track.pending_frames = 0
 
         return events
 

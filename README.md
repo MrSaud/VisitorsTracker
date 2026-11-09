@@ -107,20 +107,36 @@ is **how far past the line they actually get**:
 | Walking through, 10–60px/frame | **70–110px** |
 
 That gap is the real signal, and unlike a frame count it does not care how
-fast somebody moves. So a side change is believed when **either**:
-
-- the track is more than `commit_fraction` of its own box past the line
-  (default 0.6) — a fraction of the person, not a pixel count, so it holds
-  whether they are close to the lens or down the hall; **or**
-- it has held the new side for `COUNTER_LINE_CONFIRM_FRAMES` frames
-  (default 2) — which catches the slow, deliberate crossing that never gets
-  far past a line drawn near the frame edge.
-
-A sway satisfies neither. A sprint satisfies the first, a shuffle the second.
+fast somebody moves. So a side change is believed once the track is more than
+`COUNTER_LINE_COMMIT_FRACTION` of its own box past the line (default 0.6) — a
+fraction of the person, not a pixel count, so it holds whether they are close
+to the lens or down the hall.
 
 This is also why a suggested line is kept between 0.2 and 0.8 of the frame:
-at 0.9 a brisk walker is visible beyond the line for a frame or two, which is
-not long enough to tell them from somebody swaying on it.
+at 0.9 a close subject has no room left to get clear of the line.
+
+### Why not a frame count
+
+There used to be a second guard — the track had to hold the new side for
+`COUNTER_LINE_CONFIRM_FRAMES` frames — and *either* guard committed the
+crossing. It was removed after measuring it, because a frame count cannot
+tell a slow sway from a walk: a sway lingers at the far end of its arc for as
+long as a walk takes to leave. Forty-five seconds of one person seated at a
+webcam, line through the middle of the frame:
+
+| Rule | False crossings (truth: 0) |
+|---|---|
+| Distance **or** 2 frames held | **29** |
+| Distance **or** 10 frames held | **29** |
+| Distance alone | **0** |
+
+Raising the threshold does not help. On real footage the distance guard alone
+counted exactly the same crossings as the pair of them, 0.1s later each.
+
+The removal has a price, which is deliberate and tested: somebody who steps
+over the line and stops short of their own body width — holding a door,
+turning to talk — is no longer counted. The frame count used to catch that,
+at the cost of counting every sway as a visitor.
 
 Detection runs on every *N*th frame (`COUNTER_DETECT_EVERY`, default 3) and
 tracking fills the gaps, which is what makes CPU-only operation workable.
@@ -396,7 +412,7 @@ All of these are environment variables:
 | `COUNTER_MIN_CONFIDENCE` | *(per backend)* | Detection threshold. Unset, HOG uses 0.45 and YOLO 0.35 — HOG scores are SVM decision values, YOLO scores are probabilities, so one shared number suits neither |
 | `COUNTER_DETECT_EVERY` | `3` | Detect on every Nth frame |
 | `COUNTER_MAX_DISAPPEARED` | `25` | Frames a track survives unseen |
-| `COUNTER_LINE_CONFIRM_FRAMES` | `2` | Frames a side change must hold before it counts — see [Loitering](#loitering) |
+| `COUNTER_LINE_COMMIT_FRACTION` | `0.6` | How far past the line a track must get before it counts, as a fraction of its own box — see [Loitering](#loitering) |
 | `COUNTER_FRAME_WIDTH` | `640` | Frames are downscaled to this width before detection |
 | `COUNTER_OCCUPANCY_RESET_AT` | `00:00` | Local time occupancy returns to zero |
 | `COUNTER_STALE_FRAME_SECONDS` | `30` | No frame for this long means stalled |

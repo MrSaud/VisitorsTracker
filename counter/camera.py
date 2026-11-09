@@ -88,7 +88,7 @@ class CounterWorker(threading.Thread):
                 position=camera.line_position,
                 orientation=camera.line_orientation,
                 invert=camera.invert_direction,
-                confirm_frames=settings.COUNTER_LINE_CONFIRM_FRAMES,
+                commit_fraction=settings.COUNTER_LINE_COMMIT_FRACTION,
             ),
             detect_every=settings.COUNTER_DETECT_EVERY,
             max_disappeared=settings.COUNTER_MAX_DISAPPEARED,
