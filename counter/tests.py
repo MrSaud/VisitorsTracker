@@ -20,6 +20,7 @@ from unittest import skipUnless
 
 import cv2
 import numpy as np
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core import mail
@@ -94,6 +95,7 @@ from .vision import (
     HORIZONTAL,
     VERTICAL,
     CentroidTracker,
+    DEFAULT_CONFIRM_FRAMES,
     HogPersonDetector,
     LINE_POSITION_MAX,
     LINE_POSITION_MIN,
@@ -3731,3 +3733,23 @@ class MeasureCommandTests(TransactionTestCase):
         with self.assertRaises(CommandError) as caught:
             call_command("measure", "/no/such/clip.mp4", stdout=StringIO())
         self.assertIn("No such file", str(caught.exception))
+
+
+class CountingDefaultsAgreeTests(TestCase):
+    """The settings file must not quietly disagree with the measured default.
+
+    It did: vision was tuned to 2 after measuring that 3 misses a normal
+    walk when the line is not centred, while settings still said 3 -- so
+    every real camera ran on the number that had been rejected, and only
+    the unit tests saw the tuned one.
+    """
+
+    def test_the_confirm_frames_default_is_the_one_that_was_measured(self):
+        self.assertEqual(settings.COUNTER_LINE_CONFIRM_FRAMES,
+                         DEFAULT_CONFIRM_FRAMES)
+
+    def test_a_worker_gets_it(self):
+        camera = Camera.objects.create(name="Door", source="0")
+        worker = CounterWorker(camera)
+        self.assertEqual(worker.counter.line.confirm_frames,
+                         DEFAULT_CONFIRM_FRAMES)

@@ -3,6 +3,10 @@
 import os
 from pathlib import Path
 
+# The counting defaults live beside the code that measured them, so a
+# settings file cannot quietly disagree with them.
+from counter.vision import DEFAULT_CONFIRM_FRAMES
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # SECURITY WARNING: keep the secret key used in production secret!
@@ -128,7 +132,7 @@ COUNTER_DETECT_EVERY = int(os.environ.get("COUNTER_DETECT_EVERY", "3"))
 # weight, which flips sides on every sway. Higher is steadier but will miss
 # somebody who sprints through; see "Loitering" in the README.
 COUNTER_LINE_CONFIRM_FRAMES = int(
-    os.environ.get("COUNTER_LINE_CONFIRM_FRAMES", "3"))
+    os.environ.get("COUNTER_LINE_CONFIRM_FRAMES", str(DEFAULT_CONFIRM_FRAMES)))
 
 # Frames a track may go unseen before it is dropped.
 COUNTER_MAX_DISAPPEARED = int(os.environ.get("COUNTER_MAX_DISAPPEARED", "25"))
