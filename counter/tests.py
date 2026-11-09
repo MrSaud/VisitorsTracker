@@ -5164,3 +5164,44 @@ class ExportFilenameTests(TestCase):
 
     def test_it_stays_a_sane_length(self):
         self.assertLessEqual(len(exports.safe_filename("x" * 400)), 120)
+
+
+class ScriptedRunsMustNotHangTests(TestCase):
+    """The pause that keeps a console readable must not block a script.
+
+    An allocated console closes with the process, so an interactive
+    command pauses before exiting. Run unattended, that pause waits for a
+    key nobody will press: `createsuperuser --noinput` hung forever the
+    first time it ran from a script.
+    """
+
+    def entry(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "app_main_under_test",
+            str(pathlib.Path(settings.BASE_DIR) / "app_main.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_noinput_never_pauses(self):
+        entry = self.entry()
+        for flag in ("--noinput", "--no-input"):
+            with self.subTest(flag=flag):
+                self.assertFalse(
+                    entry.wants_a_reader(["exe", "createsuperuser", flag]))
+
+    def test_an_interactive_command_still_pauses(self):
+        self.assertTrue(self.entry().wants_a_reader(["exe", "createsuperuser"]))
+
+    def test_an_environment_variable_can_turn_it_off(self):
+        entry = self.entry()
+        with patch.dict(os.environ, {"VISITORSTRACKER_NO_PAUSE": "1"}):
+            self.assertFalse(entry.wants_a_reader(["exe", "migrate"]))
+
+    def test_the_pause_is_tied_to_an_allocated_console(self):
+        # Borrowing the caller's console means the output stays on screen
+        # after exit; there is nothing to hold open.
+        source = (pathlib.Path(settings.BASE_DIR) / "app_main.py").read_text()
+        self.assertIn('console == "allocated" and wants_a_reader', source)

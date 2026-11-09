@@ -64,6 +64,21 @@ def attach_console():
     return kind
 
 
+def wants_a_reader(argv):
+    """Whether a person is waiting to read the result.
+
+    The pause exists because an allocated console closes with the process.
+    It must not happen when nothing can press a key: a scripted
+    `createsuperuser --noinput` would hang forever, which is exactly what
+    it did the first time this ran unattended.
+    """
+    import os
+
+    if os.environ.get("VISITORSTRACKER_NO_PAUSE") == "1":
+        return False
+    return not any(a in ("--noinput", "--no-input") for a in argv)
+
+
 def main():
     if len(sys.argv) > 1:
         console = attach_console()
@@ -75,7 +90,7 @@ def main():
         try:
             execute_from_command_line(sys.argv)
         finally:
-            if console == "allocated":
+            if console == "allocated" and wants_a_reader(sys.argv):
                 # The console goes away with the process, taking the
                 # result with it. Hold it open long enough to read.
                 try:
