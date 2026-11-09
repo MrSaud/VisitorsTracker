@@ -4408,3 +4408,102 @@ class CheckSetupCommandTests(TestCase):
     def test_it_reports_the_platform_it_is_run_on(self):
         # The whole point is running it on the machine you are unsure about.
         self.assertIn(platform.system(), self.run_check())
+
+
+# ---------------------------------------------------------------------------
+# one process per camera
+# ---------------------------------------------------------------------------
+
+class CameraLeaseTests(TestCase):
+    """Two processes counting one camera double the totals, silently.
+
+    An RTSP stream serves both readers happily, so nothing errors; the
+    numbers are just wrong. Measured before this existed: four processes
+    over a clip containing 3 crossings recorded 12.
+    """
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def test_a_free_camera_can_be_claimed(self):
+        self.assertTrue(self.camera.claim_lease("process-a"))
+        self.assertEqual(self.camera.lease_held_by(), "process-a")
+
+    def test_a_second_process_is_refused(self):
+        self.assertTrue(self.camera.claim_lease("process-a"))
+        other = Camera.objects.get(pk=self.camera.pk)
+        self.assertFalse(other.claim_lease("process-b"))
+        self.assertEqual(other.lease_held_by(), "process-a")
+
+    def test_the_holder_can_claim_again(self):
+        # Restarting a worker in the same process must not deadlock on itself.
+        self.assertTrue(self.camera.claim_lease("process-a"))
+        self.assertTrue(self.camera.claim_lease("process-a"))
+
+    def test_an_expired_lease_can_be_taken_over(self):
+        # A process that is killed never releases; the camera must not be
+        # stranded until somebody notices.
+        past = timezone.now() - timedelta(seconds=1)
+        Camera.objects.filter(pk=self.camera.pk).update(
+            lease_owner="dead-process", lease_expires_at=past)
+        fresh = Camera.objects.get(pk=self.camera.pk)
+        self.assertEqual(fresh.lease_held_by(), "",
+                         "an expired lease is held by nobody")
+        self.assertTrue(fresh.claim_lease("process-b"))
+
+    def test_renewing_keeps_it(self):
+        self.camera.claim_lease("process-a", seconds=30)
+        first = self.camera.lease_expires_at
+        self.assertTrue(self.camera.renew_lease("process-a", seconds=90))
+        self.assertGreater(self.camera.lease_expires_at, first)
+
+    def test_renewing_a_lease_you_lost_fails(self):
+        self.camera.claim_lease("process-a")
+        Camera.objects.filter(pk=self.camera.pk).update(lease_owner="process-b")
+        self.assertFalse(self.camera.renew_lease("process-a"))
+
+    def test_releasing_frees_it_at_once(self):
+        self.camera.claim_lease("process-a")
+        self.assertTrue(self.camera.release_lease("process-a"))
+        fresh = Camera.objects.get(pk=self.camera.pk)
+        self.assertEqual(fresh.lease_held_by(), "")
+        self.assertTrue(fresh.claim_lease("process-b"))
+
+    def test_you_cannot_release_somebody_elses(self):
+        self.camera.claim_lease("process-a")
+        other = Camera.objects.get(pk=self.camera.pk)
+        self.assertFalse(other.release_lease("process-b"))
+        self.assertEqual(
+            Camera.objects.get(pk=self.camera.pk).lease_held_by(), "process-a")
+
+
+class WorkerRespectsTheLeaseTests(TestCase):
+    """What a worker does when the camera is already taken."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+
+    def test_a_worker_refuses_and_says_why(self):
+        self.camera.claim_lease("some-other-process")
+        worker = CounterWorker(self.camera)
+        worker.run()                      # the thread body, inline
+        self.assertIsNotNone(worker.error)
+        self.assertIn("Another process", worker.error)
+        self.assertIn("double", worker.error,
+                      "the message has to say what goes wrong, not just refuse")
+        self.assertEqual(worker.frames_read, 0)
+
+    def test_each_process_gets_its_own_token(self):
+        token = camera_module.process_token()
+        self.assertEqual(token, camera_module.process_token(),
+                         "it must be stable within a process")
+        self.assertIn(str(os.getpid()), token)
+
+    def test_the_token_is_not_just_host_and_pid(self):
+        # pids are reused; a stale lease must not be renewable by whatever
+        # process inherits that pid later.
+        with patch.object(camera_module, "_PROCESS_TOKEN", None):
+            first = camera_module.process_token()
+        with patch.object(camera_module, "_PROCESS_TOKEN", None):
+            second = camera_module.process_token()
+        self.assertNotEqual(first, second)

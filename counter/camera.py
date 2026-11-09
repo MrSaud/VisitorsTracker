@@ -10,9 +10,12 @@ tabs can watch one camera.
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import sys
 import threading
 import time
+import uuid
 
 import cv2
 from django.conf import settings
@@ -59,6 +62,22 @@ def is_file_source(source) -> bool:
     if isinstance(source, int):
         return False
     return "://" not in str(source)
+
+
+def process_token() -> str:
+    """Identifies this process to the lease, and stays put for its lifetime.
+
+    Host and pid alone are not enough: pids are reused, and a stale lease
+    from a crashed process could then be renewed by an unrelated one that
+    happened to get the same pid.
+    """
+    global _PROCESS_TOKEN
+    if _PROCESS_TOKEN is None:
+        _PROCESS_TOKEN = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    return _PROCESS_TOKEN
+
+
+_PROCESS_TOKEN: str | None = None
 
 
 def capture_backends(source):
@@ -136,6 +155,9 @@ class CounterWorker(threading.Thread):
         self._jpeg: bytes | None = None
         self._frame_seq = 0
 
+        self.lease_owner = process_token()
+        self._lease_renewed_at = 0.0
+
         self.error: str | None = None
         self.frames_read = 0
         self.started_at: float | None = None
@@ -195,6 +217,7 @@ class CounterWorker(threading.Thread):
             "seconds_since_frame": (
                 round(since_frame, 1) if since_frame is not None else None),
             "fps": round(self.fps, 2),
+            "lease_owner": self.lease_owner,
             "reconnecting": self.reconnecting,
             "reconnects": self.reconnects,
             "retry_in": self.retry_in,
@@ -203,6 +226,64 @@ class CounterWorker(threading.Thread):
             "session_inside": self.counter.occupancy,
             "active_tracks": self.counter.active_tracks,
         }
+
+    # -- the counting lease -----------------------------------------------
+
+    def _claim(self) -> bool:
+        """Take the camera, or refuse to count it.
+
+        Without this, a second process on the same camera counts everything
+        a second time. An RTSP stream serves both readers happily, so there
+        is no error anywhere -- the totals simply double.
+        """
+        from .models import Camera
+
+        camera = Camera.objects.filter(pk=self.camera_pk).first()
+        if camera is None:
+            self.error = "Camera no longer exists."
+            return False
+
+        if camera.claim_lease(self.lease_owner):
+            self._lease_renewed_at = time.monotonic()
+            return True
+
+        holder = camera.lease_held_by()
+        self.error = (
+            f"Another process is already counting this camera ({holder}). "
+            f"Two would both write crossings and double the totals."
+        )
+        logger.error("camera %s: %s", self.camera_pk, self.error)
+        return False
+
+    def _renew(self):
+        """Keep the lease alive while we are counting."""
+        from .models import LEASE_RENEW_EVERY
+
+        now = time.monotonic()
+        if now - self._lease_renewed_at < LEASE_RENEW_EVERY:
+            return
+        self._lease_renewed_at = now
+
+        from .models import Camera
+
+        camera = Camera.objects.filter(pk=self.camera_pk).first()
+        if camera is None or camera.renew_lease(self.lease_owner):
+            return
+
+        # Lost it: somebody decided we were dead and took over. Stop rather
+        # than count alongside them.
+        self.error = (
+            f"Lost the counting lease to {camera.lease_held_by() or 'another process'}."
+        )
+        logger.error("camera %s: %s", self.camera_pk, self.error)
+        self._stop_event.set()
+
+    def _release(self):
+        from .models import Camera
+
+        camera = Camera.objects.filter(pk=self.camera_pk).first()
+        if camera is not None:
+            camera.release_lease(self.lease_owner)
 
     # -- thread body ------------------------------------------------------
 
@@ -213,6 +294,9 @@ class CounterWorker(threading.Thread):
         continues across the gap, so the totals keep running while the
         tracks are thrown away.
         """
+        if not self._claim():
+            return
+
         failures = 0                       # consecutive failures to get a stream
         backoff = RECONNECT_BACKOFF_START
 
@@ -246,6 +330,7 @@ class CounterWorker(threading.Thread):
         finally:
             self.reconnecting = False
             self.retry_in = None
+            self._release()
             self.finished_at = time.time()
             close_old_connections()
             with self._condition:
@@ -329,6 +414,7 @@ class CounterWorker(threading.Thread):
         failures = 0
 
         while not self._stop_event.is_set():
+            self._renew()
             ok, frame = capture.read()
 
             if not ok or frame is None:

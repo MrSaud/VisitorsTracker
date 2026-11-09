@@ -1,10 +1,18 @@
 """Cameras, the events they cover, and the crossings they record."""
 
+from datetime import timedelta
+
 from django.db import models
 from django.utils import timezone
 
 from .daywindow import occupancy_window_start
 from .vision import DIRECTION_IN, DIRECTION_OUT, HORIZONTAL, VERTICAL
+
+# How long a counting lease is good for without being renewed. Long enough
+# that a slow pass does not drop it, short enough that a process which dies
+# without releasing it frees the camera promptly.
+LEASE_SECONDS = 45
+LEASE_RENEW_EVERY = 15
 
 
 class Camera(models.Model):
@@ -41,6 +49,15 @@ class Camera(models.Model):
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # A camera may only be counted by one process at a time. Two processes
+    # reading one RTSP stream both succeed -- the camera happily serves
+    # several readers -- and both write crossings, so the counts come out
+    # multiplied by the number of processes, silently. That is exactly what
+    # `gunicorn -w 4` with COUNTER_AUTOSTART would do. Measured: four
+    # processes over a clip containing 3 crossings recorded 12.
+    lease_owner = models.CharField(max_length=120, blank=True, default="")
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ["name"]
 
@@ -51,6 +68,59 @@ class Camera(models.Model):
         """Webcam indexes must be passed to OpenCV as ints, URLs as strings."""
         raw = (self.source or "").strip()
         return int(raw) if raw.isdigit() else raw
+
+    # -- the counting lease -----------------------------------------------
+
+    def lease_held_by(self, now=None) -> str:
+        """Who is counting this camera, or "" if nobody is."""
+        if not self.lease_owner or self.lease_expires_at is None:
+            return ""
+        now = now or timezone.now()
+        return self.lease_owner if self.lease_expires_at > now else ""
+
+    def claim_lease(self, owner, seconds=None, now=None) -> bool:
+        """Take the lease, unless a different live one exists.
+
+        One UPDATE with the conditions in its WHERE clause, checked by row
+        count. Deliberately not select_for_update: that is a no-op on
+        SQLite, so it would look like a lock while providing none. A single
+        conditional UPDATE is atomic on both.
+        """
+        seconds = LEASE_SECONDS if seconds is None else seconds
+        now = now or timezone.now()
+        expires = now + timedelta(seconds=seconds)
+
+        claimed = Camera.objects.filter(pk=self.pk).filter(
+            models.Q(lease_owner="")
+            | models.Q(lease_owner=owner)
+            | models.Q(lease_expires_at__isnull=True)
+            | models.Q(lease_expires_at__lte=now)
+        ).update(lease_owner=owner, lease_expires_at=expires)
+
+        if claimed:
+            self.lease_owner = owner
+            self.lease_expires_at = expires
+        return bool(claimed)
+
+    def renew_lease(self, owner, seconds=None, now=None) -> bool:
+        """Push the expiry out. Fails if the lease was taken meanwhile."""
+        seconds = LEASE_SECONDS if seconds is None else seconds
+        now = now or timezone.now()
+        expires = now + timedelta(seconds=seconds)
+        renewed = Camera.objects.filter(
+            pk=self.pk, lease_owner=owner).update(lease_expires_at=expires)
+        if renewed:
+            self.lease_expires_at = expires
+        return bool(renewed)
+
+    def release_lease(self, owner) -> bool:
+        """Give it up, so another process need not wait for it to expire."""
+        released = Camera.objects.filter(pk=self.pk, lease_owner=owner).update(
+            lease_owner="", lease_expires_at=None)
+        if released:
+            self.lease_owner = ""
+            self.lease_expires_at = None
+        return bool(released)
 
     # -- derived counts ---------------------------------------------------
 
