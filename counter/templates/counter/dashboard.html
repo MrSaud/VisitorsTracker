@@ -334,6 +334,21 @@
   <span class="sub">Camera-based visitor counting &middot; <a href="/admin/">admin</a> &middot; <a href="/api/v1/stats/">API</a></span>
 </header>
 
+{% if initial_admin %}
+<section class="alert degraded firstrun">
+  <div class="title">First run &mdash; sign in to add a camera</div>
+  <ul>
+    <li>Open <a href="/admin/">the admin</a> and sign in as
+        <code>{{ initial_admin.username }}</code> with
+        <code>{{ initial_admin.password }}</code></li>
+    <li>Add your camera there, then change this password.</li>
+    <li>This message disappears when you delete
+        <code>{{ initial_admin.path }}</code></li>
+  </ul>
+</section>
+{% endif %}
+
+
 <main>
   <div class="alert" id="health-alert" hidden>
     <div class="title" id="health-title"></div>

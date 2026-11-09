@@ -53,10 +53,34 @@ def dashboard(request):
         {
             "cameras": cameras,
             "has_cameras": bool(cameras),
+            # Shown until the operator deletes the file, because a
+            # generated password nobody can find is no better than none.
+            "initial_admin": _initial_admin_note(),
             # Controls are hidden rather than left to fail with a 403.
             "can_operate": _is_operator(request),
         },
     )
+
+
+def _initial_admin_note():
+    """The first-run password file, while it is still there."""
+    from .firstrun import USERNAME, password_path
+
+    path = password_path(settings.DATA_DIR)
+    if not path.exists():
+        return None
+    try:
+        return {"username": USERNAME, "path": str(path),
+                "password": _read_initial_password(path)}
+    except OSError:
+        return None
+
+
+def _read_initial_password(path):
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("password:"):
+            return line.split(":", 1)[1].strip()
+    return ""
 
 
 def _reads_allowed(request) -> bool:

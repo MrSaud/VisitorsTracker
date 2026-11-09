@@ -259,6 +259,11 @@ def main(argv=None):
                 f"Stop it, or set COUNTER_DESKTOP_PORT to another port."
             )
         prepare_database()
+        # A fresh install has no accounts, and a camera can only be added
+        # through the admin. Without this it cannot be configured at all.
+        from .firstrun import ensure_admin
+
+        ensure_admin(resolve_data_dir(Path(__file__).resolve().parent.parent))
         httpd, _thread = build_server(host, port)
         if not wait_for_server(health_url(host, port)):
             shutdown(httpd)

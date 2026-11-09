@@ -41,6 +41,7 @@ from django.utils import timezone
 
 from . import camera as camera_module
 from . import exports
+from . import firstrun
 from . import secretkey
 from config import paths
 from . import desktop
@@ -5205,3 +5206,92 @@ class ScriptedRunsMustNotHangTests(TestCase):
         # after exit; there is nothing to hold open.
         source = (pathlib.Path(settings.BASE_DIR) / "app_main.py").read_text()
         self.assertIn('console == "allocated" and wants_a_reader', source)
+
+
+class FirstRunAdminTests(TestCase):
+    """A fresh install has to be usable without a command line.
+
+    A camera can only be added through the Django admin -- there is no
+    create endpoint -- so an install with no accounts cannot be
+    configured at all. Somebody who double-clicks the app would see an
+    empty dashboard and no way forward.
+    """
+
+    def setUp(self):
+        self.data_dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.data_dir, True)
+        User.objects.all().delete()
+
+    def test_it_creates_an_administrator_when_there_are_none(self):
+        made = firstrun.ensure_admin(self.data_dir)
+        self.assertIsNotNone(made)
+        user = User.objects.get(username="admin")
+        self.assertTrue(user.is_superuser and user.is_staff)
+
+    def test_the_password_works(self):
+        firstrun.ensure_admin(self.data_dir)
+        text = (self.data_dir / firstrun.PASSWORD_FILE).read_text()
+        password = [l.split(":", 1)[1].strip() for l in text.splitlines()
+                    if l.startswith("password:")][0]
+        self.assertTrue(self.client.login(username="admin", password=password))
+
+    def test_it_leaves_an_existing_install_alone(self):
+        User.objects.create_superuser("boss", "b@example.com", "pw")
+        self.assertIsNone(firstrun.ensure_admin(self.data_dir))
+        self.assertFalse((self.data_dir / firstrun.PASSWORD_FILE).exists())
+
+    def test_it_does_not_resurrect_a_deleted_default(self):
+        # Somebody who removes the default account on purpose should not
+        # find it back after a restart.
+        firstrun.ensure_admin(self.data_dir)
+        User.objects.create_superuser("real", "r@example.com", "pw")
+        User.objects.filter(username="admin").delete()
+        firstrun.ensure_admin(self.data_dir)
+        self.assertFalse(User.objects.filter(username="admin").exists())
+
+    def test_the_password_is_different_every_time(self):
+        # A fixed default on every install is the oldest hole there is,
+        # and this app starts a camera.
+        seen = {firstrun.generate_password() for _ in range(50)}
+        self.assertEqual(len(seen), 50)
+
+    def test_the_password_avoids_lookalike_characters(self):
+        # It gets copied off a screen by hand.
+        joined = "".join(firstrun.generate_password() for _ in range(40))
+        self.assertFalse(set("l1IO0") & set(joined))
+
+    def test_the_file_is_not_world_readable(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("Windows does not model permissions this way")
+        firstrun.ensure_admin(self.data_dir)
+        mode = (self.data_dir / firstrun.PASSWORD_FILE).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+
+class FirstRunBannerTests(TestCase):
+    """The generated password has to be findable, or it helps nobody."""
+
+    def setUp(self):
+        self.data_dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.data_dir, True)
+
+    def test_the_dashboard_shows_the_credentials_while_the_file_exists(self):
+        with override_settings(DATA_DIR=self.data_dir):
+            User.objects.all().delete()
+            firstrun.ensure_admin(self.data_dir)
+            page = self.client.get("/").content.decode()
+        self.assertIn("First run", page)
+        self.assertIn("admin", page)
+
+    def test_it_disappears_once_the_file_is_deleted(self):
+        with override_settings(DATA_DIR=self.data_dir):
+            User.objects.all().delete()
+            firstrun.ensure_admin(self.data_dir)
+            (self.data_dir / firstrun.PASSWORD_FILE).unlink()
+            page = self.client.get("/").content.decode()
+        self.assertNotIn("First run", page)
+
+    def test_an_established_install_never_sees_it(self):
+        with override_settings(DATA_DIR=self.data_dir):
+            page = self.client.get("/").content.decode()
+        self.assertNotIn("First run", page)
