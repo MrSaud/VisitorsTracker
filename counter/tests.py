@@ -5310,6 +5310,13 @@ class DashboardDateFilterTests(TestCase):
                        'type="date"'):
             self.assertIn(marker, page)
 
+    def test_clear_is_visible_from_the_start(self):
+        # It used to be hidden until a date was picked, which made it a
+        # control nobody could find before they needed it.
+        page = self.page()
+        self.assertIn('id="d-clear" disabled', page)
+        self.assertNotIn('id="d-clear" hidden', page)
+
     def test_the_inputs_cannot_be_set_past_today(self):
         # Nothing is ever recorded in the future.
         self.assertIn("dFrom.max = todayIso", self.page())

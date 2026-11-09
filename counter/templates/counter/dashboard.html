@@ -245,7 +245,7 @@
     color: #dbe6f0; padding: 4px 6px; font: inherit; font-size: 12.5px;
     color-scheme: dark; }
   .range .dates input[type="date"]:focus { outline: none; border-color: #2a7399; }
-  .range .dates input.bad { border-color: #8a3b3b; }
+  .range button:disabled { opacity: 0.45; cursor: default; }
   .daily-summary {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -388,7 +388,7 @@
           <input type="date" id="d-from">
           <label for="d-to">to</label>
           <input type="date" id="d-to">
-          <button id="d-clear" hidden title="Back to the preset ranges">Clear</button>
+          <button id="d-clear" disabled title="Back to the preset ranges">Clear</button>
         </span>
         <button id="daily-csv">Download CSV</button>
       </div>
@@ -890,7 +890,7 @@ function syncDateControls() {
   document.querySelectorAll(".range button[data-days]").forEach((b) => {
     b.classList.toggle("on", !range && Number(b.dataset.days) === dailyDays);
   });
-  dClear.hidden = !dFrom.value && !dTo.value;
+  dClear.disabled = !dFrom.value && !dTo.value;
 }
 
 document.querySelectorAll(".range button[data-days]").forEach((button) => {
