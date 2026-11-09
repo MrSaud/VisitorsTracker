@@ -40,6 +40,7 @@ from django.utils import timezone
 
 from . import camera as camera_module
 from . import secretkey
+from config import paths
 from . import desktop
 from .camera import CounterWorker, is_file_source
 from .management.commands import build_app, export_model
@@ -4773,3 +4774,90 @@ class SecretKeyFileTests(TestCase):
         nested = self.tmp / "a" / "b" / ".secret_key"
         self.assertGreaterEqual(
             len(secretkey.read_or_create(nested)), secretkey.MINIMUM_LENGTH)
+
+
+class DataDirectoryTests(TestCase):
+    """Frozen, the code lives somewhere that is deleted when the app exits.
+
+    PyInstaller unpacks its bundle into a temporary directory and removes
+    it on exit, so a database written beside the code would be gone after
+    every run, taking the history and the secret key with it.
+    """
+
+    def test_a_checkout_keeps_everything_together(self):
+        with patch.object(paths, "is_frozen", return_value=False), \
+                patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(paths.resolve_data_dir("/srv/vt"),
+                             pathlib.Path("/srv/vt"))
+
+    def test_frozen_moves_data_out_of_the_bundle(self):
+        with patch.object(paths, "is_frozen", return_value=True), \
+                patch.dict(os.environ, {}, clear=True):
+            resolved = paths.resolve_data_dir("/tmp/_MEI12345")
+        self.assertNotIn("_MEI", str(resolved),
+                         "that directory is deleted when the app exits")
+
+    def test_an_explicit_directory_wins_everywhere(self):
+        for frozen in (True, False):
+            with self.subTest(frozen=frozen):
+                with patch.object(paths, "is_frozen", return_value=frozen), \
+                        patch.dict(os.environ, {"COUNTER_DATA_DIR": "/data/vt"}):
+                    self.assertEqual(paths.resolve_data_dir("/srv/vt"),
+                                     pathlib.Path("/data/vt"))
+
+    def test_windows_uses_localappdata(self):
+        with patch.object(paths.sys, "platform", "win32"), \
+                patch.dict(os.environ, {"LOCALAPPDATA": r"C:\Users\me\AppData\Local"}):
+            resolved = paths.default_data_dir()
+        self.assertIn("AppData", str(resolved))
+        self.assertTrue(str(resolved).endswith("VisitorsTracker"))
+
+    def test_macos_uses_application_support(self):
+        with patch.object(paths.sys, "platform", "darwin"):
+            self.assertIn("Application Support",
+                          str(paths.default_data_dir()))
+
+    def test_linux_uses_xdg(self):
+        with patch.object(paths.sys, "platform", "linux"), \
+                patch.dict(os.environ, {"XDG_DATA_HOME": "/home/me/.local/share"}):
+            self.assertEqual(str(paths.default_data_dir()),
+                             "/home/me/.local/share/VisitorsTracker")
+
+    def test_the_database_is_configured_under_the_data_directory(self):
+        # The test runner swaps NAME for an in-memory database, so the live
+        # setting cannot show this. Check the wiring instead.
+        configured = (pathlib.Path(settings.BASE_DIR) / "config" / "settings.py"
+                      ).read_text()
+        self.assertIn('"NAME": DATA_DIR / "db.sqlite3"', configured)
+        self.assertTrue(pathlib.Path(settings.DATA_DIR).is_absolute())
+
+
+class SpecFileTests(TestCase):
+    """The spec has to carry what Django finds by scanning, not importing."""
+
+    def setUp(self):
+        self.spec = pathlib.Path(settings.BASE_DIR) / "VisitorsTracker.spec"
+        if not self.spec.exists():
+            self.skipTest("no spec in this checkout")
+        self.text = self.spec.read_text()
+
+    def test_it_collects_what_django_discovers_by_filesystem(self):
+        # Nothing imports these, so nothing traces them either.
+        self.assertIn("counter.management.commands", self.text)
+        self.assertIn("counter.migrations", self.text)
+        self.assertIn("counter/templates", self.text)
+
+    def test_it_bundles_the_detector(self):
+        # Otherwise the exe runs on HOG and counts badly, quietly.
+        self.assertIn("ml_models", self.text)
+        self.assertIn(".onnx", self.text)
+
+    def test_it_leaves_out_the_export_only_dependencies(self):
+        # torch arrives with ultralytics for export_model and would add
+        # gigabytes to something that never calls it.
+        for heavy in ("torch", "ultralytics"):
+            self.assertIn(heavy, self.text.split("excludes=")[1][:200])
+
+    def test_it_builds_a_windowed_app_with_the_icon(self):
+        self.assertIn("console=False", self.text)
+        self.assertIn("AppIcon.ico", self.text)

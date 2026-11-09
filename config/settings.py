@@ -11,6 +11,13 @@ from counter.vision import DEFAULT_COMMIT_FRACTION
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Code and data part company when this is frozen into one executable; see
+# config/paths.py. In a checkout they are the same directory.
+from config.paths import resolve_data_dir  # noqa: E402
+
+DATA_DIR = resolve_data_dir(BASE_DIR)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # DEBUG first: the other two defaults depend on it.
 #
 # On by default, because the common case is somebody running this on their
@@ -148,7 +155,7 @@ WSGI_APPLICATION = "config.wsgi.application"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "NAME": DATA_DIR / "db.sqlite3",
     }
 }
 

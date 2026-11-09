@@ -176,18 +176,51 @@ def production_defaults():
     weeks. The app binds 127.0.0.1, so nobody else should reach it anyway;
     this is the second lock, not the first.
     """
+    from config.paths import resolve_data_dir
+
     project_dir = Path(__file__).resolve().parent.parent
+    data_dir = resolve_data_dir(project_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
     os.environ.setdefault("DJANGO_DEBUG", "0")
     os.environ.setdefault("DJANGO_ALLOWED_HOSTS", f"{DEFAULT_HOST},localhost")
     # Created once and reused, so a restart does not log the operator out.
+    # Beside the database, not beside the code: frozen, the code lives in a
+    # temporary directory that is deleted when the app exits.
     os.environ.setdefault(
-        "DJANGO_SECRET_KEY_FILE", str(project_dir / ".secret_key"))
+        "DJANGO_SECRET_KEY_FILE", str(data_dir / ".secret_key"))
+
+
+def start_logging(data_dir):
+    """Frozen, there is no console, so a failed launch leaves no trace.
+
+    Everything below -- a camera that will not open, a port in use, a
+    migration that failed -- is logged already; it just has nowhere to go
+    once the console window is gone. This gives it somewhere.
+    """
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    handler = RotatingFileHandler(
+        data_dir / "visitorstracker.log", maxBytes=2_000_000, backupCount=3,
+        encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    return handler.baseFilename
 
 
 def main(argv=None):
     production_defaults()
+
+    from config.paths import is_frozen, resolve_data_dir
+
+    if is_frozen():
+        start_logging(resolve_data_dir(Path(__file__).resolve().parent.parent))
 
     import django
 

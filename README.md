@@ -252,6 +252,45 @@ actually loaded, migrations, the port, `DEBUG`, and the cameras. With
 `--cameras` it tries to open each one, which is the step that proves the
 permission is granted. Run it there before trusting a single count.
 
+### A standalone .exe
+
+For a machine with no Python on it, `VisitorsTracker.spec` builds one
+executable with the interpreter, OpenCV and the detector inside it.
+
+**This has to be built on Windows.** PyInstaller bundles the interpreter and
+binaries of the machine it runs on; it does not cross-compile, so a Mac
+produces a Mac app and nothing else.
+
+```bat
+pip install -r requirements.txt -r requirements-desktop.txt pyinstaller
+python manage.py export_model
+pyinstaller VisitorsTracker.spec
+```
+
+The result is `dist\VisitorsTracker.exe`, several hundred MB, which runs by
+double-click with nothing installed.
+
+Three things the spec has to be told, because Django finds them by scanning
+the filesystem rather than importing them, so PyInstaller never sees them:
+**management commands**, **migrations** and **templates**. The detector model
+goes in too — a frozen app has nowhere to write one, and `export_model`
+builds a throwaway environment with torch in it, which is not something to
+do on a customer's machine.
+
+The data moves as well. Frozen, the code is unpacked into a temporary
+directory that is **deleted when the app exits**, so the database and secret
+key live in the platform's application-data directory instead
+(`%LOCALAPPDATA%\VisitorsTracker` on Windows). `COUNTER_DATA_DIR` overrides
+it. In a checkout nothing changes: data stays beside the code.
+
+With no console window, a failure before the window opens would be
+invisible, so a frozen build writes `visitorstracker.log` into that same
+directory.
+
+Expect Windows SmartScreen to warn about an unsigned executable the first
+time. Signing it needs a code-signing certificate, which costs money and is
+issued to a registered business.
+
 **None of the Windows path has been run on Windows.** This project is
 developed on a Mac. The generated files are pinned by tests and the backend
 choice is asserted, but "asserted" is not "works" — expect to iron something
