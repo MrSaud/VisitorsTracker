@@ -5,13 +5,18 @@ a model file, or any particular machine speed.
 """
 
 import csv
+import http.server
 import itertools
 import math
 import json
 import os
 import pathlib
+import plistlib
+import shutil
+import socket
 import sys
 import tempfile
+import threading
 import urllib.error
 import time as time_module
 from io import StringIO
@@ -31,7 +36,10 @@ from django.db import IntegrityError
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
+from . import camera as camera_module
+from . import desktop
 from .camera import CounterWorker, is_file_source
+from .management.commands import build_app
 from .supervisor import (
     NO_AUTOSTART_COMMANDS,
     Supervisor,
@@ -3775,3 +3783,249 @@ class CountingDefaultsAgreeTests(TestCase):
         worker = CounterWorker(camera)
         self.assertEqual(worker.counter.line.commit_fraction,
                          DEFAULT_COMMIT_FRACTION)
+
+
+# ---------------------------------------------------------------------------
+# the macOS bundle: an app that owns its own camera permission
+# ---------------------------------------------------------------------------
+
+class InfoPlistTests(TestCase):
+    """macOS needs a reason string, or it kills the app instead of asking."""
+
+    def test_the_camera_reason_is_present_and_says_something(self):
+        plist = build_app.info_plist()
+        reason = plist["NSCameraUsageDescription"]
+        self.assertIn("camera", reason.lower())
+        self.assertGreater(len(reason), 40, "a one-word reason reads as spam")
+
+    def test_the_executable_name_matches_the_one_that_gets_written(self):
+        # If these drift the bundle launches nothing and macOS says it is
+        # damaged, with no hint as to why.
+        plist = build_app.info_plist()
+        self.assertEqual(plist["CFBundleExecutable"], build_app.APP_NAME)
+
+    def test_the_bundle_identifier_is_stable(self):
+        # TCC remembers the answer against this string. Change it and the
+        # camera permission is silently forgotten.
+        self.assertEqual(build_app.info_plist()["CFBundleIdentifier"],
+                         "com.visitorstracker.desktop")
+
+    def test_no_icon_means_no_icon_key(self):
+        self.assertNotIn("CFBundleIconFile", build_app.info_plist())
+
+    def test_an_icon_is_named_by_its_filename(self):
+        plist = build_app.info_plist(icon="/somewhere/Else/Logo.icns")
+        self.assertEqual(plist["CFBundleIconFile"], "Logo.icns")
+
+
+class LauncherScriptTests(TestCase):
+    """The bundle's main executable."""
+
+    def test_it_runs_the_desktop_module_with_the_given_interpreter(self):
+        script = build_app.launcher_script("/p/VisitorsTracker", "/p/.venv/bin/python")
+        self.assertTrue(script.startswith("#!/bin/sh"))
+        self.assertIn("-m counter.desktop", script)
+        self.assertIn("'/p/.venv/bin/python'", script)
+        self.assertIn("cd '/p/VisitorsTracker'", script)
+
+    def test_a_path_with_spaces_survives(self):
+        # "CPA Latest FP Update" is a real directory on this machine.
+        script = build_app.launcher_script(
+            "/Users/me/My Projects/VT", "/Users/me/My Projects/VT/.venv/bin/python")
+        self.assertIn("cd '/Users/me/My Projects/VT'", script)
+
+    def test_a_quote_in_the_path_cannot_break_out(self):
+        script = build_app.launcher_script("/tmp/it's here", "/tmp/py")
+        self.assertIn("'/tmp/it'\\''s here'", script)
+
+
+class BuildAppCommandTests(TestCase):
+    """Building the bundle."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # A stand-in interpreter, so the test does not depend on a venv.
+        self.python = pathlib.Path(self.tmp) / "python"
+        self.python.write_text("#!/bin/sh\n")
+        self.bundle = pathlib.Path(self.tmp) / "out" / "VisitorsTracker.app"
+
+    def build(self, **extra):
+        out = StringIO()
+        call_command("build_app", output=str(pathlib.Path(self.tmp) / "out"),
+                     python=str(self.python), no_sign=True, stdout=out, **extra)
+        return out.getvalue()
+
+    def test_it_produces_a_launchable_bundle(self):
+        self.build()
+        plist_path = self.bundle / "Contents" / "Info.plist"
+        executable = self.bundle / "Contents" / "MacOS" / "VisitorsTracker"
+        self.assertTrue(plist_path.exists())
+        self.assertTrue(executable.exists())
+        self.assertTrue(os.access(executable, os.X_OK),
+                        "macOS will not launch a bundle whose binary is not +x")
+        with open(plist_path, "rb") as handle:
+            plist = plistlib.load(handle)
+        self.assertIn("NSCameraUsageDescription", plist)
+        self.assertEqual(plist["CFBundleExecutable"], "VisitorsTracker")
+
+    def test_rebuilding_over_an_existing_bundle_works(self):
+        self.build()
+        marker = self.bundle / "Contents" / "stale.txt"
+        marker.write_text("left over from the last build")
+        self.build()
+        self.assertFalse(marker.exists(),
+                         "a rebuild must not leave the previous build behind")
+
+    def test_a_missing_interpreter_is_refused(self):
+        with self.assertRaises(CommandError):
+            call_command("build_app", python="/nowhere/python", no_sign=True,
+                         output=str(pathlib.Path(self.tmp) / "out"),
+                         stdout=StringIO())
+
+    def test_a_missing_icon_is_refused(self):
+        with self.assertRaises(CommandError):
+            self.build(icon="/nowhere/Logo.icns")
+
+    def test_an_icon_is_copied_in(self):
+        icon = pathlib.Path(self.tmp) / "Logo.icns"
+        icon.write_bytes(b"not really an icon")
+        self.build(icon=str(icon))
+        self.assertTrue((self.bundle / "Contents" / "Resources" / "Logo.icns").exists())
+
+
+class DesktopPortTests(TestCase):
+    """Two copies of the app must not fight over the camera."""
+
+    def test_a_bound_port_is_not_free(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen(1)
+            port = held.getsockname()[1]
+            self.assertFalse(desktop.port_is_free(port))
+
+    def test_an_unbound_port_is_free(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        self.assertTrue(desktop.port_is_free(port))
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    body = b'{"status": "ok", "cameras": []}'
+    status = 200
+
+    def do_GET(self):
+        self.send_response(self.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.body)))
+        self.end_headers()
+        self.wfile.write(self.body)
+
+    def log_message(self, *args):
+        pass
+
+
+class AlreadyServingTests(TestCase):
+    """Launching the app twice opens a window on the first one."""
+
+    def serve(self, handler_cls):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def test_our_own_health_response_is_recognised(self):
+        port = self.serve(_Handler)
+        self.assertTrue(desktop.ours_is_already_serving(port=port))
+
+    def test_somebody_else_on_the_port_is_not_us(self):
+        class Other(_Handler):
+            body = b"<html>a totally different app</html>"
+        port = self.serve(Other)
+        self.assertFalse(desktop.ours_is_already_serving(port=port))
+
+    def test_nothing_on_the_port_is_not_us(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        self.assertFalse(desktop.ours_is_already_serving(port=port, timeout=0.5))
+
+
+class WaitForServerTests(TestCase):
+    """The window must not open on a connection error."""
+
+    def test_it_returns_once_the_server_answers(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+        self.assertTrue(desktop.wait_for_server(url, timeout=5))
+
+    def test_a_404_still_counts_as_up(self):
+        class NotFound(_Handler):
+            status = 404
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NotFound)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+        self.assertTrue(desktop.wait_for_server(url, timeout=5),
+                        "the server answered; the path simply does not exist")
+
+    def test_it_gives_up_on_a_dead_port(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        started = time_module.monotonic()
+        self.assertFalse(
+            desktop.wait_for_server(f"http://127.0.0.1:{port}/", timeout=1))
+        self.assertLess(time_module.monotonic() - started, 10)
+
+
+class DesktopServerDoesNotHangOnQuitTests(TestCase):
+    """Closing the window has to end the process, live view or not.
+
+    Django's ThreadedWSGIServer blocks on close until every request thread
+    finishes. An MJPEG live view is a request that never finishes, so with
+    the default the app would stay running invisibly after its window went
+    away, still holding the camera.
+    """
+
+    def test_the_server_class_does_not_block_on_close(self):
+        httpd, _thread = desktop.build_server(port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.assertFalse(httpd.block_on_close)
+        self.assertTrue(httpd.daemon_threads)
+
+
+class DesktopShutdownTests(TestCase):
+    """Quitting releases the camera."""
+
+    def test_it_stops_the_workers_and_the_server(self):
+        calls = []
+
+        class FakeServer:
+            def shutdown(self):
+                calls.append("shutdown")
+
+            def server_close(self):
+                calls.append("close")
+
+        class FakeSupervisor:
+            def stop(self):
+                calls.append("supervisor")
+
+        with patch.object(camera_module.REGISTRY, "stop_all",
+                          lambda: calls.append("stop_all")):
+            desktop.shutdown(FakeServer(), FakeSupervisor())
+
+        self.assertEqual(calls, ["supervisor", "stop_all", "shutdown", "close"])
+
+    def test_it_is_safe_with_nothing_running(self):
+        with patch.object(camera_module.REGISTRY, "stop_all", lambda: None):
+            desktop.shutdown(None, None)       # must not raise

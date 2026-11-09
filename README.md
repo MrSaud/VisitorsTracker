@@ -67,6 +67,58 @@ That script starts the server with `COUNTER_AUTOSTART=1` under Terminal, which
 owns the permission. None of this applies to RTSP or HTTP cameras — only local
 capture devices sit behind that prompt.
 
+### The app bundle
+
+Borrowing Terminal's permission works, but it is a workaround: the camera is
+granted to a terminal emulator, the window has to stay open, and there is
+nothing to double-click. `build_app` wraps the same server in a real macOS
+application so it has an identity of its own:
+
+```bash
+pip install -r requirements-desktop.txt
+python manage.py build_app
+open dist/VisitorsTracker.app
+```
+
+What that gives:
+
+- **Its own entry in Privacy & Security > Camera**, named VisitorsTracker. The
+  bundle carries `NSCameraUsageDescription`, which is what macOS shows in the
+  prompt — and without which it terminates the process instead of asking.
+- **A window**, via `pywebview`, rendering the same dashboard. No browser tab,
+  no Terminal.
+- **The same server.** It still listens on `127.0.0.1:8000`, so a phone on the
+  network, the REST API and a second browser all still work. The window is a
+  view onto the server, not a replacement for it.
+
+It is ad-hoc signed (`codesign --sign -`) so TCC has a stable identity to
+remember the answer against; pass `--no-sign` to skip that. The path to the
+project and to its interpreter are baked in at build time, so the bundle works
+from the Dock or `/Applications` — move the project and rebuild.
+
+Double-clicking it twice is handled by macOS, which activates the running copy
+rather than starting a second one. The app's own guard is for the other case:
+when a server is *already* running from `manage.py runserver`, the Terminal
+launcher or the LaunchAgent, the app opens a window onto that one instead of
+failing on a busy port. Two servers would fight over the camera, because a
+capture device opens once.
+
+Closing the window releases the camera and stops the server. The bundle's WSGI
+server deliberately does not block on close — an MJPEG live view is a request
+that never finishes, and the default would leave the app running invisibly with
+the camera still held.
+
+**One thing to check on your own machine.** Homebrew's `bin/python3.12` is a
+stub that executes `Python.framework/.../Python.app/Contents/MacOS/Python`, so
+the running process's binary lives outside this bundle. macOS normally
+attributes the permission to the application that was launched — this bundle —
+but if **Privacy & Security > Camera** ends up listing *Python* rather than
+*VisitorsTracker*, that attribution went to the shared interpreter instead,
+and the grant is shared with every Python GUI app on the machine. Putting a
+framework interpreter inside `Contents/MacOS/` would pin it to the bundle.
+Reading the answer requires the TCC database, which needs Full Disk Access, so
+the pane is the only place to see it.
+
 ## How counting works
 
 1. **Detect** — a YOLOv8 ONNX model when one is present, otherwise OpenCV's

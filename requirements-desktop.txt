@@ -1,0 +1,6 @@
+# Extra dependencies for the macOS app bundle (`manage.py build_app`).
+#
+# The server does not import these: counter/desktop.py imports webview only
+# when it actually opens a window, so a headless deployment installs
+# requirements.txt alone and never pulls in pyobjc.
+pywebview==6.2.1
