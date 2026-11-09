@@ -108,16 +108,19 @@ server deliberately does not block on close — an MJPEG live view is a request
 that never finishes, and the default would leave the app running invisibly with
 the camera still held.
 
-**One thing to check on your own machine.** Homebrew's `bin/python3.12` is a
-stub that executes `Python.framework/.../Python.app/Contents/MacOS/Python`, so
-the running process's binary lives outside this bundle. macOS normally
-attributes the permission to the application that was launched — this bundle —
-but if **Privacy & Security > Camera** ends up listing *Python* rather than
-*VisitorsTracker*, that attribution went to the shared interpreter instead,
-and the grant is shared with every Python GUI app on the machine. Putting a
-framework interpreter inside `Contents/MacOS/` would pin it to the bundle.
-Reading the answer requires the TCC database, which needs Full Disk Access, so
-the pane is the only place to see it.
+**The permission really does land on the bundle**, which was worth checking
+rather than assuming. Homebrew's `bin/python3.12` is a stub that executes
+`Python.framework/.../Python.app/Contents/MacOS/Python`, so the running
+process's binary lives *outside* the bundle — the grant could plausibly have
+gone to that shared interpreter instead, and been shared with every Python GUI
+app on the machine. It does not: macOS attributes it to the application that
+was launched. Confirmed on macOS 27.2 with Homebrew python 3.12.12 —
+**Privacy & Security > Camera** lists *VisitorsTracker*, not *Python*.
+
+If a different interpreter layout ever shows *Python* in that pane, putting a
+framework interpreter inside `Contents/MacOS/` would pin the grant to the
+bundle. There is no way to read the attribution programmatically: the TCC
+database needs Full Disk Access, so that pane is the only place it is visible.
 
 ## How counting works
 
