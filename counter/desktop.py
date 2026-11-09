@@ -39,7 +39,16 @@ def dashboard_url(host=DEFAULT_HOST, port=DEFAULT_PORT) -> str:
 
 
 def port_is_free(port, host=DEFAULT_HOST) -> bool:
+    """Whether the server could bind here.
+
+    SO_REUSEADDR matters: Django's WSGIServer sets allow_reuse_address, so a
+    probe without it is stricter than the thing it is testing for. Sockets
+    left in TIME_WAIT by the previous run would then read as "busy" and the
+    app would refuse to start for a minute after every restart -- on exactly
+    the port it had just been using itself.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, int(port)))
         except OSError:

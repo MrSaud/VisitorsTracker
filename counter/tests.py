@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import urllib.error
+import urllib.request
 import time as time_module
 from io import StringIO
 from unittest.mock import patch
@@ -4029,3 +4030,103 @@ class DesktopShutdownTests(TestCase):
     def test_it_is_safe_with_nothing_running(self):
         with patch.object(camera_module.REGISTRY, "stop_all", lambda: None):
             desktop.shutdown(None, None)       # must not raise
+
+
+class RestartingOnTheSamePortTests(TestCase):
+    """Quitting and relaunching must not hit a minute of "port busy".
+
+    The probe used to bind without SO_REUSEADDR while the server binds with
+    it, so connections left in TIME_WAIT by the run that just ended made the
+    app refuse to start on its own port.
+    """
+
+    def test_the_port_is_free_again_as_soon_as_the_server_stops(self):
+        httpd, _thread = desktop.build_server(port=0)
+        port = httpd.server_address[1]
+        url = f"http://127.0.0.1:{port}/api/v1/health/"
+
+        # Real connections, so the kernel leaves real TIME_WAIT entries.
+        for _ in range(3):
+            try:
+                urllib.request.urlopen(url, timeout=5).read()
+            except urllib.error.HTTPError:
+                pass
+        httpd.shutdown()
+        httpd.server_close()
+
+        self.assertTrue(
+            desktop.port_is_free(port),
+            "the app would have refused to restart on its own port")
+
+    def test_the_probe_agrees_with_a_live_server(self):
+        httpd, _thread = desktop.build_server(port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.assertFalse(desktop.port_is_free(httpd.server_address[1]))
+
+
+class DefaultIconTests(TestCase):
+    """The bundle should carry the project's icon without being asked."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.python = pathlib.Path(self.tmp) / "python"
+        self.python.write_text("#!/bin/sh\n")
+        self.out = pathlib.Path(self.tmp) / "out"
+        self.bundle = self.out / "VisitorsTracker.app"
+
+    def build(self, **extra):
+        call_command("build_app", output=str(self.out), python=str(self.python),
+                     no_sign=True, stdout=StringIO(), **extra)
+
+    def icon_key(self):
+        with open(self.bundle / "Contents" / "Info.plist", "rb") as handle:
+            return plistlib.load(handle).get("CFBundleIconFile")
+
+    def test_the_project_icon_is_picked_up_with_no_flag(self):
+        shipped = pathlib.Path(settings.BASE_DIR) / build_app.DEFAULT_ICON
+        if not shipped.exists():
+            self.skipTest(f"{build_app.DEFAULT_ICON} is not in this checkout")
+        self.build()
+        self.assertEqual(self.icon_key(), "AppIcon.icns")
+        self.assertTrue(
+            (self.bundle / "Contents" / "Resources" / "AppIcon.icns").exists())
+
+    def test_no_icon_builds_without_one(self):
+        self.build(no_icon=True)
+        self.assertIsNone(self.icon_key())
+
+    def test_an_explicit_icon_wins_over_the_default(self):
+        mine = pathlib.Path(self.tmp) / "Other.icns"
+        mine.write_bytes(b"icns")
+        self.build(icon=str(mine))
+        self.assertEqual(self.icon_key(), "Other.icns")
+
+
+class ShippedIconTests(TestCase):
+    """The icon macOS is given has to suit the way macOS draws it.
+
+    macOS 26 and later draw their own rounded container and place the app's
+    icon inside it. A pre-rounded icon with a margin then renders as a
+    rounded square inside a rounded square, shrunk and ringed in grey, so
+    the artwork has to reach the edges and let the system do the rounding.
+    """
+
+    def test_the_master_is_square_and_reaches_the_edges(self):
+        master = pathlib.Path(settings.BASE_DIR) / "assets" / "AppIcon.png"
+        if not master.exists():
+            self.skipTest("assets/AppIcon.png is not in this checkout")
+
+        from PIL import Image
+
+        image = Image.open(master).convert("RGBA")
+        self.assertEqual(image.width, image.height, "an app icon is square")
+
+        alpha = np.array(image)[:, :, 3]
+        transparent = (alpha <= 250).mean()
+        self.assertLess(
+            transparent, 0.001,
+            f"{transparent:.1%} of the icon is transparent; macOS would draw "
+            "its own container around it and the result is a rounded square "
+            "inside a rounded square")

@@ -23,6 +23,10 @@ APP_NAME = "VisitorsTracker"
 BUNDLE_ID = "com.visitorstracker.desktop"
 VERSION = "1.0"
 
+# Used unless --icon says otherwise. Regenerate it from new artwork with
+# scripts/make_icon.py, which fits the image to Apple's icon grid.
+DEFAULT_ICON = Path("assets") / "AppIcon.icns"
+
 # Shown by macOS in the permission prompt and in Privacy & Security.
 CAMERA_REASON = (
     "VisitorsTracker counts people crossing a line in the camera's view. "
@@ -87,7 +91,11 @@ class Command(BaseCommand):
             "--python", default=None,
             help="Interpreter the app runs (default: this project's .venv).")
         parser.add_argument(
-            "--icon", default=None, help="An .icns file for the bundle.")
+            "--icon", default=None,
+            help=f"An .icns file (default: {DEFAULT_ICON} when it exists).")
+        parser.add_argument(
+            "--no-icon", action="store_true",
+            help="Build without an icon even if the default one is there.")
         parser.add_argument(
             "--no-sign", action="store_true",
             help="Skip the ad-hoc signature. The app still runs, but macOS "
@@ -110,6 +118,11 @@ class Command(BaseCommand):
             icon = Path(icon).resolve()
             if not icon.exists():
                 raise CommandError(f"No icon at {icon}.")
+        elif not options["no_icon"]:
+            # The project's own icon, when it has one. An explicit --icon
+            # still wins, and a missing default is not an error.
+            default = project_dir / DEFAULT_ICON
+            icon = default if default.exists() else None
 
         if bundle.exists():
             shutil.rmtree(bundle)
@@ -135,6 +148,7 @@ class Command(BaseCommand):
         self.stdout.write(f"  interpreter: {python_path}")
         self.stdout.write(f"  project:     {project_dir}")
         self.stdout.write(f"  signed:      {'ad-hoc' if signed else 'no'}")
+        self.stdout.write(f"  icon:        {icon.name if icon else 'none'}")
         self.stdout.write(
             "\nOpen it once and allow camera access when macOS asks. It then "
             f"appears in Privacy & Security > Camera as {APP_NAME}.")

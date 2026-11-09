@@ -91,6 +91,23 @@ What that gives:
   network, the REST API and a second browser all still work. The window is a
   view onto the server, not a replacement for it.
 
+It carries `assets/AppIcon.icns` unless you pass `--icon` or `--no-icon`. To
+replace the artwork:
+
+```bash
+python scripts/make_icon.py my-artwork.png
+python manage.py build_app
+```
+
+That script does one thing worth knowing about. macOS 26 and later draw their
+own rounded container and place the app's icon inside it, so a pre-rounded
+icon with a margin — which is what icon artwork normally looks like — renders
+as a rounded square *inside* a rounded square, shrunk and ringed in grey. The
+icon therefore has to bleed to the edges and let the system do the rounding.
+Since the source artwork's own corners are transparent, the script paints the
+background into them by inpainting from the surrounding pixels, rather than
+cropping and losing a slice of the design at every edge.
+
 It is ad-hoc signed (`codesign --sign -`) so TCC has a stable identity to
 remember the answer against; pass `--no-sign` to skip that. The path to the
 project and to its interpreter are baked in at build time, so the bundle works
