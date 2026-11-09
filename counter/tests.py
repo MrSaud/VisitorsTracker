@@ -39,6 +39,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 from . import camera as camera_module
+from . import secretkey
 from . import desktop
 from .camera import CounterWorker, is_file_source
 from .management.commands import build_app, export_model
@@ -4647,3 +4648,124 @@ class SpeedCheckTests(TestCase):
         call_command("check_setup", stdout=out, stderr=StringIO())
         self.assertNotIn("sustainable rate", out.getvalue(),
                          "a routine check should not spend a second detecting")
+
+
+class StaleLeaseTests(TestCase):
+    """A killed process must not lock its own camera out on restart.
+
+    SIGTERM and SIGKILL never run a finally block, so the lease outlives
+    the process. Waiting it out means 45 seconds of a desktop app that
+    will not count, right after somebody restarted it.
+    """
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.host = socket.gethostname()
+
+    def test_a_dead_local_process_is_recognised(self):
+        # A pid that cannot be running: 0 is never a real process here.
+        self.assertTrue(
+            camera_module.lease_looks_stale(f"{self.host}:999999999:abcd1234"))
+
+    def test_a_live_local_process_is_not(self):
+        self.assertFalse(
+            camera_module.lease_looks_stale(f"{self.host}:{os.getpid()}:abcd1234"))
+
+    def test_another_machine_is_never_judged(self):
+        # A pid on another host means nothing here, alive or not.
+        self.assertFalse(
+            camera_module.lease_looks_stale(f"some-other-box:1:abcd1234"))
+
+    def test_a_token_in_an_unknown_shape_is_left_alone(self):
+        for token in ("", None, "garbage", "a:b", "a:b:c:d"):
+            with self.subTest(token=token):
+                self.assertFalse(camera_module.lease_looks_stale(token))
+
+    def test_a_worker_takes_over_from_a_dead_process(self):
+        dead = f"{self.host}:999999999:abcd1234"
+        self.camera.claim_lease(dead)
+        worker = CounterWorker(self.camera)
+        self.assertTrue(worker._claim())
+        self.assertEqual(
+            Camera.objects.get(pk=self.camera.pk).lease_held_by(),
+            worker.lease_owner)
+
+    def test_a_worker_does_not_take_over_from_a_live_one(self):
+        self.camera.claim_lease(f"{self.host}:{os.getpid()}:other-worker")
+        worker = CounterWorker(self.camera)
+        self.assertFalse(worker._claim())
+        self.assertIn("Another process", worker.error)
+
+    def test_taking_over_is_conditional_on_the_holder(self):
+        # If the lease changed hands between the check and the write, the
+        # takeover must lose rather than stomp.
+        self.camera.claim_lease("first-holder")
+        Camera.objects.filter(pk=self.camera.pk).update(lease_owner="second-holder")
+        self.assertFalse(self.camera.take_lease_from("first-holder", "me"))
+        self.assertEqual(
+            Camera.objects.get(pk=self.camera.pk).lease_owner, "second-holder")
+
+
+class DesktopProductionDefaultsTests(TestCase):
+    """A double-clicked app has no shell, so it configures itself."""
+
+    def defaults(self, preset=None):
+        env = dict(preset or {})
+        with patch.dict(os.environ, env, clear=True):
+            desktop.production_defaults()
+            return dict(os.environ)
+
+    def test_debug_is_off_by_default(self):
+        self.assertEqual(self.defaults()["DJANGO_DEBUG"], "0")
+
+    def test_it_points_at_a_key_file_rather_than_inventing_one_each_run(self):
+        env = self.defaults()
+        self.assertTrue(env["DJANGO_SECRET_KEY_FILE"].endswith(".secret_key"))
+
+    def test_allowed_hosts_is_local_only(self):
+        hosts = self.defaults()["DJANGO_ALLOWED_HOSTS"]
+        self.assertIn("127.0.0.1", hosts)
+        self.assertNotIn("*", hosts)
+
+    def test_an_explicit_setting_still_wins(self):
+        env = self.defaults({"DJANGO_DEBUG": "1",
+                             "DJANGO_ALLOWED_HOSTS": "example.com"})
+        self.assertEqual(env["DJANGO_DEBUG"], "1")
+        self.assertEqual(env["DJANGO_ALLOWED_HOSTS"], "example.com")
+
+
+class SecretKeyFileTests(TestCase):
+    """The key has to survive a restart, or everyone is logged out."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = self.tmp / ".secret_key"
+
+    def test_it_is_created_once_and_reused(self):
+        first = secretkey.read_or_create(self.path)
+        self.assertEqual(secretkey.read_or_create(self.path), first)
+        self.assertGreaterEqual(len(first), secretkey.MINIMUM_LENGTH)
+
+    def test_it_is_not_world_readable(self):
+        secretkey.read_or_create(self.path)
+        mode = self.path.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600, f"mode was {oct(mode)}")
+
+    def test_a_truncated_file_is_replaced_rather_than_trusted(self):
+        # A short key weakens every signature. Refusing to start on it was
+        # the first attempt and it just made the app unlaunchable.
+        self.path.write_text("short")
+        key = secretkey.read_or_create(self.path)
+        self.assertGreaterEqual(len(key), secretkey.MINIMUM_LENGTH)
+        self.assertEqual(self.path.read_text().strip(), key)
+
+    def test_an_empty_file_is_replaced(self):
+        self.path.write_text("")
+        self.assertGreaterEqual(
+            len(secretkey.read_or_create(self.path)), secretkey.MINIMUM_LENGTH)
+
+    def test_it_creates_the_directory_if_needed(self):
+        nested = self.tmp / "a" / "b" / ".secret_key"
+        self.assertGreaterEqual(
+            len(secretkey.read_or_create(nested)), secretkey.MINIMUM_LENGTH)

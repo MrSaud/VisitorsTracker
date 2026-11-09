@@ -21,6 +21,15 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 DEV_SECRET_KEY = "django-insecure-j4v8%kvi*voz9@q*knnt-!o7#gg4%xzstk&1^!_^=2t8g*gug-"
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
 
+# An install with no environment to set a key in -- the double-clicked
+# desktop app -- points this at a file instead, which is created once and
+# then reused so sessions survive a restart. Opt-in on purpose: a server
+# that forgot its key should fail loudly, not invent one nobody has saved.
+if not SECRET_KEY and os.environ.get("DJANGO_SECRET_KEY_FILE"):
+    from counter.secretkey import read_or_create
+
+    SECRET_KEY = read_or_create(os.environ["DJANGO_SECRET_KEY_FILE"])
+
 if not SECRET_KEY:
     if DEBUG:
         SECRET_KEY = DEV_SECRET_KEY

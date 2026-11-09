@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -162,8 +163,31 @@ def shutdown(httpd=None, supervisor=None):
             httpd.server_close()
 
 
-def main(argv=None):
+def production_defaults():
+    """Run as a deployed app, not a development one.
+
+    A double-clicked app has no shell, no systemd unit and nobody to export
+    anything, so it has to configure itself. Every one of these is a
+    setdefault: a server or a developer that sets the variable still wins.
+
+    DEBUG is the one that matters. It serves a traceback containing settings
+    to anyone who can reach the port, and it makes Django keep the last
+    9000 queries in memory -- pointless for a process meant to run for
+    weeks. The app binds 127.0.0.1, so nobody else should reach it anyway;
+    this is the second lock, not the first.
+    """
+    project_dir = Path(__file__).resolve().parent.parent
+
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+    os.environ.setdefault("DJANGO_DEBUG", "0")
+    os.environ.setdefault("DJANGO_ALLOWED_HOSTS", f"{DEFAULT_HOST},localhost")
+    # Created once and reused, so a restart does not log the operator out.
+    os.environ.setdefault(
+        "DJANGO_SECRET_KEY_FILE", str(project_dir / ".secret_key"))
+
+
+def main(argv=None):
+    production_defaults()
 
     import django
 

@@ -113,6 +113,24 @@ class Camera(models.Model):
             self.lease_expires_at = expires
         return bool(renewed)
 
+    def take_lease_from(self, holder, owner, seconds=None, now=None) -> bool:
+        """Take a lease from a named holder, conditional on it still being theirs.
+
+        For the one case the caller can prove is safe: the holder is a
+        process on this machine that no longer exists. Still conditional on
+        the holder, so it cannot stomp a lease that changed hands in the
+        meantime.
+        """
+        seconds = LEASE_SECONDS if seconds is None else seconds
+        now = now or timezone.now()
+        expires = now + timedelta(seconds=seconds)
+        taken = Camera.objects.filter(pk=self.pk, lease_owner=holder).update(
+            lease_owner=owner, lease_expires_at=expires)
+        if taken:
+            self.lease_owner = owner
+            self.lease_expires_at = expires
+        return bool(taken)
+
     def release_lease(self, owner) -> bool:
         """Give it up, so another process need not wait for it to expire."""
         released = Camera.objects.filter(pk=self.pk, lease_owner=owner).update(

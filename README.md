@@ -315,6 +315,29 @@ a bigger machine, a higher `COUNTER_DETECT_EVERY`, or a lower
 
 Run it on the server **before** mounting a camera.
 
+### Running the desktop app in production
+
+The Mac app and the Windows launcher configure themselves, because a
+double-clicked app has no shell to export anything in:
+
+```
+DJANGO_DEBUG=0
+DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost
+DJANGO_SECRET_KEY_FILE=<project>/.secret_key
+```
+
+Each is a default, so a server or a developer that sets the variable still
+wins. The key file is created on first launch with mode 600 and reused after
+that: a fresh key every restart would log the operator out each time, and it
+is gitignored, so it never leaves the machine. It is replaced rather than
+trusted if it is ever truncated — a key under 50 characters weakens every
+signature made with it.
+
+`DEBUG=0` matters even on a localhost-only app: with it on, an error serves
+a traceback containing your settings to anyone who can reach the port, and
+Django keeps the last 9000 queries in memory for a process meant to run for
+weeks.
+
 ### Burstable instances are the wrong family
 
 A t2/t3/t4g instance earns CPU credits at a fixed rate and spends them when

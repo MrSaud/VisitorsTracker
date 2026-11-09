@@ -124,7 +124,10 @@ def windows_service_script(project_dir, python_path) -> str:
         "rem Headless counting for Task Scheduler. No window.\r\n"
         "set COUNTER_AUTOSTART=1\r\n"
         "set COUNTER_RECONNECT_ATTEMPTS=0\r\n"
-        "rem Set these for alerting, and DJANGO_DEBUG=0 in production.\r\n"
+        "set DJANGO_DEBUG=0\r\n"
+        "set DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost\r\n"
+        f'set DJANGO_SECRET_KEY_FILE={project_dir}\\.secret_key\r\n'
+        "rem Set these for alerting.\r\n"
         "rem set COUNTER_ALERTS_ENABLED=1\r\n"
         "rem set COUNTER_ALERT_WEBHOOK=https://...\r\n"
         f'cd /d "{project_dir}"\r\n'

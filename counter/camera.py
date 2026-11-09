@@ -80,6 +80,31 @@ def process_token() -> str:
 _PROCESS_TOKEN: str | None = None
 
 
+def lease_looks_stale(token) -> bool:
+    """Whether a lease belongs to a process that is no longer running.
+
+    Only decidable for leases taken on this machine, and only there is it
+    checked: a pid on another host means nothing here. A process killed
+    with SIGTERM or SIGKILL never gets to release its lease, so without
+    this a restart is refused by its own corpse until the lease expires --
+    45 seconds of a desktop app that will not count.
+    """
+    parts = str(token or "").split(":")
+    if len(parts) != 3:
+        return False
+    host, pid, _unique = parts
+    if host != socket.gethostname():
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError):
+        return True
+    except PermissionError:
+        # Alive, owned by somebody else.
+        return False
+    return False
+
+
 def capture_backends(source):
     """Capture backends to try for this source, best first.
 
@@ -248,6 +273,18 @@ class CounterWorker(threading.Thread):
             return True
 
         holder = camera.lease_held_by()
+
+        if lease_looks_stale(holder):
+            # The holder is a dead process on this machine. Take it over
+            # rather than wait out a lease nobody is using.
+            logger.warning(
+                "camera %s: taking over the lease from %s, which is gone",
+                self.camera_pk, holder)
+            if camera.take_lease_from(holder, self.lease_owner):
+                self._lease_renewed_at = time.monotonic()
+                return True
+            holder = camera.lease_held_by()
+
         self.error = (
             f"Another process is already counting this camera ({holder}). "
             f"Two would both write crossings and double the totals."

@@ -20,3 +20,4 @@ counter/ml_models/people.jpg
 
 # launchd writes here
 logs/
+.secret_key
