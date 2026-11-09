@@ -1,0 +1,20 @@
+# Nightly database backup. Paired with visitorstracker-backup.timer.
+#   sudo cp deploy/visitorstracker-backup.* /etc/systemd/system/
+#   sudo systemctl enable --now visitorstracker-backup.timer
+#   systemctl list-timers visitorstracker-backup
+[Unit]
+Description=Back up the VisitorsTracker database
+After=visitorstracker.service
+
+[Service]
+Type=oneshot
+User=visitorstracker
+Group=visitorstracker
+WorkingDirectory=/opt/visitorstracker
+EnvironmentFile=/etc/visitorstracker.env
+# Safe to run while the counter is writing: it uses SQLite's backup API,
+# not a file copy.
+ExecStart=/opt/visitorstracker/.venv/bin/python manage.py backup_db --keep 14
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=visitorstracker-backup

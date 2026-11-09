@@ -4507,3 +4507,88 @@ class WorkerRespectsTheLeaseTests(TestCase):
         with patch.object(camera_module, "_PROCESS_TOKEN", None):
             second = camera_module.process_token()
         self.assertNotEqual(first, second)
+
+
+class BackupCommandTests(TestCase):
+    """A copy of the database that is safe to take while it is being written."""
+
+    def setUp(self):
+        import sqlite3
+
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.into = self.tmp / "backups"
+
+        # A real file on disk: the test database is in memory, and the whole
+        # point of this command is copying a file safely.
+        self.db = self.tmp / "db.sqlite3"
+        con = sqlite3.connect(self.db)
+        con.execute("create table counter_camera (id integer primary key, name text)")
+        con.execute("insert into counter_camera (name) values ('Door')")
+        con.commit()
+        con.close()
+        self.databases_setting = {
+            "default": {"ENGINE": "django.db.backends.sqlite3",
+                        "NAME": str(self.db)}}
+
+    def backup(self, **extra):
+        out = StringIO()
+        with override_settings(DATABASES=self.databases_setting):
+            call_command("backup_db", into=str(self.into), stdout=out, **extra)
+        return out.getvalue()
+
+    def test_the_copy_is_a_valid_database_with_the_rows_in_it(self):
+        self.backup(no_compress=True)
+
+        copies = list(self.into.glob("*.sqlite3"))
+        self.assertEqual(len(copies), 1)
+
+        import sqlite3
+
+        con = sqlite3.connect(copies[0])
+        try:
+            self.assertEqual(
+                con.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            rows = con.execute("select count(*) from counter_camera").fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(rows, 1)
+
+    def test_an_in_memory_database_is_explained_not_just_refused(self):
+        memory = {"default": {"ENGINE": "django.db.backends.sqlite3",
+                              "NAME": ":memory:"}}
+        with override_settings(DATABASES=memory):
+            with self.assertRaises(CommandError) as caught:
+                call_command("backup_db", into=str(self.into), stdout=StringIO())
+        self.assertIn("in memory", str(caught.exception))
+
+    def test_it_compresses_by_default(self):
+        self.backup()
+        self.assertEqual(len(list(self.into.glob("*.gz"))), 1)
+        self.assertEqual(len(list(self.into.glob("*.sqlite3"))), 0,
+                         "the uncompressed copy should not be left behind")
+
+    def test_it_keeps_only_the_newest(self):
+        self.into.mkdir(parents=True, exist_ok=True)
+        for n in range(5):
+            (self.into / f"db-2026010{n}-000000.sqlite3.gz").write_bytes(b"old")
+        self.backup(keep=3)
+        remaining = sorted(p.name for p in self.into.iterdir())
+        self.assertEqual(len(remaining), 3)
+        self.assertNotIn("db-20260100-000000.sqlite3.gz", remaining,
+                         "the oldest should go first")
+
+    def test_keep_zero_prunes_nothing(self):
+        self.into.mkdir(parents=True, exist_ok=True)
+        (self.into / "db-20260101-000000.sqlite3.gz").write_bytes(b"old")
+        self.backup(keep=0)
+        self.assertEqual(len(list(self.into.iterdir())), 2)
+
+    def test_it_refuses_a_database_it_cannot_copy_this_way(self):
+        engines = {"default": {"ENGINE": "django.db.backends.postgresql",
+                               "NAME": "vt"}}
+        with override_settings(DATABASES=engines):
+            with self.assertRaises(CommandError) as caught:
+                call_command("backup_db", into=str(self.into), stdout=StringIO())
+        self.assertIn("pg_dump", str(caught.exception),
+                      "it should say what to use instead")

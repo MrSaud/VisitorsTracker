@@ -3,22 +3,50 @@
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 # The counting defaults live beside the code that measured them, so a
 # settings file cannot quietly disagree with them.
 from counter.vision import DEFAULT_COMMIT_FRACTION
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get(
-    "DJANGO_SECRET_KEY",
-    "django-insecure-j4v8%kvi*voz9@q*knnt-!o7#gg4%xzstk&1^!_^=2t8g*gug-",
-)
-
-# SECURITY WARNING: don't run with debug turned on in production!
+# DEBUG first: the other two defaults depend on it.
+#
+# On by default, because the common case is somebody running this on their
+# own machine to look at a camera. Every deployment artifact in deploy/ sets
+# DJANGO_DEBUG=0, and `manage.py check_setup` says so when it is on.
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 
-ALLOWED_HOSTS = ["*"]
+DEV_SECRET_KEY = "django-insecure-j4v8%kvi*voz9@q*knnt-!o7#gg4%xzstk&1^!_^=2t8g*gug-"
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
+
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = DEV_SECRET_KEY
+    else:
+        # Refuse rather than fall back. A shared key in a public repository
+        # signs session cookies and password-reset tokens for every install
+        # that has one, so a silent default is worse than not starting.
+        raise ImproperlyConfigured(
+            "DJANGO_SECRET_KEY must be set when DJANGO_DEBUG=0. Generate one:\n"
+            "  python -c \"from django.core.management.utils import "
+            "get_random_secret_key as k; print(k())\""
+        )
+
+# Comma-separated, e.g. "counter.example.com,10.0.1.14". Wide open while
+# DEBUG is on, because then it is somebody's laptop and the host varies.
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+] or (["*"] if DEBUG else [])
+
+if not DEBUG and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured(
+        "DJANGO_ALLOWED_HOSTS must list the hostnames this serves when "
+        "DJANGO_DEBUG=0, e.g. DJANGO_ALLOWED_HOSTS=counter.example.com"
+    )
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -43,7 +71,31 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True
+# Wide open in development; in production only what is named. The API is
+# read-open, so this is about which other sites may read it from a browser.
+CORS_ALLOW_ALL_ORIGINS = DEBUG and not os.environ.get("DJANGO_CORS_ORIGINS")
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("DJANGO_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
+# Behind nginx or an ALB, Django sees the proxy's own http:// connection.
+# Only trust the header when told to: believing it unconditionally lets a
+# client claim HTTPS and defeat the secure-cookie flags below.
+if os.environ.get("DJANGO_BEHIND_TLS_PROXY") == "1":
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_HSTS_SECONDS", "0"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = SECURE_HSTS_SECONDS > 0
+    SECURE_SSL_REDIRECT = os.environ.get("DJANGO_SSL_REDIRECT", "0") == "1"
+
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [

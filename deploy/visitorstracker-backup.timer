@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly VisitorsTracker database backup
+
+[Timer]
+# After midnight, when the daily occupancy figure has rolled over.
+OnCalendar=*-*-* 00:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,56 @@
+# systemd unit for VisitorsTracker on a Linux server (Amazon Linux, Ubuntu).
+#
+#   sudo cp deploy/visitorstracker.service /etc/systemd/system/
+#   sudo cp deploy/visitorstracker.env.example /etc/visitorstracker.env
+#   sudo chmod 600 /etc/visitorstracker.env   # it holds the secret key
+#   sudoedit /etc/visitorstracker.env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now visitorstracker
+#   systemctl status visitorstracker
+#
+# Edit User, Group and the two paths below to match the box.
+
+[Unit]
+Description=VisitorsTracker camera counting and dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=visitorstracker
+Group=visitorstracker
+WorkingDirectory=/opt/visitorstracker
+EnvironmentFile=/etc/visitorstracker.env
+
+ExecStartPre=/opt/visitorstracker/.venv/bin/python manage.py migrate --noinput
+ExecStart=/opt/visitorstracker/.venv/bin/gunicorn \
+    --config /opt/visitorstracker/deploy/gunicorn.conf.py \
+    config.wsgi:application
+
+# A counter that stays down after a wobble is not counting. Restart always,
+# but rate-limited, so a configuration mistake does not spin forever.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Counting is CPU-bound and this machine may be doing other things; keep it
+# from starving them. Raise the niceness if counting falls behind.
+Nice=5
+
+# The service needs its own directory and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/visitorstracker
+# Network cameras only. Drop this line if a USB camera is plugged into this
+# machine, since /dev access is needed to open it.
+PrivateDevices=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=visitorstracker
+
+[Install]
+WantedBy=multi-user.target

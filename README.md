@@ -258,6 +258,77 @@ choice is asserted, but "asserted" is not "works" — expect to iron something
 out on first run. `python manage.py build_app --target windows` on a Mac
 generates the files for inspection, with this machine's paths in them.
 
+## Deploying on a Linux server
+
+The server can only count cameras it can reach, so this shape assumes
+**network cameras** (RTSP/HTTP). A USB webcam plugged into a laptop is not
+visible to a server in another building; that needs the counting to run on
+the laptop, with the server doing dashboards only — which this does not
+support today.
+
+```bash
+sudo useradd --system --home /opt/visitorstracker visitorstracker
+sudo git clone <repo> /opt/visitorstracker && cd /opt/visitorstracker
+sudo -u visitorstracker python3.12 -m venv .venv
+sudo -u visitorstracker .venv/bin/pip install -r requirements.txt -r requirements-server.txt
+sudo -u visitorstracker .venv/bin/python manage.py export_model
+
+sudo cp deploy/visitorstracker.env.example /etc/visitorstracker.env
+sudo chmod 600 /etc/visitorstracker.env     # it holds the secret key
+sudoedit /etc/visitorstracker.env
+
+sudo cp deploy/visitorstracker.service deploy/visitorstracker-backup.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now visitorstracker visitorstracker-backup.timer
+
+sudo cp deploy/nginx-visitorstracker.conf /etc/nginx/conf.d/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Then, on the server: `python manage.py check_setup`.
+
+### One worker. Not for load — for correctness
+
+`deploy/gunicorn.conf.py` sets `workers = 1`, and raising it breaks counting.
+
+Camera workers are threads inside the web process, so each gunicorn worker
+process would start its own counter for the same camera. An RTSP stream
+serves them all happily, so nothing errors — the counts simply multiply.
+Measured, before cameras took a lease: **four processes over a clip
+containing 3 crossings recorded 12.**
+
+Cameras now take a **lease** (`lease_owner`, `lease_expires_at`), so a second
+process is refused rather than counting alongside the first. That stops the
+corruption, but extra workers still would not work: only the process holding
+the lease has a live camera, so the live view, the start/stop buttons and the
+health tiles would answer differently depending on which worker got the
+request. One process with many threads is the right shape here. The lease
+expires after 45 seconds, so a process that is killed does not strand its
+camera.
+
+### Settings refuse to start wrong
+
+With `DJANGO_DEBUG=0`, the app will not boot without `DJANGO_SECRET_KEY` or
+`DJANGO_ALLOWED_HOSTS`. A shared key in a public repository signs session
+cookies for every install that has one, so a silent fallback is worse than
+not starting. `DJANGO_BEHIND_TLS_PROXY=1` turns on secure cookies and lets
+Django see the real scheme; do not set it unless something really is
+terminating TLS, or a client could claim HTTPS itself. With that config
+`manage.py check --deploy` reports only the HSTS-preload warning, which is a
+deliberate opt-in.
+
+### Backups
+
+```bash
+python manage.py backup_db --keep 14
+```
+
+`visitorstracker-backup.timer` runs it nightly at 00:30, after the daily
+occupancy figure rolls over. It uses SQLite's own backup API rather than
+copying the file, because `cp` on a database that the counter is writing to
+can produce a copy that is subtly corrupt. Verified against the live
+database with a camera running: `PRAGMA integrity_check` returns `ok`.
+
 ## How counting works
 
 1. **Detect** — a YOLOv8 ONNX model when one is present, otherwise OpenCV's

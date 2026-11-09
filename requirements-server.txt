@@ -1,0 +1,4 @@
+# Extra dependencies for running this on a server.
+# Not needed on a laptop: `manage.py runserver` and the desktop app don't
+# use them.
+gunicorn>=23.0,<24
