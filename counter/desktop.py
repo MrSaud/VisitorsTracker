@@ -11,10 +11,11 @@ which is why the webcam launcher has to go through Terminal.app and why
 there is no way to add a plain script to Privacy & Security > Camera.
 Inside a bundle the app owns that permission under its own name.
 
-What it runs is the same server as always, still listening on
-127.0.0.1:8000, so a phone or another machine on the network still reaches
-the dashboard and the API. The window is a view onto it, not a replacement
-for it.
+What it runs is the same server as always, on 127.0.0.1:8000 -- which is
+this machine only. The window is a view onto a real HTTP server rather than
+a replacement for it, so pointing it at 0.0.0.0 would let a phone or a PC on
+the network open the same dashboard; it does not do that by default, because
+reads are unauthenticated and that would put them on the LAN.
 """
 
 from __future__ import annotations

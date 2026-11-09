@@ -87,9 +87,11 @@ What that gives:
   prompt — and without which it terminates the process instead of asking.
 - **A window**, via `pywebview`, rendering the same dashboard. No browser tab,
   no Terminal.
-- **The same server.** It still listens on `127.0.0.1:8000`, so a phone on the
-  network, the REST API and a second browser all still work. The window is a
-  view onto the server, not a replacement for it.
+- **The same server**, on `127.0.0.1:8000`. The window is a view onto a real
+  HTTP server, not a replacement for it, so a second browser on the same
+  machine and the REST API both still work. It is *not* reachable from
+  another device unless you bind `0.0.0.0` — see
+  [Viewing it from another machine](#viewing-it-from-another-machine).
 
 It carries `assets/AppIcon.icns` unless you pass `--icon` or `--no-icon`. To
 replace the artwork:
@@ -138,6 +140,37 @@ If a different interpreter layout ever shows *Python* in that pane, putting a
 framework interpreter inside `Contents/MacOS/` would pin the grant to the
 bundle. There is no way to read the attribution programmatically: the TCC
 database needs Full Disk Access, so that pane is the only place it is visible.
+
+### Viewing it from another machine
+
+The dashboard is a web page, so **any** device with a browser can display it —
+a Windows PC, a phone, a tablet — with nothing installed on that device. That
+has always been true and needs no port of anything.
+
+What is *not* portable that way is the counting. `cv2.VideoCapture(0)` opens a
+capture device attached to the machine it runs on, so the counting process has
+to run on whichever computer the camera is plugged into. That machine's
+operating system is the only one that matters.
+
+So:
+
+| Camera is plugged into | What you need |
+|---|---|
+| A Mac, viewed from Windows | Nothing Windows-specific. Bind `0.0.0.0` and open the Mac's address in a browser |
+| A Windows PC | The Windows launcher below — the counting runs there |
+
+By default the server listens on `127.0.0.1:8000`, which is the machine
+itself and nothing else. To let other devices reach it:
+
+```bash
+python manage.py runserver 0.0.0.0:8000 --noreload
+```
+
+Think before you do. **Reads are unauthenticated** — anyone who can reach the
+host can see the counts and the camera's live view. Writes need a staff
+session or the service token, so nobody can stop a camera or wipe history,
+but the video is open. Set `ALLOWED_HOSTS` to the real hostname and turn off
+`CORS_ALLOW_ALL_ORIGINS` at the same time.
 
 ### Windows
 
