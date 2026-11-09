@@ -9,16 +9,36 @@ crossings are attributed to it for as long as it runs. See [Events](#events).
 
 ## Setup
 
+macOS and Linux:
+
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
+```
+
+Windows:
+
+```bat
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+```
+
+Then, the same on both:
+
+```bash
 pip install -r requirements.txt
+python manage.py export_model
 python manage.py migrate
 python manage.py createsuperuser
 python manage.py runserver
 ```
 
 Then open http://127.0.0.1:8000/ for the dashboard.
+
+`export_model` downloads and converts the detector weights, which are not in
+the repository. Skip it and the counter still runs, but on the built-in HOG
+detector instead of YOLO — noticeably worse, with nothing on screen to say
+why. `manage.py check_setup` reports which one you ended up with.
 
 ## Adding a camera
 
@@ -225,6 +245,12 @@ Edit the paths in it first. It points at `VisitorsTracker-headless.bat`, which
 is what sets `COUNTER_AUTOSTART` — a scheduled task's `<Exec>` has nowhere to
 put environment variables, and without it the server starts but no camera
 does.
+
+Whichever machine the camera ends up on, `python manage.py check_setup` on
+that machine says whether it is ready — dependencies, which detector is
+actually loaded, migrations, the port, `DEBUG`, and the cameras. With
+`--cameras` it tries to open each one, which is the step that proves the
+permission is granted. Run it there before trusting a single count.
 
 **None of the Windows path has been run on Windows.** This project is
 developed on a Mac. The generated files are pinned by tests and the backend

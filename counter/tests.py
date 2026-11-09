@@ -11,6 +11,7 @@ import math
 import json
 import os
 import pathlib
+import platform
 import plistlib
 import shutil
 import socket
@@ -4347,3 +4348,63 @@ class ExportModelCommandTests(TestCase):
         self.assertNotIn("DJANGO_SETTINGS_MODULE", env)
         self.assertNotIn("COUNTER_AUTOSTART", env)
         self.assertIn("PATH", env, "it still needs a usable environment")
+
+
+class CheckSetupCommandTests(TestCase):
+    """One command that says whether a machine can run this.
+
+    Written for the quiet failures. A missing model does not stop anything,
+    it just counts worse; this has to be the thing that says so.
+    """
+
+    def run_check(self, **extra):
+        out, err = StringIO(), StringIO()
+        call_command("check_setup", stdout=out, stderr=err, **extra)
+        return out.getvalue()
+
+    def test_a_working_checkout_reports_the_real_detector(self):
+        if not resolve_model_path(settings.COUNTER_ONNX_MODEL).exists():
+            self.skipTest("no model exported in this checkout")
+        output = self.run_check()
+        self.assertIn("OnnxPersonDetector", output)
+        self.assertIn("migrations", output)
+
+    @override_settings(COUNTER_ONNX_MODEL="definitely_not_here.onnx")
+    def test_a_missing_model_is_called_out_not_passed_over(self):
+        output = self.run_check()
+        self.assertIn("definitely_not_here.onnx", output)
+        self.assertIn("export_model", output, "it must say how to fix it")
+        self.assertIn("not YOLO", output,
+                      "the HOG fallback is the quiet failure this is for")
+
+    @override_settings(COUNTER_ONNX_MODEL="definitely_not_here.onnx")
+    def test_it_checks_the_configured_model_not_the_default_one(self):
+        # The bug this guards: resolving the default name would report a
+        # healthy yolov8n.onnx while the counter loads something else.
+        self.assertNotIn("yolov8n.onnx (", self.run_check())
+
+    @override_settings(DEBUG=True)
+    def test_debug_being_on_is_a_warning(self):
+        output = self.run_check()
+        self.assertIn("DJANGO_DEBUG", output)
+        self.assertIn("tracebacks expose settings", output)
+
+    @override_settings(DEBUG=False)
+    def test_debug_off_is_not_mentioned(self):
+        self.assertNotIn("DJANGO_DEBUG", self.run_check())
+
+    def test_it_names_the_cameras_and_whether_they_are_active(self):
+        Camera.objects.create(name="Front door", source="0", is_active=True)
+        output = self.run_check()
+        self.assertIn("Front door", output)
+        self.assertIn("active", output)
+
+    def test_no_cameras_is_a_warning_with_a_way_forward(self):
+        Camera.objects.all().delete()
+        output = self.run_check()
+        self.assertIn("none", output)
+        self.assertIn("Adding a camera", output)
+
+    def test_it_reports_the_platform_it_is_run_on(self):
+        # The whole point is running it on the machine you are unsure about.
+        self.assertIn(platform.system(), self.run_check())
