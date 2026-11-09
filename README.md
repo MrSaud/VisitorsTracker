@@ -139,6 +139,58 @@ framework interpreter inside `Contents/MacOS/` would pin the grant to the
 bundle. There is no way to read the attribution programmatically: the TCC
 database needs Full Disk Access, so that pane is the only place it is visible.
 
+### Windows
+
+The counting engine is the same on both platforms — there are no
+`sys.platform` branches in it and no POSIX paths — so Windows needs only a
+launcher and an icon of its own:
+
+```bat
+pip install -r requirements.txt -r requirements-desktop.txt
+python manage.py build_app
+powershell -ExecutionPolicy Bypass -File dist\CreateShortcut.ps1
+```
+
+That writes `dist\VisitorsTracker.bat` and a `.lnk` shortcut carrying
+`assets\AppIcon.ico`. Drag the shortcut to the desktop or taskbar.
+
+Three differences from the Mac worth knowing:
+
+- **The launcher runs `pythonw.exe`, not `python.exe`.** With `python.exe` a
+  console window sits behind the app for as long as it runs, and closing it
+  kills the server.
+- **The icon is a different shape.** macOS 26+ masks app icons, so the
+  `.icns` is full bleed; Windows draws the `.ico` exactly as given, so that
+  one keeps its own rounded corners. `scripts/make_icon.py` writes both from
+  one source image.
+- **Camera permission is a system-wide toggle**, not a per-app grant. If the
+  camera will not open, check **Settings > Privacy & security > Camera** and
+  that *"Let desktop apps access your camera"* is on. None of the macOS
+  bundle-identity machinery applies.
+
+OpenCV's default capture backend on Windows is Media Foundation, which can
+take seconds to open a webcam and fails outright on some. The worker tries
+**DirectShow** first and keeps the default as a fallback. Network cameras are
+untouched by this — a URL always goes through FFmpeg.
+
+For unattended running, `deploy/visitorstracker-task.xml` is the Task
+Scheduler counterpart to the macOS LaunchAgent:
+
+```bat
+schtasks /create /tn VisitorsTracker /xml deploy\visitorstracker-task.xml
+```
+
+Edit the paths in it first. It points at `VisitorsTracker-headless.bat`, which
+is what sets `COUNTER_AUTOSTART` — a scheduled task's `<Exec>` has nowhere to
+put environment variables, and without it the server starts but no camera
+does.
+
+**None of the Windows path has been run on Windows.** This project is
+developed on a Mac. The generated files are pinned by tests and the backend
+choice is asserted, but "asserted" is not "works" — expect to iron something
+out on first run. `python manage.py build_app --target windows` on a Mac
+generates the files for inspection, with this machine's paths in them.
+
 ## How counting works
 
 1. **Detect** — a YOLOv8 ONNX model when one is present, otherwise OpenCV's

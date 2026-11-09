@@ -3,13 +3,17 @@
 
     python scripts/make_icon.py artwork.png
 
-Artwork for an app icon usually arrives as a rounded square with a margin
-and a drop shadow, which is wrong for macOS 26 and later: the system draws
-its own rounded container and places the icon inside it. A pre-rounded icon
-then shows as a rounded square inside a rounded square, shrunk and ringed in
-grey. So this fills the canvas edge to edge and lets the system do the
-rounding -- it crops the artwork's own corners away and extends the
-background into them, because cropping alone would leave them transparent.
+The two platforms want opposite things from the same artwork.
+
+macOS 26 and later draw their own rounded container and place the icon
+inside it, so a pre-rounded icon with a margin shows as a rounded square
+inside a rounded square, shrunk and ringed in grey. The .icns therefore
+bleeds to the edges and lets the system do the rounding -- the artwork's own
+corners are transparent, so the background is painted into them.
+
+Windows does no such masking: it draws the .ico exactly as given. Full-bleed
+artwork would read as a square tile among rounded neighbours, so the .ico
+keeps the artwork's own rounded corners and transparency.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from PIL import Image
 
 CANVAS = 1024
 SIZES = (16, 32, 128, 256, 512)
+ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
 
@@ -76,6 +81,44 @@ def full_bleed(art):
     return Image.fromarray(rgba, "RGBA")
 
 
+def rounded(art):
+    """The artwork as it came, square and centred, corners still transparent."""
+    x0, y0, x1, y1 = solid_bbox(art)
+    shape = art.crop((x0, y0, x1 + 1, y1 + 1))
+    side = max(shape.size)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.alpha_composite(shape, ((side - shape.width) // 2,
+                                   (side - shape.height) // 2))
+    return square.resize((CANVAS, CANVAS), Image.LANCZOS)
+
+
+def write_icns(master):
+    """macOS. Needs iconutil, so it is skipped elsewhere."""
+    if not shutil.which("iconutil"):
+        print("iconutil not found (not macOS): skipping AppIcon.icns")
+        return False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        iconset = Path(tmp) / "AppIcon.iconset"
+        iconset.mkdir()
+        for base in SIZES:
+            for scale in (1, 2):
+                px = base * scale
+                name = f"icon_{base}x{base}{'@2x' if scale == 2 else ''}.png"
+                master.resize((px, px), Image.LANCZOS).save(iconset / name)
+        subprocess.run(
+            ["iconutil", "-c", "icns", str(iconset),
+             "-o", str(ASSETS / "AppIcon.icns")],
+            check=True)
+    return True
+
+
+def write_ico(master):
+    """Windows. Pillow writes a multi-resolution .ico with no outside tool."""
+    master.save(ASSETS / "AppIcon.ico",
+                sizes=[(px, px) for px in ICO_SIZES])
+
+
 def main(argv):
     if len(argv) != 2:
         raise SystemExit(__doc__)
@@ -88,33 +131,27 @@ def main(argv):
     if art.width != art.height:
         print(f"warning: {source.name} is {art.width}x{art.height}, not square")
 
-    master = full_bleed(art)
     ASSETS.mkdir(exist_ok=True)
-    master.save(ASSETS / "AppIcon.png")
 
-    opaque = (np.array(master)[:, :, 3] > 250).mean()
-    print(f"{CANVAS}x{CANVAS}, {opaque*100:.0f}% opaque "
-          f"(full bleed; macOS rounds the corners itself)")
+    mac_master = full_bleed(art)
+    mac_master.save(ASSETS / "AppIcon.png")
+    opaque = (np.array(mac_master)[:, :, 3] > 250).mean()
+    print(f"macOS master: {CANVAS}x{CANVAS}, {opaque*100:.0f}% opaque "
+          "(full bleed; macOS rounds the corners itself)")
+    made_icns = write_icns(mac_master)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        iconset = Path(tmp) / "AppIcon.iconset"
-        iconset.mkdir()
-        for base in SIZES:
-            for scale in (1, 2):
-                px = base * scale
-                name = f"icon_{base}x{base}{'@2x' if scale == 2 else ''}.png"
-                master.resize((px, px), Image.LANCZOS).save(iconset / name)
+    win_master = rounded(art)
+    transparent = (np.array(win_master)[:, :, 3] <= 250).mean()
+    print(f"Windows master: {CANVAS}x{CANVAS}, {transparent*100:.0f}% "
+          "transparent (its own rounded corners; Windows does not mask)")
+    write_ico(win_master)
 
-        if not shutil.which("iconutil"):
-            raise SystemExit("iconutil not found; this needs macOS.")
-        subprocess.run(
-            ["iconutil", "-c", "icns", str(iconset),
-             "-o", str(ASSETS / "AppIcon.icns")],
-            check=True)
-
+    print()
     print(f"wrote {ASSETS / 'AppIcon.png'}")
-    print(f"wrote {ASSETS / 'AppIcon.icns'}")
-    print("\nRebuild the bundle to pick it up:  python manage.py build_app")
+    if made_icns:
+        print(f"wrote {ASSETS / 'AppIcon.icns'}")
+    print(f"wrote {ASSETS / 'AppIcon.ico'}")
+    print("\nRebuild the launcher to pick it up:  python manage.py build_app")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Windows Task Scheduler job: start counting at logon and keep it running.
+  The counterpart to deploy/com.visitorstracker.counter.plist on macOS.
+
+  Import it with:
+    schtasks /create /tn VisitorsTracker /xml deploy\visitorstracker-task.xml
+
+  It runs dist\VisitorsTracker-headless.bat, which `manage.py build_app`
+  generates. That batch file is what sets COUNTER_AUTOSTART -- a scheduled
+  task's <Exec> has nowhere to put environment variables, and without it the
+  server starts but no camera does.
+
+  Edit the two paths under <Exec> first: nothing substitutes them for you.
+  Use VisitorsTracker.bat instead when you want the window as well.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Counts visitors crossing a line in a camera's view.</Description>
+    <URI>\VisitorsTracker</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <!-- A counter that stops after three days is worse than useless. -->
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Path\To\VisitorsTracker\dist\VisitorsTracker-headless.bat</Command>
+      <WorkingDirectory>C:\Path\To\VisitorsTracker</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

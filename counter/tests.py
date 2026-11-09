@@ -4192,3 +4192,114 @@ class CameraPrivacyHintTests(TestCase):
 
     def test_linux_does_not_send_people_to_a_settings_app(self):
         self.assertIn("video", self.hint("linux"))
+
+
+class WindowsLauncherTests(TestCase):
+    """The Windows launcher, pinned by its text.
+
+    None of this is run on Windows -- the project is developed on a Mac --
+    so these assert what gets written, not that Windows likes it.
+    """
+
+    def test_it_uses_pythonw_so_no_console_window_is_left_behind(self):
+        script = build_app.windows_launcher_script(
+            r"C:\VT", r"C:\VT\.venv\Scripts\pythonw.exe")
+        self.assertIn("pythonw.exe", script)
+        self.assertIn("-m counter.desktop", script)
+        self.assertIn('start ""', script,
+                      "without start the batch file blocks until the app exits")
+
+    def test_batch_files_use_crlf(self):
+        # A .bat with bare LF can fail in ways that are hard to see.
+        script = build_app.windows_launcher_script(r"C:\VT", r"C:\py.exe")
+        self.assertNotIn("\n", script.replace("\r\n", ""))
+
+    def test_the_path_is_quoted_so_program_files_works(self):
+        script = build_app.windows_launcher_script(
+            r"C:\Program Files\VT", r"C:\Program Files\VT\pythonw.exe")
+        self.assertIn(r'cd /d "C:\Program Files\VT"', script)
+
+    def test_the_headless_launcher_turns_autostart_on(self):
+        # Task Scheduler cannot set environment variables, so if the batch
+        # file does not, the server starts and no camera does.
+        script = build_app.windows_service_script(r"C:\VT", r"C:\VT\python.exe")
+        self.assertIn("set COUNTER_AUTOSTART=1", script)
+        self.assertIn("runserver", script)
+        self.assertNotIn("pythonw", script,
+                         "headless wants the real console interpreter")
+
+    def test_the_shortcut_carries_the_icon(self):
+        script = build_app.shortcut_script(
+            r"C:\out\VT.lnk", r"C:\out\VT.bat", r"C:\VT\assets\AppIcon.ico",
+            r"C:\VT")
+        self.assertIn("WScript.Shell", script)
+        self.assertIn(r'$link.IconLocation = "C:\VT\assets\AppIcon.ico"', script)
+        self.assertIn("$link.Save()", script)
+
+    def test_a_shortcut_without_an_icon_omits_the_line(self):
+        script = build_app.shortcut_script(r"C:\a.lnk", r"C:\a.bat", None, r"C:\VT")
+        self.assertNotIn("IconLocation", script)
+
+
+class BuildTargetTests(TestCase):
+    """Which launcher gets built, and with which icon."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.out = pathlib.Path(self.tmp) / "out"
+
+    def build(self, **extra):
+        out = StringIO()
+        call_command("build_app", output=str(self.out), stdout=out,
+                     stderr=StringIO(), **extra)
+        return out.getvalue()
+
+    def test_windows_writes_the_batch_files_not_a_bundle(self):
+        self.build(target="windows", python=str(pathlib.Path(self.tmp) / "py.exe"))
+        self.assertTrue((self.out / "VisitorsTracker.bat").exists())
+        self.assertTrue((self.out / "VisitorsTracker-headless.bat").exists())
+        self.assertTrue((self.out / "CreateShortcut.ps1").exists())
+        self.assertFalse((self.out / "VisitorsTracker.app").exists())
+
+    def test_windows_defaults_to_the_ico_not_the_icns(self):
+        shipped = pathlib.Path(settings.BASE_DIR) / build_app.DEFAULT_ICONS["windows"]
+        if not shipped.exists():
+            self.skipTest("assets/AppIcon.ico is not in this checkout")
+        self.build(target="windows", python=str(pathlib.Path(self.tmp) / "py.exe"))
+        script = (self.out / "CreateShortcut.ps1").read_text()
+        self.assertIn("AppIcon.ico", script)
+        self.assertNotIn("AppIcon.icns", script,
+                         "an .icns means nothing to Windows")
+
+    def test_cross_generating_says_it_is_only_for_inspection(self):
+        errors = StringIO()
+        call_command("build_app", target="windows", output=str(self.out),
+                     python=str(pathlib.Path(self.tmp) / "py.exe"),
+                     stdout=StringIO(), stderr=errors)
+        self.assertIn("inspection only", errors.getvalue())
+
+    def test_a_missing_interpreter_is_only_fatal_for_this_machine(self):
+        # Cross-generating cannot check a path that lives on another OS.
+        self.build(target="windows", python=r"C:\nope\pythonw.exe")
+        self.assertTrue((self.out / "VisitorsTracker.bat").exists())
+
+
+class WindowsIconTests(TestCase):
+    """Windows draws the .ico as given; it does not mask it."""
+
+    def test_the_ico_keeps_its_own_rounded_corners(self):
+        ico = pathlib.Path(settings.BASE_DIR) / "assets" / "AppIcon.ico"
+        if not ico.exists():
+            self.skipTest("assets/AppIcon.ico is not in this checkout")
+
+        from PIL import Image
+
+        image = Image.open(ico)
+        image.size = (256, 256)
+        corners = image.convert("RGBA")
+        alpha = np.array(corners)[:, :, 3]
+        # Unlike the macOS master, this one must NOT be full bleed, or it
+        # shows as a square tile among rounded neighbours.
+        self.assertLess(alpha[0, 0], 128, "the top-left corner should be clear")
+        self.assertGreater(alpha[128, 128], 250, "the middle should be solid")
