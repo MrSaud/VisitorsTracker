@@ -4130,3 +4130,65 @@ class ShippedIconTests(TestCase):
             f"{transparent:.1%} of the icon is transparent; macOS would draw "
             "its own container around it and the result is a rounded square "
             "inside a rounded square")
+
+
+# ---------------------------------------------------------------------------
+# running somewhere other than a Mac
+# ---------------------------------------------------------------------------
+
+class CaptureBackendTests(TestCase):
+    """OpenCV's default backend is not the right one everywhere.
+
+    These assert the choice on platforms this project is not tested on, so
+    the Windows path is at least pinned rather than assumed.
+    """
+
+    def backends(self, platform, source=0):
+        with patch.object(camera_module.sys, "platform", platform):
+            return camera_module.capture_backends(source)
+
+    def test_windows_prefers_directshow_over_media_foundation(self):
+        order = self.backends("win32")
+        self.assertEqual(order[0], cv2.CAP_DSHOW)
+        self.assertIn(cv2.CAP_MSMF, order)
+        self.assertEqual(order[-1], cv2.CAP_ANY,
+                         "the default must stay as a last resort")
+
+    def test_linux_prefers_v4l2(self):
+        self.assertEqual(self.backends("linux")[0], cv2.CAP_V4L2)
+
+    def test_macos_is_left_on_the_default(self):
+        self.assertEqual(self.backends("darwin"), [cv2.CAP_ANY])
+
+    def test_a_url_never_gets_a_camera_backend(self):
+        # DirectShow cannot open RTSP; naming it would break network cameras.
+        for platform in ("win32", "linux", "darwin"):
+            with self.subTest(platform=platform):
+                self.assertEqual(
+                    self.backends(platform, "rtsp://cam/stream"), [cv2.CAP_ANY])
+
+    def test_a_file_never_gets_a_camera_backend(self):
+        self.assertEqual(self.backends("win32", "/clips/door.mp4"), [cv2.CAP_ANY])
+
+
+class CameraPrivacyHintTests(TestCase):
+    """The advice has to name the right place on the right system."""
+
+    def hint(self, platform):
+        with patch.object(camera_module.sys, "platform", platform):
+            worker = CounterWorker(Camera.objects.create(name="D", source="0"))
+            return worker._open_hint()
+
+    def test_windows_points_at_windows_settings(self):
+        hint = self.hint("win32")
+        self.assertIn("Privacy & security", hint)
+        self.assertIn("desktop apps", hint)
+        self.assertNotIn("System Settings", hint,
+                         "that is the macOS pane, on Windows")
+
+    def test_macos_points_at_system_settings(self):
+        self.assertIn("System Settings > Privacy & Security > Camera",
+                      self.hint("darwin"))
+
+    def test_linux_does_not_send_people_to_a_settings_app(self):
+        self.assertIn("video", self.hint("linux"))

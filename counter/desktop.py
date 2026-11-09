@@ -1,15 +1,20 @@
-"""Run VisitorsTracker as a desktop window on macOS.
+"""Run VisitorsTracker as a desktop window.
 
-The bundle is not cosmetic. macOS grants camera access to the *application*
-that asks for it, and a Python process started from a shell has no
-application of its own -- the permission lands on whoever ran it, which is
-why the webcam launcher has to go through Terminal.app and why there is no
-way to add a plain script to Privacy & Security > Camera.
+Nothing here is platform-specific: pywebview uses WebKit on macOS and the
+Edge WebView2 runtime on Windows, and the server underneath is the same one
+on both. ``manage.py build_app`` wraps this in a macOS .app bundle.
 
-Inside a bundle the app owns that permission under its own name. What it
-runs is the same server as always, still listening on 127.0.0.1:8000, so a
-phone or another machine on the network still reaches the dashboard and the
-API. The window is a view onto it, not a replacement for it.
+On macOS the bundle is not cosmetic. macOS grants camera access to the
+*application* that asks for it, and a Python process started from a shell
+has no application of its own -- the permission lands on whoever ran it,
+which is why the webcam launcher has to go through Terminal.app and why
+there is no way to add a plain script to Privacy & Security > Camera.
+Inside a bundle the app owns that permission under its own name.
+
+What it runs is the same server as always, still listening on
+127.0.0.1:8000, so a phone or another machine on the network still reaches
+the dashboard and the API. The window is a view onto it, not a replacement
+for it.
 """
 
 from __future__ import annotations

@@ -10,6 +10,7 @@ tabs can watch one camera.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 
@@ -58,6 +59,38 @@ def is_file_source(source) -> bool:
     if isinstance(source, int):
         return False
     return "://" not in str(source)
+
+
+def capture_backends(source):
+    """Capture backends to try for this source, best first.
+
+    OpenCV's default differs by platform and the default is not always the
+    one that works. On Windows it is Media Foundation, which can take
+    several seconds to open a webcam and fails outright on some of them,
+    while DirectShow opens immediately -- so Windows gets an explicit order
+    with the default kept as a last resort. A URL or a file is left alone:
+    those go through FFmpeg, and naming a camera backend would break them.
+
+    macOS is deliberately left on the default. AVFoundation is already what
+    it picks, and this is the platform the project is tested on.
+    """
+    if not isinstance(source, int):
+        return [cv2.CAP_ANY]
+    if sys.platform.startswith("win"):
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    if sys.platform.startswith("linux"):
+        return [cv2.CAP_V4L2, cv2.CAP_ANY]
+    return [cv2.CAP_ANY]
+
+
+def camera_privacy_location() -> str:
+    """Where this platform keeps the camera permission, by name."""
+    if sys.platform.startswith("win"):
+        return ("Settings > Privacy & security > Camera, with "
+                "\"Let desktop apps access your camera\" turned on")
+    if sys.platform.startswith("linux"):
+        return "your user's access to the video device (often the 'video' group)"
+    return "System Settings > Privacy & Security > Camera"
 
 
 class CounterWorker(threading.Thread):
@@ -222,11 +255,12 @@ class CounterWorker(threading.Thread):
 
     def _open(self):
         """Open the source, or record why it could not be opened."""
-        capture = cv2.VideoCapture(self.source)
-        if capture.isOpened():
-            return capture
-
-        capture.release()
+        for backend in capture_backends(self.source):
+            capture = (cv2.VideoCapture(self.source) if backend == cv2.CAP_ANY
+                       else cv2.VideoCapture(self.source, backend))
+            if capture.isOpened():
+                return capture
+            capture.release()
         self.error = (
             f"Could not open video source {self.source!r}. " + self._open_hint()
         )
@@ -237,9 +271,9 @@ class CounterWorker(threading.Thread):
         """Advice that fits the kind of source, rather than all of them."""
         if isinstance(self.source, int):
             return (
-                "Check that the process running this has camera access in "
-                "System Settings > Privacy & Security > Camera, and that no "
-                "other app is holding the device."
+                f"Check that the process running this has camera access in "
+                f"{camera_privacy_location()}, and that no other app is "
+                f"holding the device."
             )
         if self.is_file:
             return "Check that the file exists and is a format OpenCV can read."
