@@ -9,8 +9,8 @@
 ## Exporting a model
 
 ```bash
-./scripts/export_yolo.sh          # yolov8n, the default
-./scripts/export_yolo.sh yolov8s  # more accurate, slower
+python manage.py export_model          # yolov8n, the default
+python manage.py export_model yolov8s  # more accurate, slower
 ```
 
 The script builds a temporary venv for `ultralytics` + `torch` and throws it
@@ -30,4 +30,4 @@ export COUNTER_ONNX_MODEL=yolov8s.onnx
 - A missing or corrupt model never takes the cameras down: the loader logs a
   warning and falls back to HOG.
 - `people.jpg`, if present, is a local fixture for the detection test and is
-  also gitignored. `scripts/export_yolo.sh` does not fetch it.
+  also gitignored. `manage.py export_model` does not fetch it.

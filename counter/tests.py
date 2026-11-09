@@ -40,7 +40,7 @@ from django.utils import timezone
 from . import camera as camera_module
 from . import desktop
 from .camera import CounterWorker, is_file_source
-from .management.commands import build_app
+from .management.commands import build_app, export_model
 from .supervisor import (
     NO_AUTOSTART_COMMANDS,
     Supervisor,
@@ -4303,3 +4303,47 @@ class WindowsIconTests(TestCase):
         # shows as a square tile among rounded neighbours.
         self.assertLess(alpha[0, 0], 128, "the top-left corner should be clear")
         self.assertGreater(alpha[128, 128], 250, "the middle should be solid")
+
+
+class ExportModelCommandTests(TestCase):
+    """Getting the detector onto a machine that has just cloned this.
+
+    The model is gitignored, so a fresh checkout has none and `auto`
+    quietly falls back to HOG. The command that produces it used to be a
+    bash script, which meant Windows had no way to get one at all.
+    """
+
+    def test_the_venv_interpreter_path_is_right_per_platform(self):
+        with patch.object(export_model.sys, "platform", "win32"):
+            self.assertEqual(
+                export_model.venv_python(pathlib.Path("/w/venv")).name,
+                "python.exe")
+            self.assertIn(
+                "Scripts",
+                str(export_model.venv_python(pathlib.Path("/w/venv"))))
+        with patch.object(export_model.sys, "platform", "darwin"):
+            path = export_model.venv_python(pathlib.Path("/w/venv"))
+            self.assertEqual(path.name, "python")
+            self.assertIn("bin", str(path))
+
+    def test_a_checkpoint_name_cannot_be_a_path_or_a_flag(self):
+        for bad in ("../../etc/passwd", "a/b", r"a\b", "--upgrade", ""):
+            with self.subTest(name=bad):
+                with self.assertRaises(CommandError):
+                    call_command("export_model", bad, stdout=StringIO())
+
+    def test_a_missing_interpreter_is_refused_before_any_work(self):
+        with self.assertRaises(CommandError):
+            call_command("export_model", python="/nowhere/python",
+                         stdout=StringIO())
+
+    def test_the_build_environment_does_not_inherit_project_settings(self):
+        # Ultralytics should not see DJANGO_SETTINGS_MODULE or COUNTER_*:
+        # it is a separate program that happens to run from here.
+        with patch.dict(os.environ, {"DJANGO_SETTINGS_MODULE": "config.settings",
+                                     "COUNTER_AUTOSTART": "1",
+                                     "PATH": "/usr/bin"}):
+            env = export_model.Command.clean_env()
+        self.assertNotIn("DJANGO_SETTINGS_MODULE", env)
+        self.assertNotIn("COUNTER_AUTOSTART", env)
+        self.assertIn("PATH", env, "it still needs a usable environment")

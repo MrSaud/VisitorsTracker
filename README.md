@@ -147,9 +147,17 @@ launcher and an icon of its own:
 
 ```bat
 pip install -r requirements.txt -r requirements-desktop.txt
+python manage.py export_model
+python manage.py migrate
 python manage.py build_app
 powershell -ExecutionPolicy Bypass -File dist\CreateShortcut.ps1
 ```
+
+`export_model` is not optional. The detector weights are gitignored, so a
+fresh clone has none and `COUNTER_DETECTOR=auto` quietly falls back to HOG —
+the cameras run and the counts get much worse, with nothing on screen to say
+why. Every dependency has a Windows wheel, including the pinned OpenCV
+(`cp37-abi3-win_amd64`).
 
 That writes `dist\VisitorsTracker.bat` and a `.lnk` shortcut carrying
 `assets\AppIcon.ico`. Drag the shortcut to the desktop or taskbar.
@@ -271,8 +279,8 @@ tracking fills the gaps, which is what makes CPU-only operation workable.
 in `counter/ml_models/`, and falls back to HOG otherwise. Export one with:
 
 ```bash
-./scripts/export_yolo.sh            # yolov8n
-./scripts/export_yolo.sh yolov8s    # more accurate, slower
+python manage.py export_model            # yolov8n
+python manage.py export_model yolov8s    # more accurate, slower
 ```
 
 `ultralytics` and `torch` are needed only to *export*; the script builds a
