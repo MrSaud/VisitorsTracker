@@ -4385,10 +4385,14 @@ class CheckSetupCommandTests(TestCase):
         self.assertNotIn("yolov8n.onnx (", self.run_check())
 
     @override_settings(DEBUG=True)
-    def test_debug_being_on_is_a_warning(self):
+    def test_debug_being_on_is_a_warning_scoped_to_this_command(self):
+        # It reports how this process was started, not the server's
+        # setting; saying otherwise is a false alarm about an app that
+        # configures itself correctly.
         output = self.run_check()
         self.assertIn("DJANGO_DEBUG", output)
-        self.assertIn("tracebacks expose settings", output)
+        self.assertIn("for this command", output)
+        self.assertIn("desktop app sets it to 0", output)
 
     @override_settings(DEBUG=False)
     def test_debug_off_is_not_mentioned(self):

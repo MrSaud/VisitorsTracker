@@ -239,9 +239,15 @@ class Command(BaseCommand):
                         "stop it, or set COUNTER_DESKTOP_PORT")
 
         if settings.DEBUG:
-            self.report(WARN, "DJANGO_DEBUG", "on",
-                        "set DJANGO_DEBUG=0 before anyone else can reach this: "
-                        "tracebacks expose settings")
+            # This reflects how *this* command was started, not the server.
+            # The desktop app sets DJANGO_DEBUG=0 for itself, so running
+            # `manage.py check_setup` in a shell beside it reports on the
+            # shell. Say so, rather than raise a false alarm about an app
+            # that is already configured correctly.
+            self.report(WARN, "DJANGO_DEBUG", "on for this command",
+                        "fine for a shell. The desktop app sets it to 0 "
+                        "itself; a server sets it in its environment file. "
+                        "Check the server's own value before worrying")
 
     def check_cameras(self, open_them=False):
         from counter.models import Camera
