@@ -23,11 +23,19 @@ one, and export_model builds a throwaway environment with torch in it,
 which is not something to do on a customer's machine.
 """
 
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules
 
 PROJECT = Path(SPECPATH)
+
+# collect_submodules imports the package to walk it, and it runs now --
+# while the spec is being evaluated -- not inside Analysis, so pathex has
+# not been applied yet. Without this it quietly returns an empty list and
+# the build succeeds while bundling none of the modules below.
+if str(PROJECT) not in sys.path:
+    sys.path.insert(0, str(PROJECT))
 
 datas = [
     (str(PROJECT / "counter" / "templates"), "counter/templates"),
@@ -39,9 +47,16 @@ model_dir = PROJECT / "counter" / "ml_models"
 for model in model_dir.glob("*.onnx"):
     datas.append((str(model), "counter/ml_models"))
 
+# Django is configured almost entirely by strings: INSTALLED_APPS,
+# MIDDLEWARE, the database ENGINE, the DRF authentication and permission
+# classes, the password validators. Nothing imports any of them, so
+# PyInstaller's analysis cannot see them and the build succeeds without
+# them. Each one is a crash on startup, discovered one at a time.
+STRING_REFERENCED = ("config", "counter", "corsheaders", "rest_framework")
+
 hiddenimports = (
-    collect_submodules("counter.management.commands")
-    + collect_submodules("counter.migrations")
+    [name for package in STRING_REFERENCED
+     for name in collect_submodules(package)]
     + [
         "django.contrib.admin.apps",
         "django.contrib.auth.apps",
@@ -56,8 +71,17 @@ hiddenimports = (
     ]
 )
 
+for package in STRING_REFERENCED:
+    if not collect_submodules(package):
+        raise SystemExit(
+            f"collect_submodules found nothing for {package!r}. The build "
+            f"would succeed and then die with ModuleNotFoundError. Run "
+            f"pyinstaller from {PROJECT} with its virtualenv active.")
+
 a = Analysis(
-    ["counter/desktop.py"],
+    # app_main.py, not counter/desktop.py: the entry script runs as
+    # __main__, and counter.desktop uses relative imports.
+    ["app_main.py"],
     pathex=[str(PROJECT)],
     binaries=[],
     datas=datas,

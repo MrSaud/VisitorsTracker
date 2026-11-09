@@ -4842,10 +4842,14 @@ class SpecFileTests(TestCase):
         self.text = self.spec.read_text()
 
     def test_it_collects_what_django_discovers_by_filesystem(self):
-        # Nothing imports these, so nothing traces them either.
-        self.assertIn("counter.management.commands", self.text)
-        self.assertIn("counter.migrations", self.text)
+        # Nothing imports these, so nothing traces them either. The
+        # submodule collection covers the whole counter package, which
+        # includes management commands and migrations.
+        self.assertIn("STRING_REFERENCED", self.text)
+        for package in ("config", "counter", "corsheaders", "rest_framework"):
+            self.assertIn(f'"{package}"', self.text)
         self.assertIn("counter/templates", self.text)
+        self.assertIn("counter/migrations", self.text)
 
     def test_it_bundles_the_detector(self):
         # Otherwise the exe runs on HOG and counts badly, quietly.
@@ -4861,3 +4865,68 @@ class SpecFileTests(TestCase):
     def test_it_builds_a_windowed_app_with_the_icon(self):
         self.assertIn("console=False", self.text)
         self.assertIn("AppIcon.ico", self.text)
+
+
+class FrozenEntryPointTests(TestCase):
+    """PyInstaller runs its entry script as __main__, not as a module.
+
+    counter/desktop.py uses relative imports, so pointing the build at it
+    produced "attempted relative import with no known parent package" after
+    the app had already started, migrated and opened its port.
+    """
+
+    def test_there_is_an_entry_script_that_only_imports(self):
+        entry = pathlib.Path(settings.BASE_DIR) / "app_main.py"
+        self.assertTrue(entry.exists())
+        text = entry.read_text()
+        self.assertIn("from counter.desktop import main", text)
+        # Code only -- the docstring explains relative imports, so a plain
+        # substring check matches its own explanation.
+        code = [line for line in text.splitlines()
+                if line.startswith(("from ", "import "))]
+        self.assertFalse([line for line in code if line.startswith("from .")],
+                         "an entry script runs as __main__ and has no package")
+
+    def test_the_spec_builds_the_entry_script_not_the_module(self):
+        spec = pathlib.Path(settings.BASE_DIR) / "VisitorsTracker.spec"
+        if not spec.exists():
+            self.skipTest("no spec in this checkout")
+        text = spec.read_text()
+        self.assertIn('["app_main.py"]', text)
+        self.assertNotIn('["counter/desktop.py"]', text)
+
+    def test_the_spec_puts_the_project_on_sys_path_before_collecting(self):
+        # collect_submodules imports to walk, and runs while the spec is
+        # evaluated -- before pathex applies. Without this it returns
+        # nothing, the build succeeds, and the app dies on startup.
+        spec = pathlib.Path(settings.BASE_DIR) / "VisitorsTracker.spec"
+        if not spec.exists():
+            self.skipTest("no spec in this checkout")
+        text = spec.read_text()
+        self.assertIn("sys.path.insert", text)
+        self.assertLess(text.index("sys.path.insert"),
+                        text.index("STRING_REFERENCED"),
+                        "the path has to be set before anything is collected")
+
+    def test_the_spec_refuses_to_build_an_empty_bundle(self):
+        spec = pathlib.Path(settings.BASE_DIR) / "VisitorsTracker.spec"
+        if not spec.exists():
+            self.skipTest("no spec in this checkout")
+        self.assertIn("raise SystemExit", spec.read_text())
+
+
+class CrashLoggingTests(TestCase):
+    """A windowed build has no stderr, so a crash has to be written down."""
+
+    def test_uncaught_exceptions_are_logged_before_the_process_dies(self):
+        source = pathlib.Path(settings.BASE_DIR) / "counter" / "desktop.py"
+        text = source.read_text()
+        self.assertIn("sys.excepthook", text)
+        self.assertIn("threading.excepthook", text,
+                      "a camera worker dying must not be silent either")
+
+    def test_it_logs_where_the_data_went(self):
+        # The first frozen run left an empty log file and no clue; the
+        # startup line at least says which directory to look in.
+        text = (pathlib.Path(settings.BASE_DIR) / "counter" / "desktop.py").read_text()
+        self.assertIn("VisitorsTracker starting, data directory", text)

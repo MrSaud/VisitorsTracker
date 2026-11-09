@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -211,6 +212,25 @@ def start_logging(data_dir):
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.addHandler(handler)
+
+    # The crash is the case this log exists for, and it is the one case
+    # plain logging misses: an uncaught exception goes to stderr, and a
+    # windowed build has no stderr. Without this the app dies leaving an
+    # empty log file, which is what it did the first time it was frozen.
+    def log_and_die(kind, value, traceback):
+        root.critical("unhandled exception", exc_info=(kind, value, traceback))
+        sys.__excepthook__(kind, value, traceback)
+
+    sys.excepthook = log_and_die
+
+    # Threads get their own hook; a camera worker dying must not be silent.
+    def log_thread_death(args):
+        root.critical("unhandled exception in %s", args.thread_name,
+                      exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    threading.excepthook = log_thread_death
+
+    root.info("VisitorsTracker starting, data directory %s", data_dir)
     return handler.baseFilename
 
 

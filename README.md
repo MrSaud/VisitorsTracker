@@ -267,8 +267,24 @@ python manage.py export_model
 pyinstaller VisitorsTracker.spec
 ```
 
-The result is `dist\VisitorsTracker.exe`, several hundred MB, which runs by
-double-click with nothing installed.
+The result is `dist\VisitorsTracker.exe` — about 80MB on macOS, expect
+similar on Windows — which runs by double-click with nothing installed.
+
+The spec was validated by actually freezing the app on a Mac and running
+it: the binary is useless on Windows, but every problem below is
+platform-independent and each one was a silent failure found that way.
+
+| What broke | Why |
+|---|---|
+| `collect_submodules` returned nothing | It imports packages to walk them, and runs while the spec is evaluated — before `pathex` applies. The build succeeded and bundled none of them. The spec now puts the project on `sys.path` first and **refuses to build** if a collection comes back empty |
+| `No module named 'config.settings'` | Named only by a string in an environment variable |
+| `No module named 'corsheaders.middleware'` | Django is configured almost entirely by strings: `INSTALLED_APPS`, `MIDDLEWARE`, the database `ENGINE`, the DRF classes. None is traceable |
+| `attempted relative import with no known parent package` | PyInstaller runs its entry script as `__main__`, so `counter/desktop.py`'s relative imports fail. `app_main.py` exists to be that script |
+
+After those, a frozen build starts, migrates, serves the dashboard and
+reports `status: ok`. The first three were invisible until the app also
+logged uncaught exceptions — a windowed build has no stderr, so the very
+first attempt died leaving an empty log file and no clue.
 
 Three things the spec has to be told, because Django finds them by scanning
 the filesystem rather than importing them, so PyInstaller never sees them:
