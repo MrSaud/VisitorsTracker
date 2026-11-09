@@ -26,7 +26,7 @@ which is not something to do on a customer's machine.
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 PROJECT = Path(SPECPATH)
 
@@ -41,6 +41,15 @@ datas = [
     (str(PROJECT / "counter" / "templates"), "counter/templates"),
     (str(PROJECT / "counter" / "migrations"), "counter/migrations"),
 ]
+
+# The admin's CSS. Django serves static files itself only while DEBUG is
+# on, and this app turns DEBUG off, so it serves them through the
+# staticfiles finders instead -- which read from the app directories, and
+# those have to be in the bundle. Without this the admin loads with no
+# styling at all.
+datas += collect_data_files("django.contrib.admin")
+datas += collect_data_files("django.contrib.auth")
+datas += collect_data_files("rest_framework")
 
 # The detector. Without it the app runs on HOG and counts badly, quietly.
 model_dir = PROJECT / "counter" / "ml_models"

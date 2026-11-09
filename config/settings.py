@@ -172,6 +172,18 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
+STATIC_ROOT = DATA_DIR / "staticfiles"
+
+# Who serves /static/.
+#
+# Django only serves static files itself while DEBUG is on, and the
+# desktop app deliberately turns DEBUG off -- which left the admin with no
+# CSS at all, because nothing else was serving them either. There is no
+# web server in front of a double-clicked app, so it has to do it.
+#
+# Set COUNTER_SERVE_STATIC=0 where nginx or a CDN serves them instead;
+# nginx would normally intercept /static/ before Django sees it anyway.
+COUNTER_SERVE_STATIC = os.environ.get("COUNTER_SERVE_STATIC", "1") == "1"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 

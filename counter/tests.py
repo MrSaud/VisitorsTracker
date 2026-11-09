@@ -13,6 +13,7 @@ import os
 import pathlib
 import platform
 import plistlib
+import re
 import shutil
 import socket
 import sys
@@ -4996,3 +4997,60 @@ class FrozenManagementCommandTests(TestCase):
         source = self.entry_source()
         self.assertLess(source.index("production_defaults()"),
                         source.index("execute_from_command_line"))
+
+
+class AdminStaticFilesTests(TestCase):
+    """The admin needs its CSS, and DEBUG=0 stops Django serving it.
+
+    The desktop app turns DEBUG off deliberately, which left the admin
+    login page completely unstyled: nothing was serving /static/ at all,
+    because there is no web server in front of a double-clicked app.
+    """
+
+    def test_static_is_served_when_the_app_is_the_only_server(self):
+        from django.conf import settings
+
+        if not settings.COUNTER_SERVE_STATIC:
+            self.skipTest("static serving turned off in this environment")
+        response = self.client.get("/static/admin/css/base.css")
+        self.assertEqual(response.status_code, 200)
+
+    def test_the_login_page_asks_for_css_that_resolves(self):
+        page = self.client.get("/admin/login/").content.decode()
+        hrefs = re.findall(r'href="([^"]+\.css)"', page)
+        self.assertTrue(hrefs, "the admin login page should link stylesheets")
+        for href in hrefs:
+            with self.subTest(href=href):
+                self.assertEqual(self.client.get(href).status_code, 200,
+                                 f"{href} does not resolve")
+
+    @override_settings(COUNTER_SERVE_STATIC=False)
+    def test_it_can_be_turned_off_for_a_real_web_server(self):
+        # nginx serves /static/ in the server deployment; Django need not.
+        from importlib import reload
+
+        import config.urls
+
+        reload(config.urls)
+        try:
+            patterns = [str(p.pattern) for p in config.urls.urlpatterns]
+            self.assertFalse([p for p in patterns if "static" in p])
+        finally:
+            reload(config.urls)
+
+    def test_static_root_is_under_the_data_directory(self):
+        from django.conf import settings
+
+        self.assertEqual(pathlib.Path(settings.STATIC_ROOT).parent,
+                         pathlib.Path(settings.DATA_DIR))
+
+
+class SpecCarriesAdminStaticTests(TestCase):
+    """A frozen build reads static files from the app directories."""
+
+    def test_the_spec_collects_django_admin_data(self):
+        spec = pathlib.Path(settings.BASE_DIR) / "VisitorsTracker.spec"
+        if not spec.exists():
+            self.skipTest("no spec in this checkout")
+        text = spec.read_text()
+        self.assertIn('collect_data_files("django.contrib.admin")', text)
