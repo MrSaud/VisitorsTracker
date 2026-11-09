@@ -315,6 +315,28 @@ a bigger machine, a higher `COUNTER_DETECT_EVERY`, or a lower
 
 Run it on the server **before** mounting a camera.
 
+### Burstable instances are the wrong family
+
+A t2/t3/t4g instance earns CPU credits at a fixed rate and spends them when
+it works. Counting is not bursty — it is one steady CPU-bound load, forever.
+Do the arithmetic before choosing one:
+
+```
+t3.medium earns                       24 credits/hour  (2 vCPU x 20% baseline)
+one camera at 20fps, detect_every 3    6.7 detections/second
+  at 100ms per detection             = 0.67 vCPU       = 40 credits/hour
+```
+
+That is a deficit whatever the per-detection figure turns out to be, and the
+credit balance is finite: when it runs out the instance is throttled to its
+baseline, counting collapses, and the only symptom is a frame rate quietly
+falling until people cross the line between detections. In `unlimited` mode
+it does not throttle — it bills surplus credits instead, forever.
+
+Use a compute-optimised instance (c-family) sized from
+`check_setup --benchmark` on the box itself, and remember that whatever else
+the machine already does is competing for the same cores.
+
 ### One worker. Not for load — for correctness
 
 `deploy/gunicorn.conf.py` sets `workers = 1`, and raising it breaks counting.
