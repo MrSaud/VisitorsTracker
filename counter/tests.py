@@ -40,6 +40,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
 from . import camera as camera_module
+from . import exports
 from . import secretkey
 from config import paths
 from . import desktop
@@ -5054,3 +5055,112 @@ class SpecCarriesAdminStaticTests(TestCase):
             self.skipTest("no spec in this checkout")
         text = spec.read_text()
         self.assertIn('collect_data_files("django.contrib.admin")', text)
+
+
+class AdminCsvExportTests(TestCase):
+    """Exporting an event's figures from the admin, by date."""
+
+    def setUp(self):
+        self.staff = User.objects.create_superuser("boss", "b@example.com", "pw")
+        self.client.force_login(self.staff)
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.event = Event.objects.create(
+            name="Trade show",
+            starts_at=timezone.now() - timedelta(days=2),
+            ends_at=timezone.now() + timedelta(days=1))
+        for i in range(3):
+            Crossing.objects.create(camera=self.camera, event=self.event,
+                                    direction=DIRECTION_IN, track_id=i,
+                                    occurred_at=timezone.now())
+
+    def post(self, **extra):
+        data = {"action": "export_csv",
+                "_selected_action": [str(self.event.pk)], **extra}
+        return self.client.post("/admin/counter/event/", data)
+
+    def test_choosing_the_action_asks_for_dates_first(self):
+        response = self.post()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'name="start"')
+        self.assertContains(response, "Trade show")
+
+    def test_it_downloads_a_csv_naming_the_event(self):
+        response = self.post(apply="1")
+        self.assertEqual(response["Content-Type"], "text/csv")
+        self.assertIn("Trade-show", response["Content-Disposition"])
+
+    def test_every_row_names_its_event(self):
+        # Several events in one file would otherwise be unreadable.
+        rows = list(csv.reader(
+            self.post(apply="1").content.decode().splitlines()))
+        self.assertEqual(rows[0][0], "event")
+        self.assertTrue(all(r[0] == "Trade show" for r in rows[1:]))
+
+    def test_the_counts_are_there(self):
+        rows = list(csv.reader(
+            self.post(apply="1").content.decode().splitlines()))
+        header, body = rows[0], rows[1:]
+        total_in = sum(int(r[header.index("in")]) for r in body)
+        self.assertEqual(total_in, 3)
+
+    def test_an_explicit_window_narrows_it_and_is_named(self):
+        today = timezone.localdate()
+        response = self.post(apply="1", start=today.isoformat(),
+                             end=today.isoformat())
+        self.assertIn(today.isoformat(), response["Content-Disposition"])
+        rows = list(csv.reader(response.content.decode().splitlines()))
+        self.assertEqual(len(rows) - 1, 1, "one day asked for, one day back")
+
+    def test_blank_dates_mean_the_events_own_run(self):
+        rows = list(csv.reader(
+            self.post(apply="1").content.decode().splitlines()))
+        # The event spans three calendar days.
+        self.assertGreaterEqual(len(rows) - 1, 3)
+
+    def test_backwards_dates_are_refused_with_a_message(self):
+        response = self.post(apply="1", start="2026-12-01", end="2026-01-01")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "after the end date")
+
+    def test_a_bad_date_does_not_500(self):
+        response = self.post(apply="1", start="not-a-date")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "errornote")
+
+    def test_several_events_come_back_in_one_file(self):
+        other = Event.objects.create(
+            name="Open day", starts_at=timezone.now() - timedelta(days=1),
+            ends_at=timezone.now())
+        response = self.client.post("/admin/counter/event/", {
+            "action": "export_csv", "apply": "1",
+            "_selected_action": [str(self.event.pk), str(other.pk)]})
+        names = {r[0] for r in csv.reader(
+            response.content.decode().splitlines())} - {"event"}
+        self.assertEqual(names, {"Trade show", "Open day"})
+        self.assertIn("2-events", response["Content-Disposition"])
+
+    def test_an_anonymous_visitor_cannot_export(self):
+        self.client.logout()
+        response = self.post(apply="1")
+        self.assertNotEqual(response.get("Content-Type"), "text/csv")
+
+
+class ExportFilenameTests(TestCase):
+    """Event names are free text; filenames are not."""
+
+    def test_punctuation_and_spaces_are_made_safe(self):
+        self.assertEqual(exports.safe_filename("visitors", "Doors open 9-5 (east)"),
+                         "visitors_Doors-open-9-5-east")
+
+    def test_a_slash_cannot_survive(self):
+        self.assertNotIn("/", exports.safe_filename("visitors", "Eid/Fitr"))
+
+    def test_dot_runs_are_collapsed(self):
+        name = exports.safe_filename("visitors", "../../etc/passwd")
+        self.assertNotIn("..", name)
+
+    def test_an_empty_name_still_gives_a_filename(self):
+        self.assertEqual(exports.safe_filename(""), "export")
+
+    def test_it_stays_a_sane_length(self):
+        self.assertLessEqual(len(exports.safe_filename("x" * 400)), 120)

@@ -877,6 +877,31 @@ curl -OJ 'http://127.0.0.1:8000/api/v1/daily/?event=3&format=csv'
 - **Crossings outside any event are still recorded**, with no event attached,
   and still appear in the date and hour reports.
 
+## Exporting
+
+From the admin: **Events**, tick the ones you want, choose *Export visitor
+data to CSV*. It asks for a date range first — leave it blank and each event
+exports its own run, which is usually what "export the trade show" means.
+
+```
+event,date,in,out,net,peak_inside,peak_at
+Trade show,2026-11-08,214,198,16,47,2026-11-08T14:22:10+00:00
+```
+
+Every row names its event, so several events can go in one file. The
+filename carries the event and the window, because three exports otherwise
+arrive as `visitors.csv`, `visitors (1).csv` and `visitors (2).csv`.
+
+The API does the same thing for scripts, and takes the same filters:
+
+```bash
+curl -o day.csv "http://127.0.0.1:8000/api/v1/daily/?event=5&start=2026-11-01&end=2026-11-30&format=csv"
+```
+
+Its columns start at `date` rather than `event`: that endpoint can be scoped
+to a camera or to nothing at all, where an event column would be empty on
+every row.
+
 ## Visitors per date
 
 The dashboard's **Visitors per date** panel charts daily crossings over 7, 30

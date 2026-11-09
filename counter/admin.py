@@ -1,6 +1,9 @@
 from django.contrib import admin
+from django.shortcuts import render
 
+from .exports import events_csv_response
 from .models import Alert, Camera, Crossing, Event
+from .reports import parse_date
 
 
 @admin.register(Camera)
@@ -29,6 +32,41 @@ class EventAdmin(admin.ModelAdmin):
         ("Limits", {"fields": ("capacity",)}),
         ("Record", {"fields": ("created_at",)}),
     )
+
+    actions = ["export_csv"]
+
+    @admin.action(description="Export visitor data to CSV")
+    def export_csv(self, request, queryset):
+        """Download daily counts for the selected events.
+
+        An intermediate page because the dates matter: an action on its
+        own cannot ask anything, and "export this event" usually means a
+        particular window rather than whatever the default happens to be.
+        Left blank, each event exports its own run.
+        """
+        events = list(queryset)
+        context = {
+            **self.admin_site.each_context(request),
+            "events": events,
+            "title": "Export visitor data",
+            "opts": self.model._meta,
+        }
+
+        if "apply" not in request.POST:
+            return render(request, "admin/export_events.html", context)
+
+        try:
+            start = parse_date(request.POST.get("start") or None)
+            end = parse_date(request.POST.get("end") or None)
+        except ValueError as exc:
+            context["error"] = str(exc)
+            return render(request, "admin/export_events.html", context)
+
+        if start and end and start > end:
+            context["error"] = "The start date is after the end date."
+            return render(request, "admin/export_events.html", context)
+
+        return events_csv_response(events, start=start, end=end)
 
     @admin.display(description="Attendance")
     def attendance(self, obj):

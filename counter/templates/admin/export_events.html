@@ -1,0 +1,41 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<h1>Export visitor data</h1>
+
+<p>
+  {{ events|length }} event{{ events|pluralize }} selected:
+  {% for event in events %}<strong>{{ event.name }}</strong>{% if not forloop.last %}, {% endif %}{% endfor %}
+</p>
+
+<form method="post">
+  {% csrf_token %}
+  {% for event in events %}
+    <input type="hidden" name="_selected_action" value="{{ event.pk }}">
+  {% endfor %}
+  <input type="hidden" name="action" value="export_csv">
+
+  <fieldset class="module aligned">
+    <div class="form-row">
+      <label for="start">From</label>
+      <input type="date" name="start" id="start" value="{{ suggested_start|default:'' }}">
+      <p class="help">Leave both blank to use each event&rsquo;s own dates.</p>
+    </div>
+    <div class="form-row">
+      <label for="end">To</label>
+      <input type="date" name="end" id="end" value="{{ suggested_end|default:'' }}">
+    </div>
+  </fieldset>
+
+  {% if error %}<p class="errornote">{{ error }}</p>{% endif %}
+
+  <div class="submit-row">
+    <input type="submit" name="apply" value="Download CSV" class="default">
+    <a href="../" class="button cancel-link">Cancel</a>
+  </div>
+</form>
+
+<p class="help">
+  One row per event per day: attendance in, out, net, and the peak number
+  inside with the time it happened.
+</p>
+{% endblock %}

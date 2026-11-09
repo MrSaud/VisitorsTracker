@@ -22,6 +22,7 @@ from .daywindow import occupancy_window_start
 from .health import STATUS_OK, build_report
 from .models import Alert, Camera, Crossing, Event, active_event_for
 from .permissions import _is_operator
+from .exports import safe_filename
 from .reports import (
     DEFAULT_DAYS,
     busiest_hours,
@@ -301,6 +302,10 @@ def daily_report(request):
         label = f"{window_start.isoformat()}_{window_end.isoformat()}"
         if camera is not None:
             label = f"camera{camera.pk}_{label}"
+        if event is not None:
+            # Otherwise exporting three events gives three files with the
+            # same name, and the second two land as "(1)" and "(2)".
+            label = safe_filename(event.name, label)
         response = HttpResponse(content_type="text/csv")
         response["Content-Disposition"] = (
             f'attachment; filename="visitors_{label}.csv"'
