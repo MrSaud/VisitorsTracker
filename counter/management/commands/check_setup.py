@@ -27,6 +27,10 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            "--benchmark", action="store_true",
+            help="Time the detector on this machine and say whether it can "
+                 "keep up with a live camera.")
+        parser.add_argument(
             "--cameras", action="store_true",
             help="Also try to open each configured camera. This takes the "
                  "device, so do not run it while the counter is running.")
@@ -45,6 +49,10 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.MIGRATE_HEADING("\nDetector"))
         self.check_detector()
+
+        if options["benchmark"]:
+            self.stdout.write(self.style.MIGRATE_HEADING("\nSpeed"))
+            self.check_speed()
 
         self.stdout.write(self.style.MIGRATE_HEADING("\nDatabase"))
         self.check_database()
@@ -133,6 +141,65 @@ class Command(BaseCommand):
                 "python manage.py export_model, then check again")
         else:
             self.report(OK, "detector in use", name)
+
+    def check_speed(self, runs=10):
+        """Can this machine detect fast enough for a live camera?
+
+        Detection is the whole cost; tracking is noise beside it. It runs on
+        every Nth frame and tracking fills the gaps, so the video rate a
+        machine can sustain is (detections per second) x COUNTER_DETECT_EVERY.
+        A box that cannot reach the camera's frame rate does not fail -- it
+        falls behind, and people cross the line between detections.
+        """
+        import time
+
+        import cv2
+        import numpy as np
+
+        from counter.vision import build_detector
+
+        detector = build_detector(
+            settings.COUNTER_DETECTOR,
+            min_confidence=settings.COUNTER_MIN_CONFIDENCE,
+            model_name=settings.COUNTER_ONNX_MODEL)
+
+        fixture = Path(settings.BASE_DIR) / "counter" / "ml_models" / "people.jpg"
+        if fixture.exists():
+            frame = cv2.resize(cv2.imread(str(fixture)),
+                               (settings.COUNTER_FRAME_WIDTH, 480))
+        else:
+            # Noise, not black: an empty frame can take a shortcut through
+            # the post-processing and flatter the machine.
+            frame = np.random.randint(
+                0, 255, (480, settings.COUNTER_FRAME_WIDTH, 3), dtype=np.uint8)
+
+        detector.detect(frame)                      # warm up
+        started = time.perf_counter()
+        for _ in range(runs):
+            detector.detect(frame)
+        per_detection = (time.perf_counter() - started) / runs
+
+        every = settings.COUNTER_DETECT_EVERY
+        detections_per_second = 1.0 / per_detection
+        sustainable = detections_per_second * every
+
+        self.report(OK, "detection", f"{per_detection*1000:.0f} ms "
+                                     f"({detections_per_second:.1f}/s)")
+        self.report(OK, "detect_every", f"{every} (tracking fills the gaps)")
+
+        detail = f"{sustainable:.0f} fps of video"
+        if sustainable < 8:
+            self.report(FAIL, "sustainable rate", detail,
+                        "too slow for a live camera. Use a bigger machine, "
+                        "raise COUNTER_DETECT_EVERY, or lower "
+                        "COUNTER_FRAME_WIDTH")
+        elif sustainable < 15:
+            self.report(WARN, "sustainable rate", detail,
+                        "tight for a 15-20 fps camera; people may cross "
+                        "between detections. Consider raising "
+                        "COUNTER_DETECT_EVERY")
+        else:
+            self.report(OK, "sustainable rate", detail)
 
     def check_database(self):
         from django.db.migrations.executor import MigrationExecutor

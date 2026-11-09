@@ -4592,3 +4592,58 @@ class BackupCommandTests(TestCase):
                 call_command("backup_db", into=str(self.into), stdout=StringIO())
         self.assertIn("pg_dump", str(caught.exception),
                       "it should say what to use instead")
+
+
+class SpeedCheckTests(TestCase):
+    """Whether a machine can keep up is a question it should answer itself.
+
+    Written because the server this is going on is an EC2 instance whose
+    size nobody could tell me, and detection is the whole cost.
+    """
+
+    class SlowDetector:
+        def __init__(self, seconds):
+            self.seconds = seconds
+
+        def detect(self, frame):
+            time_module.sleep(self.seconds)
+            return []
+
+    def check_with(self, seconds, detect_every=3):
+        out = StringIO()
+        with patch("counter.vision.build_detector",
+                   return_value=self.SlowDetector(seconds)), \
+                override_settings(COUNTER_DETECT_EVERY=detect_every):
+            call_command("check_setup", benchmark=True, stdout=out,
+                         stderr=StringIO())
+        return out.getvalue()
+
+    def test_a_fast_machine_passes(self):
+        output = self.check_with(0.005)           # 5ms -> 600 fps of video
+        self.assertIn("sustainable rate", output)
+        self.assertNotIn("too slow", output)
+
+    def test_a_machine_that_cannot_keep_up_fails_and_says_what_to_change(self):
+        output = self.check_with(0.5)             # 500ms -> 6 fps of video
+        self.assertIn("too slow", output)
+        self.assertIn("COUNTER_DETECT_EVERY", output,
+                      "it must name a lever, not just the verdict")
+
+    def test_a_marginal_machine_is_warned_about(self):
+        # ~0.25s per detection x 3 = about 12 fps of video: enough to run,
+        # not enough to trust at a busy door.
+        output = self.check_with(0.25)
+        self.assertIn("between detections", output)
+
+    def test_raising_detect_every_changes_the_verdict(self):
+        # The same hardware, counted differently: the lever works.
+        slow = self.check_with(0.25, detect_every=3)
+        relaxed = self.check_with(0.25, detect_every=8)
+        self.assertIn("between detections", slow)
+        self.assertNotIn("between detections", relaxed)
+
+    def test_the_benchmark_is_opt_in(self):
+        out = StringIO()
+        call_command("check_setup", stdout=out, stderr=StringIO())
+        self.assertNotIn("sustainable rate", out.getvalue(),
+                         "a routine check should not spend a second detecting")

@@ -285,7 +285,35 @@ sudo cp deploy/nginx-visitorstracker.conf /etc/nginx/conf.d/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Then, on the server: `python manage.py check_setup`.
+Then, on the server:
+
+```bash
+python manage.py check_setup --benchmark
+```
+
+### Will the machine keep up?
+
+Detection is the entire cost; tracking is noise beside it. It runs on every
+*N*th frame (`COUNTER_DETECT_EVERY`) and tracking fills the gaps, so the
+video rate a machine can sustain is roughly
+`(detections per second) x COUNTER_DETECT_EVERY`. `--benchmark` measures it:
+
+```
+Speed
+  ok   detection              43 ms (23.1/s)
+  ok   detect_every           3 (tracking fills the gaps)
+  ok   sustainable rate       69 fps of video
+```
+
+That is an M1 Mac, with plenty of headroom over a 20 fps camera. A small
+burstable cloud instance will be far slower, and a machine that cannot keep
+up does not fail — it falls behind, and people cross the line between
+detections, which shows up as undercounting rather than as an error. Below
+15 fps sustainable the check warns; below 8 it fails and names the levers:
+a bigger machine, a higher `COUNTER_DETECT_EVERY`, or a lower
+`COUNTER_FRAME_WIDTH`.
+
+Run it on the server **before** mounting a camera.
 
 ### One worker. Not for load — for correctness
 
