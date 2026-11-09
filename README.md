@@ -75,15 +75,52 @@ capture devices sit behind that prompt.
    one visitor is counted once rather than once per frame. See
    [Tracking](#tracking).
 3. **Count** — each track's centroid is compared against the counting line.
-   A side change outside a small dead band emits one `CountEvent`, with
+   A side change that survives the checks below emits one `Crossing`, with
    `direction` of `in` or `out`.
 
 Tracks are positional and short-lived, so the same person returning later is
 a new track and counts again: **`in` is entry crossings, not unique people**.
 
-The dead band (`LineCounter.margin`) is what stops someone loitering on the
-line from racking up counts. Set `invert_direction` on a camera if in and out
-come out backwards for its mounting angle.
+Set `invert_direction` on a camera if in and out come out backwards for its
+mounting angle.
+
+### Loitering
+
+Somebody standing in the doorway shifting their weight crosses the line over
+and over. Counting each flip is wrong, and it is wrong in the direction that
+flatters you — footfall inflates while occupancy stays roughly right, so the
+headline number is the one that lies. Measured on a 240px frame:
+
+| One person swaying on the line | Counted |
+|---|---|
+| ±20px | 1 ✅ |
+| ±30px | **4 in, 3 out** ❌ |
+| ±40px | **6 in, 5 out** ❌ |
+
+The dead band alone does not fix this: it only decides when a side is
+*claimed*, and a sway of 30px clears it easily. What separates the two cases
+is **how far past the line they actually get**:
+
+| | Reaches past the line |
+|---|---|
+| Swaying, even ±50px | **32px** |
+| Walking through, 10–60px/frame | **70–110px** |
+
+That gap is the real signal, and unlike a frame count it does not care how
+fast somebody moves. So a side change is believed when **either**:
+
+- the track is more than `commit_fraction` of its own box past the line
+  (default 0.6) — a fraction of the person, not a pixel count, so it holds
+  whether they are close to the lens or down the hall; **or**
+- it has held the new side for `COUNTER_LINE_CONFIRM_FRAMES` frames
+  (default 2) — which catches the slow, deliberate crossing that never gets
+  far past a line drawn near the frame edge.
+
+A sway satisfies neither. A sprint satisfies the first, a shuffle the second.
+
+This is also why a suggested line is kept between 0.2 and 0.8 of the frame:
+at 0.9 a brisk walker is visible beyond the line for a frame or two, which is
+not long enough to tell them from somebody swaying on it.
 
 Detection runs on every *N*th frame (`COUNTER_DETECT_EVERY`, default 3) and
 tracking fills the gaps, which is what makes CPU-only operation workable.
@@ -359,6 +396,7 @@ All of these are environment variables:
 | `COUNTER_MIN_CONFIDENCE` | *(per backend)* | Detection threshold. Unset, HOG uses 0.45 and YOLO 0.35 — HOG scores are SVM decision values, YOLO scores are probabilities, so one shared number suits neither |
 | `COUNTER_DETECT_EVERY` | `3` | Detect on every Nth frame |
 | `COUNTER_MAX_DISAPPEARED` | `25` | Frames a track survives unseen |
+| `COUNTER_LINE_CONFIRM_FRAMES` | `2` | Frames a side change must hold before it counts — see [Loitering](#loitering) |
 | `COUNTER_FRAME_WIDTH` | `640` | Frames are downscaled to this width before detection |
 | `COUNTER_OCCUPANCY_RESET_AT` | `00:00` | Local time occupancy returns to zero |
 | `COUNTER_STALE_FRAME_SECONDS` | `30` | No frame for this long means stalled |
@@ -722,16 +760,59 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 deployment use `supervise`, which also restarts what stops — see
 [Staying up](#staying-up).
 
+## Measuring accuracy
+
+Until you can say "within 3%", you cannot put a number in front of a client.
+`measure` runs the real counter over a recording — same detector, same
+tracker, same line logic as a live camera — and compares it with a hand count:
+
+```bash
+python manage.py measure door.mp4 --expect-in 143 --expect-out 139
+```
+
+```
+door.mp4
+  12043 frames, 10:02.15 at 20 fps · detector onnx · processed in 54.2s
+  line horizontal at 0.5
+
+  counted: 148 in, 141 out
+
+   in: counted 148, truth 143 → +5 (3.5%)
+  out: counted 141, truth 139 → +2 (1.4%)
+```
+
+Nothing is written to the database — this is a measurement, not a shift.
+
+When the numbers disagree, the next question is *where*, and guessing is no
+better than arguing. Every crossing is logged with the time in the clip it
+happened, and `--record` writes back the annotated video:
+
+```bash
+python manage.py measure door.mp4 --record checked.mp4 --csv found.csv
+```
+
+```csv
+frame,at,seconds,direction,track_id
+118,00:05.90,5.9,in,6
+125,00:06.25,6.25,in,1
+```
+
+Open `checked.mp4` at 00:06.25 and you can see what the counter saw.
+
+`--line`, `--orientation` and `--invert` let you try a different setup on the
+same clip without touching a camera in the admin, which turns "where should
+the line go" into something you measure rather than guess.
+
 ## Tests
 
 ```bash
 python manage.py test
 ```
 
-335 tests covering tracker identity through crossings and occlusion,
+352 tests covering tracker identity through crossings and occlusion,
 event scoping and attribution, reconnection after a dropped stream,
 supervisor reconciliation, peak occupancy, alert grace periods,
-escalation and delivery,
+escalation and delivery, loitering on the line,
 assignment optimality against brute force, line-crossing direction, the dead
 band,
 the YOLOv8 output decoding, line-setup suggestions, local-date and local-hour

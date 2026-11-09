@@ -4,6 +4,7 @@ A stub detector stands in for HOG/ONNX so nothing here needs a camera,
 a model file, or any particular machine speed.
 """
 
+import csv
 import itertools
 import json
 import os
@@ -23,6 +24,7 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core import mail
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import IntegrityError
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
@@ -93,8 +95,11 @@ from .vision import (
     VERTICAL,
     CentroidTracker,
     HogPersonDetector,
+    LINE_POSITION_MAX,
+    LINE_POSITION_MIN,
     LineCounter,
     OnnxPersonDetector,
+    Track,
     VisitorCounter,
     build_detector,
     non_max_suppression,
@@ -3497,3 +3502,232 @@ class AlertOrderingTests(TestCase):
 
         self.assertEqual(payload["alerts"][0]["id"], old_open.pk)
         self.assertEqual(len(payload["alerts"]), 3)
+
+
+# ---------------------------------------------------------------------------
+# standing on the line is not walking through it
+# ---------------------------------------------------------------------------
+
+class LineHysteresisTests(TestCase):
+    """One person hesitating in a doorway used to count as eleven.
+
+    A track that hovers across the line flips sides on every sway, and each
+    flip was a crossing. Two guards now have to be satisfied -- held for a
+    few frames, or clearly past the line -- and either will do, because a
+    sprinter has no frames to spare and a slow walker near the frame edge
+    never gets far past it.
+    """
+
+    LINE_Y = 120          # a 240px frame, line at 0.5
+
+    def _run(self, ys, position=0.5, **kwargs):
+        counter = VisitorCounter(
+            detector=StubDetector([[box_at(160, y)] for y in ys]),
+            tracker=build_tracker("sort", max_disappeared=25),
+            line=LineCounter(position=position, **kwargs),
+            detect_every=1,
+        )
+        frame = blank_frame()
+        for _ in ys:
+            counter.process(frame)
+        return counter.total_in, counter.total_out
+
+    @staticmethod
+    def _sway(amplitude, times=6, line=120):
+        points = [40, 60, 90]
+        for _ in range(times):
+            points += [line - amplitude, line + amplitude]
+        return points
+
+    def test_swaying_on_the_line_is_not_a_dozen_visitors(self):
+        for amplitude in (30, 40, 50):
+            with self.subTest(amplitude=amplitude):
+                total = sum(self._run(self._sway(amplitude)))
+                self.assertLessEqual(
+                    total, 1,
+                    f"swaying +/-{amplitude}px counted {total} crossings")
+
+    def test_the_old_rule_really_did_inflate(self):
+        # Guards the guard: if this ever stops failing, the scenario has
+        # drifted and the test above proves nothing.
+        total = sum(self._run(self._sway(40), confirm_frames=1,
+                              commit_fraction=0.0))
+        self.assertGreater(total, 5,
+                           "counting on the first flip should inflate here")
+
+    def test_walking_through_still_counts_at_any_speed(self):
+        for step in (5, 10, 15, 20, 30, 40, 60, 80):
+            with self.subTest(step=step):
+                total_in, _out = self._run(list(range(10, 235, step)))
+                self.assertEqual(total_in, 1, f"missed a walk at {step}px/frame")
+
+    def test_a_real_change_of_mind_still_counts(self):
+        def leg(start, end, step):
+            direction = 1 if end > start else -1
+            return list(range(start, end, direction * step)) + [end]
+
+        ys = leg(20, 220, 15) + leg(220, 20, 15) + leg(20, 220, 15)
+        self.assertEqual(self._run(ys), (2, 1))
+
+    def test_distance_alone_is_enough_for_a_fast_crossing(self):
+        # Two frames past the line, which is too few to "hold" it, but far
+        # enough that it cannot be a sway.
+        counted = self._run([40, 60, 90, 220], confirm_frames=99)
+        self.assertEqual(counted[0], 1,
+                         "a sprinter has no frames to spare")
+
+    def test_frames_alone_are_enough_for_a_slow_one(self):
+        # Never gets far past the line, but stays there deliberately.
+        counted = self._run([40, 60, 90, 135, 137, 136, 138],
+                            commit_fraction=0.0)
+        self.assertEqual(counted[0], 1,
+                         "a slow, deliberate crossing must still count")
+
+    def test_neither_guard_means_no_crossing(self):
+        counted = self._run([40, 60, 90, 135], confirm_frames=99,
+                            commit_fraction=10.0)
+        self.assertEqual(counted, (0, 0))
+
+
+class CommitDistanceTests(TestCase):
+    """The distance guard scales with the person, not with the lens."""
+
+    def test_a_bigger_person_must_travel_further(self):
+        line = LineCounter(position=0.5, commit_fraction=0.5)
+        near = Track(track_id=1, centroid=(0, 0), box=(0, 0, 40, 200))
+        far = Track(track_id=2, centroid=(0, 0), box=(0, 0, 10, 40))
+
+        # 40px past the line: nothing for someone filling the frame,
+        # plenty for someone at the far end of a hall.
+        self.assertFalse(line._is_clear_of_line(near, 40))
+        self.assertTrue(line._is_clear_of_line(far, 40))
+
+    def test_a_missing_box_falls_back_to_the_frame_count(self):
+        line = LineCounter(position=0.5)
+        self.assertFalse(line._is_clear_of_line(
+            Track(track_id=1, centroid=(0, 0), box=None), 500))
+
+    def test_a_vertical_line_measures_width(self):
+        line = LineCounter(position=0.5, orientation=VERTICAL,
+                           commit_fraction=0.5)
+        wide = Track(track_id=1, centroid=(0, 0), box=(0, 0, 200, 40))
+        self.assertFalse(line._is_clear_of_line(wide, 40))
+        self.assertTrue(line._is_clear_of_line(wide, 120))
+
+
+class SuggestedLineStaysOffTheEdgeTests(TestCase):
+    """A line at 0.95 leaves nowhere to confirm a crossing."""
+
+    def test_the_suggestion_is_pulled_away_from_the_edge(self):
+        # Everyone walking along the very bottom of the frame.
+        centroids = [(x, 340) for x in range(20, 300, 20)]
+        suggestion = suggest_line_setup(centroids, (360, 640, 3))
+
+        self.assertIsNotNone(suggestion)
+        self.assertGreaterEqual(suggestion["position"], LINE_POSITION_MIN)
+        self.assertLessEqual(suggestion["position"], LINE_POSITION_MAX)
+
+    def test_a_central_suggestion_is_left_alone(self):
+        centroids = [(x, 180) for x in range(20, 620, 20)]
+        suggestion = suggest_line_setup(centroids, (360, 640, 3))
+        self.assertAlmostEqual(suggestion["position"], 0.5, places=1)
+
+
+class MeasureCommandTests(TransactionTestCase):
+    """Counting a recorded clip, so accuracy can be a number not an opinion."""
+
+    FRAMES = 40
+
+    def _clip(self, path):
+        writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"MJPG"), 20.0, (FRAME_W, FRAME_H))
+        if not writer.isOpened():
+            return False
+        for index in range(self.FRAMES):
+            frame = np.full((FRAME_H, FRAME_W, 3), 30, dtype=np.uint8)
+            y = int(20 + 200 * index / (self.FRAMES - 1))
+            cv2.rectangle(frame, (140, y - 40), (180, y + 40), (200, 200, 200), -1)
+            writer.write(frame)
+        writer.release()
+        return path.exists() and path.stat().st_size > 0
+
+    def _walker(self):
+        """One person walking down the frame, past the middle."""
+        return StubDetector([
+            [box_at(160, int(20 + 200 * i / (self.FRAMES - 1)))]
+            for i in range(self.FRAMES)
+        ])
+
+    def _run(self, clip, *args):
+        out = StringIO()
+        with patch("counter.management.commands.measure.build_detector",
+                   return_value=self._walker()):
+            call_command("measure", str(clip), "--detect-every", "1",
+                         "--quiet", *args, stdout=out)
+        return out.getvalue()
+
+    def test_it_counts_a_clip_without_touching_the_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = pathlib.Path(tmp) / "door.avi"
+            if not self._clip(clip):
+                self.skipTest("OpenCV build cannot write MJPG video here")
+
+            output = self._run(clip)
+
+            self.assertIn("counted: 1 in, 0 out", output)
+            self.assertEqual(Crossing.objects.count(), 0,
+                             "measuring is not a shift; it records nothing")
+            self.assertEqual(Camera.objects.count(), 0)
+
+    def test_it_reports_the_error_against_a_hand_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = pathlib.Path(tmp) / "door.avi"
+            if not self._clip(clip):
+                self.skipTest("OpenCV build cannot write MJPG video here")
+
+            output = self._run(clip, "--expect-in", "2", "--expect-out", "0")
+
+            self.assertIn("counted 1, truth 2", output)
+            self.assertIn("-1", output, "the error itself must be stated")
+            self.assertIn("50.0%", output)
+
+    def test_every_crossing_is_logged_with_its_place_in_the_clip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = pathlib.Path(tmp) / "door.avi"
+            if not self._clip(clip):
+                self.skipTest("OpenCV build cannot write MJPG video here")
+            report = pathlib.Path(tmp) / "found.csv"
+
+            self._run(clip, "--csv", str(report))
+
+            rows = list(csv.DictReader(report.open()))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["direction"], DIRECTION_IN)
+            # The frame and timestamp are the point: they are what lets
+            # somebody open the recording at the moment in dispute.
+            self.assertTrue(rows[0]["at"].startswith("00:"))
+            self.assertGreater(int(rows[0]["frame"]), 0)
+
+    def test_it_can_write_back_an_annotated_recording(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = pathlib.Path(tmp) / "door.avi"
+            if not self._clip(clip):
+                self.skipTest("OpenCV build cannot write MJPG video here")
+            checked = pathlib.Path(tmp) / "checked.avi"
+
+            self._run(clip, "--record", str(checked))
+
+            self.assertTrue(checked.exists())
+            playback = cv2.VideoCapture(str(checked))
+            try:
+                self.assertTrue(playback.isOpened(), "recording is not readable")
+                ok, frame = playback.read()
+                self.assertTrue(ok)
+                self.assertIsNotNone(frame)
+            finally:
+                playback.release()
+
+    def test_a_missing_clip_is_a_clear_error(self):
+        with self.assertRaises(CommandError) as caught:
+            call_command("measure", "/no/such/clip.mp4", stdout=StringIO())
+        self.assertIn("No such file", str(caught.exception))

@@ -123,6 +123,13 @@ COUNTER_MIN_CONFIDENCE = float(_min_confidence) if _min_confidence else None
 # Detect on every Nth frame; tracking fills the gaps (1 = every frame).
 COUNTER_DETECT_EVERY = int(os.environ.get("COUNTER_DETECT_EVERY", "3"))
 
+# Frames a track must hold the far side of the line before the crossing is
+# counted. Guards against somebody standing in the doorway shifting their
+# weight, which flips sides on every sway. Higher is steadier but will miss
+# somebody who sprints through; see "Loitering" in the README.
+COUNTER_LINE_CONFIRM_FRAMES = int(
+    os.environ.get("COUNTER_LINE_CONFIRM_FRAMES", "3"))
+
 # Frames a track may go unseen before it is dropped.
 COUNTER_MAX_DISAPPEARED = int(os.environ.get("COUNTER_MAX_DISAPPEARED", "25"))
 
