@@ -5386,3 +5386,90 @@ class DailyRangeApiTests(TestCase):
         rows = response.content.decode().splitlines()
         self.assertEqual(len(rows) - 1, 3)
         self.assertIn(start.isoformat(), response["Content-Disposition"])
+
+
+class DesktopSaveFileTests(TestCase):
+    """The window has no address bar, so a download must not navigate.
+
+    Clicking Download CSV used to set window.location, which in a
+    chrome-less webview left the operator looking at raw CSV with no Back
+    button and no way to save it.
+    """
+
+    class FakeWindow:
+        def __init__(self, answer):
+            self.answer = answer
+            self.asked = []
+
+        def create_file_dialog(self, kind, save_filename=None):
+            self.asked.append(save_filename)
+            return self.answer
+
+    def save(self, answer, filename="visitors.csv", content="a,b\n1,2\n"):
+        from counter import desktop
+
+        window = self.FakeWindow(answer)
+        fake_webview = type("W", (), {"windows": [window], "SAVE_DIALOG": 30})
+        with patch.dict(sys.modules, {"webview": fake_webview}):
+            return desktop.DesktopApi().save_file(filename, content), window
+
+    def test_it_writes_where_the_dialog_says(self):
+        target = pathlib.Path(tempfile.mkdtemp()) / "out.csv"
+        self.addCleanup(shutil.rmtree, target.parent, True)
+        result, window = self.save(str(target))
+        self.assertTrue(result["saved"])
+        self.assertEqual(target.read_text(), "a,b\n1,2\n")
+        self.assertEqual(window.asked, ["visitors.csv"])
+
+    def test_a_sequence_from_an_older_pywebview_is_handled(self):
+        target = pathlib.Path(tempfile.mkdtemp()) / "out.csv"
+        self.addCleanup(shutil.rmtree, target.parent, True)
+        result, _ = self.save((str(target),))
+        self.assertTrue(result["saved"])
+        self.assertTrue(target.exists())
+
+    def test_cancelling_is_not_an_error(self):
+        result, _ = self.save(None)
+        self.assertFalse(result["saved"])
+        self.assertEqual(result["reason"], "cancelled")
+
+    def test_an_unwritable_destination_is_reported_not_raised(self):
+        result, _ = self.save("/nowhere/that/exists/out.csv")
+        self.assertFalse(result["saved"])
+        self.assertNotEqual(result["reason"], "cancelled")
+
+    def test_no_window_is_survivable(self):
+        from counter import desktop
+
+        fake_webview = type("W", (), {"windows": [], "SAVE_DIALOG": 30})
+        with patch.dict(sys.modules, {"webview": fake_webview}):
+            result = desktop.DesktopApi().save_file("x.csv", "a")
+        self.assertFalse(result["saved"])
+
+    def test_the_window_is_given_the_api(self):
+        source = (pathlib.Path(settings.BASE_DIR) / "counter" / "desktop.py").read_text()
+        self.assertIn("js_api=DesktopApi()", source)
+
+
+class CsvDownloadDoesNotNavigateTests(TestCase):
+    """Neither path may leave the page."""
+
+    def page(self):
+        return self.client.get("/").content.decode()
+
+    def test_nothing_sets_window_location_for_a_csv(self):
+        page = self.page()
+        self.assertNotIn('window.location = dailyUrl', page)
+        self.assertNotIn('window.location = hourlyUrl', page)
+
+    def test_the_desktop_branch_asks_the_application_to_save(self):
+        self.assertIn("window.pywebview.api.save_file", self.page())
+
+    def test_the_browser_branch_uses_a_download_link(self):
+        page = self.page()
+        self.assertIn('link.download = fallbackName', page)
+
+    def test_the_filename_comes_from_the_server_when_it_gives_one(self):
+        # The server names the file after the event and the window; the
+        # fallback is only for when it does not.
+        self.assertIn("Content-Disposition", self.page())

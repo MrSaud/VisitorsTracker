@@ -924,8 +924,63 @@ dFrom.max = todayIso;
 dTo.max = todayIso;
 syncDateControls();
 
-document.getElementById("daily-csv").addEventListener("click", () => {
-  window.location = dailyUrl("&format=csv");
+// ---- downloads --------------------------------------------------------
+//
+// The desktop window has no address bar and no Back button, so navigating
+// to a CSV strands whoever clicked it: raw text, no way out. Inside the
+// app we fetch the file and hand it to the application to save; in an
+// ordinary browser a download link does the right thing already.
+
+function filenameFrom(response, fallback) {
+  const header = response.headers.get("Content-Disposition") || "";
+  const match = header.match(/filename="?([^"]+)"?/);
+  return match ? match[1] : fallback;
+}
+
+function flashCsvResult(button, text) {
+  const original = button.dataset.label || button.textContent;
+  button.dataset.label = original;
+  button.textContent = text;
+  button.disabled = true;
+  setTimeout(() => {
+    button.textContent = original;
+    button.disabled = false;
+  }, 2200);
+}
+
+async function downloadCsv(url, fallbackName, button) {
+  const native = window.pywebview && window.pywebview.api
+    && window.pywebview.api.save_file;
+
+  if (!native) {
+    // A real browser: let it download without leaving the page.
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fallbackName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    return;
+  }
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const text = await response.text();
+    const result = await window.pywebview.api.save_file(
+      filenameFrom(response, fallbackName), text);
+    if (result && result.saved) {
+      flashCsvResult(button, "Saved");
+    } else if (result && result.reason !== "cancelled") {
+      flashCsvResult(button, "Could not save");
+    }
+  } catch (err) {
+    flashCsvResult(button, "Could not save");
+  }
+}
+
+document.getElementById("daily-csv").addEventListener("click", (event) => {
+  downloadCsv(dailyUrl("&format=csv"), "visitors.csv", event.currentTarget);
 });
 
 // ---- alerts ------------------------------------------------------------
@@ -1109,8 +1164,9 @@ document.querySelectorAll(".range button[data-hdays]").forEach((button) => {
   });
 });
 
-document.getElementById("hourly-csv").addEventListener("click", () => {
-  window.location = hourlyUrl("&format=csv");
+document.getElementById("hourly-csv").addEventListener("click", (event) => {
+  downloadCsv(hourlyUrl("&format=csv"), "visitors_by_hour.csv",
+              event.currentTarget);
 });
 
 refresh();

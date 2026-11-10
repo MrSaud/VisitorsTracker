@@ -234,6 +234,40 @@ def start_logging(data_dir):
     return handler.baseFilename
 
 
+class DesktopApi:
+    """What the page may ask the application to do for it.
+
+    One thing, so far: save a file. The window has no address bar and no
+    Back button, so a download link that navigates leaves the operator
+    staring at raw CSV with no way out -- which is exactly what the
+    Download CSV buttons used to do. A webview is not a browser and must
+    not be asked to behave like one.
+    """
+
+    def save_file(self, filename, content):
+        """Ask where to put it, then write it. Returns what happened."""
+        import webview
+
+        windows = webview.windows
+        if not windows:
+            return {"saved": False, "reason": "no window"}
+
+        chosen = windows[0].create_file_dialog(
+            webview.SAVE_DIALOG, save_filename=filename or "export.csv")
+        if not chosen:
+            return {"saved": False, "reason": "cancelled"}
+
+        # Older pywebview returns a sequence here, newer a string.
+        if isinstance(chosen, (list, tuple)):
+            chosen = chosen[0]
+
+        try:
+            Path(chosen).write_text(content, encoding="utf-8")
+        except OSError as error:
+            return {"saved": False, "reason": str(error)}
+        return {"saved": True, "path": str(chosen)}
+
+
 def main(argv=None):
     production_defaults()
 
@@ -279,6 +313,7 @@ def main(argv=None):
         width=WINDOW_SIZE[0],
         height=WINDOW_SIZE[1],
         min_size=WINDOW_MIN_SIZE,
+        js_api=DesktopApi(),
     )
     try:
         webview.start()
