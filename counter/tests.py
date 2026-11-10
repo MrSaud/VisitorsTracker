@@ -859,10 +859,11 @@ class DailyApiTests(TestCase):
         self.assertEqual(response["Content-Type"], "text/csv")
         self.assertIn("attachment;", response["Content-Disposition"])
         lines = response.content.decode().strip().splitlines()
-        self.assertEqual(lines[0], "date,in,out,net,peak_inside,peak_at")
+        self.assertEqual(lines[0], "event,date,in,out,net,peak_inside,peak_at")
         # Four arrivals, none of whom left, so all four were inside at once.
-        self.assertTrue(lines[1].startswith("2026-03-03,4,0,4,4,"))
-        self.assertEqual(lines[2], "2026-03-04,0,0,0,0,")
+        row = next(csv.reader([lines[1]]))
+        self.assertEqual(row[:6], ["All events", "2026-03-03", "4", "0", "4", "4"])
+        self.assertEqual(lines[2], "All events,2026-03-04,0,0,0,0,")
 
     def test_bad_date_is_400(self):
         response = self.client.get("/api/v1/daily/?start=07-03-2026")
@@ -1244,9 +1245,10 @@ class HourlyApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Content-Type"], "text/csv")
         lines = response.content.decode().strip().splitlines()
-        self.assertEqual(lines[0], "hour,in,out,average_in,share_percent")
+        self.assertEqual(lines[0], "event,hour,in,out,average_in,share_percent")
         self.assertEqual(len(lines), 25)
-        self.assertTrue(lines[10].startswith("09:00,6,0,6.0,100.0"))
+        row = next(csv.reader([lines[10]]))
+        self.assertEqual(row[:5], ["All events", "09:00", "6", "0", "6.0"])
 
     def test_bad_params_are_400(self):
         self.assertEqual(self.client.get("/api/v1/hourly/?days=lots").status_code, 400)
@@ -2791,7 +2793,7 @@ class PeakApiTests(TestCase):
         body = response.content.decode()
         header, first = body.splitlines()[0], body.splitlines()[1]
 
-        self.assertEqual(header, "date,in,out,net,peak_inside,peak_at")
+        self.assertEqual(header, "event,date,in,out,net,peak_inside,peak_at")
         self.assertIn(",2,", first)
 
 
@@ -5473,3 +5475,47 @@ class CsvDownloadDoesNotNavigateTests(TestCase):
         # The server names the file after the event and the window; the
         # fallback is only for when it does not.
         self.assertIn("Content-Disposition", self.page())
+
+
+class CsvNamesItsEventTests(TestCase):
+    """A file off the dashboard should still say what it covers.
+
+    Opened a week later in a spreadsheet, "16 in on the 9th" means
+    nothing without knowing which event it belonged to.
+    """
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.event = Event.objects.create(
+            name="Trade show", starts_at=timezone.now() - timedelta(days=1),
+            ends_at=timezone.now() + timedelta(days=1))
+        Crossing.objects.create(camera=self.camera, event=self.event,
+                                direction=DIRECTION_IN, track_id=1,
+                                occurred_at=timezone.now())
+
+    def rows(self, path):
+        return list(csv.reader(
+            self.client.get(path).content.decode().splitlines()))
+
+    def test_a_filtered_daily_export_names_the_event(self):
+        rows = self.rows(f"/api/v1/daily/?days=3&event={self.event.pk}&format=csv")
+        self.assertEqual(rows[0][0], "event")
+        self.assertTrue(all(r[0] == "Trade show" for r in rows[1:]))
+
+    def test_an_unfiltered_export_says_so_rather_than_leaving_it_blank(self):
+        # An empty cell reads as missing data; this reads as what it is.
+        rows = self.rows("/api/v1/daily/?days=3&format=csv")
+        self.assertTrue(all(r[0] == "All events" for r in rows[1:]))
+        self.assertNotIn("", {r[0] for r in rows[1:]})
+
+    def test_the_hourly_export_names_it_too(self):
+        rows = self.rows(f"/api/v1/hourly/?days=3&event={self.event.pk}&format=csv")
+        self.assertEqual(rows[0][0], "event")
+        self.assertTrue(all(r[0] == "Trade show" for r in rows[1:]))
+
+    def test_the_admin_export_and_the_api_agree_on_the_first_column(self):
+        # Two exports of the same thing should not have different shapes.
+        from counter.exports import DAILY_COLUMNS
+
+        api = self.rows(f"/api/v1/daily/?days=3&event={self.event.pk}&format=csv")
+        self.assertEqual(api[0], DAILY_COLUMNS)

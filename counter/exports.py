@@ -17,6 +17,10 @@ from .reports import daily_counts, resolve_range
 
 DAILY_COLUMNS = ["event", "date", "in", "out", "net", "peak_inside", "peak_at"]
 
+# What the event column says when the export is not scoped to one. A blank
+# reads as missing data; this reads as what it is.
+ALL_EVENTS = "All events"
+
 
 def safe_filename(*parts) -> str:
     """A filename a browser and a filesystem will both accept.

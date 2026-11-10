@@ -898,9 +898,10 @@ The API does the same thing for scripts, and takes the same filters:
 curl -o day.csv "http://127.0.0.1:8000/api/v1/daily/?event=5&start=2026-11-01&end=2026-11-30&format=csv"
 ```
 
-Its columns start at `date` rather than `event`: that endpoint can be scoped
-to a camera or to nothing at all, where an event column would be empty on
-every row.
+Both exports start with the event, so a file still says what it covers once
+it is off the dashboard and in somebody's spreadsheet. An export that is not
+scoped to one event says `All events` rather than leaving the cell blank,
+which would read as missing data.
 
 ## Visitors per date
 

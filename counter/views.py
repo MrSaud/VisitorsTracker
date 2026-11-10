@@ -22,7 +22,7 @@ from .daywindow import occupancy_window_start
 from .health import STATUS_OK, build_report
 from .models import Alert, Camera, Crossing, Event, active_event_for
 from .permissions import _is_operator
-from .exports import safe_filename
+from .exports import ALL_EVENTS, safe_filename
 from .reports import (
     DEFAULT_DAYS,
     busiest_hours,
@@ -334,11 +334,15 @@ def daily_report(request):
         response["Content-Disposition"] = (
             f'attachment; filename="visitors_{label}.csv"'
         )
+        # Every row names its event, so a file still says what it covers
+        # once it is off the dashboard and in somebody's spreadsheet.
+        scope = event.name if event is not None else ALL_EVENTS
         writer = csv.writer(response)
-        writer.writerow(["date", "in", "out", "net", "peak_inside", "peak_at"])
+        writer.writerow(["event", "date", "in", "out", "net",
+                         "peak_inside", "peak_at"])
         for row in rows:
-            writer.writerow([row["date"], row["in"], row["out"], row["net"],
-                             row["peak"], row["peak_at"] or ""])
+            writer.writerow([scope, row["date"], row["in"], row["out"],
+                             row["net"], row["peak"], row["peak_at"] or ""])
         return response
 
     return Response({
@@ -378,10 +382,12 @@ def hourly_report(request):
         response["Content-Disposition"] = (
             f'attachment; filename="visitors_by_hour_{label}.csv"'
         )
+        scope = event.name if event is not None else ALL_EVENTS
         writer = csv.writer(response)
-        writer.writerow(["hour", "in", "out", "average_in", "share_percent"])
+        writer.writerow(["event", "hour", "in", "out", "average_in",
+                         "share_percent"])
         for row in profile:
-            writer.writerow([row["label"], row["in"], row["out"],
+            writer.writerow([scope, row["label"], row["in"], row["out"],
                              row["average_in"], row["share"]])
         return response
 
