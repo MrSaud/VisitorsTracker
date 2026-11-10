@@ -1,0 +1,193 @@
+{% extends "counter/base.html" %}
+
+{% block content %}
+<main>
+  {% if has_cameras %}
+  <section class="cameras">
+    {% for camera in cameras %}
+    <article class="camera" data-camera="{{ camera.pk }}">
+      <div class="camera-head">
+        <div>
+          <h2>{{ camera.name }}</h2>
+          <div class="src">{{ camera.source }}</div>
+        </div>
+        <span class="pill" data-role="state">checking&hellip;</span>
+      </div>
+
+      <div class="viewport" data-role="viewport">
+        <div class="placeholder" data-role="placeholder">Not running{% if can_operate %} &mdash; press Start to open this camera{% endif %}.</div>
+      </div>
+
+      <div class="error" data-role="error" hidden></div>
+
+      <div class="camera-stats">
+        <div><div class="label">In</div><div class="value v-in" data-role="in">&mdash;</div></div>
+        <div><div class="label">Out</div><div class="value v-out" data-role="out">&mdash;</div></div>
+        <div><div class="label">Inside</div><div class="value v-inside" data-role="inside">&mdash;</div></div>
+      </div>
+
+      {% if can_operate %}
+      <div class="controls">
+        <button class="primary" data-action="start">Start</button>
+        <button data-action="stop">Stop</button>
+        <button class="danger" data-action="reset">Reset counts</button>
+      </div>
+      {% else %}
+      <div class="controls read-only">
+        Read-only &mdash; <a href="/admin/login/?next=/">sign in</a> to control cameras.
+      </div>
+      {% endif %}
+
+      <div class="meta" data-role="meta"></div>
+    </article>
+    {% endfor %}
+  </section>
+  {% else %}
+  <div class="empty">
+    No cameras configured yet. Add one in the <a href="/admin/counter/camera/add/">admin</a>,
+    or create a webcam entry from the shell:
+    <code>python manage.py run_counter --source 0 --name "Front door"</code>
+  </div>
+  {% endif %}
+</main>
+{% endblock %}
+
+{% block scripts %}
+const CSRF = "{{ csrf_token }}";
+const CAN_OPERATE = {% if can_operate %}true{% else %}false{% endif %};
+const IDLE_TEXT = CAN_OPERATE
+  ? "Not running — press Start to open this camera."
+  : "Not running.";
+const POLL_MS = 2000;
+
+async function postJSON(url) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "X-CSRFToken": CSRF },
+  });
+  let body = null;
+  try { body = await response.json(); } catch (err) { body = null; }
+  return { ok: response.ok, status: response.status, body: body };
+}
+
+function setText(root, role, value) {
+  const node = root.querySelector(`[data-role="${role}"]`);
+  if (node) node.textContent = value;
+}
+
+function showStream(card, cameraId) {
+  const viewport = card.querySelector('[data-role="viewport"]');
+  if (viewport.querySelector("img")) return;
+  viewport.innerHTML = "";
+  const img = document.createElement("img");
+  img.alt = "live view";
+  img.src = `/api/v1/cameras/${cameraId}/stream/?t=${Date.now()}`;
+  viewport.appendChild(img);
+}
+
+function hideStream(card, message) {
+  const viewport = card.querySelector('[data-role="viewport"]');
+  viewport.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "placeholder";
+  div.setAttribute("data-role", "placeholder");
+  div.textContent = message;
+  viewport.appendChild(div);
+}
+
+function applyCamera(card, data) {
+  const pill = card.querySelector('[data-role="state"]');
+  const errorBox = card.querySelector('[data-role="error"]');
+
+  setText(card, "in", data.totals.in);
+  setText(card, "out", data.totals.out);
+  setText(card, "inside", data.occupancy.inside);
+
+  if (data.running) {
+    pill.textContent = "running";
+    pill.classList.add("on");
+    showStream(card, data.id);
+  } else {
+    pill.textContent = "stopped";
+    pill.classList.remove("on");
+    if (!card.dataset.starting) hideStream(card, IDLE_TEXT);
+  }
+
+  const live = data.live;
+  if (live) {
+    const bits = [];
+    bits.push(`detector ${live.detector}`);
+    if (data.running) {
+      bits.push(`${live.fps.toFixed(1)} fps`);
+      bits.push(`${live.frames_read} frames`);
+      bits.push(`${live.active_tracks} tracked`);
+      bits.push(`session in ${live.session_in} / out ${live.session_out}`);
+    }
+    setText(card, "meta", bits.join(" · "));
+    if (live.error) {
+      errorBox.textContent = live.error;
+      errorBox.hidden = false;
+    } else {
+      errorBox.hidden = true;
+    }
+  } else {
+    setText(card, "meta", "");
+  }
+
+  const startButton = card.querySelector('[data-action="start"]');
+  const stopButton = card.querySelector('[data-action="stop"]');
+  if (startButton) startButton.disabled = data.running;
+  if (stopButton) stopButton.disabled = !data.running;
+}
+
+async function refresh() {
+  // Only the cards. This used to fill the dashboard's totals tiles too,
+  // which do not exist here -- so it threw on the first tile and the
+  // catch below hid it, leaving every card on "checking...".
+  try {
+    const response = await fetch("/api/v1/cameras/");
+    if (!response.ok) return;
+    const data = await response.json();
+    for (const camera of data.cameras) {
+      const card = document.querySelector(`[data-camera="${camera.id}"]`);
+      if (card) applyCamera(card, camera);
+    }
+  } catch (err) {
+    /* transient fetch failure; the next poll will retry */
+  }
+}
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const card = button.closest("[data-camera]");
+  if (!card) return;
+
+  const cameraId = card.dataset.camera;
+  const action = button.dataset.action;
+  const errorBox = card.querySelector('[data-role="error"]');
+
+  if (action === "reset" && !confirm("Delete all recorded crossings for this camera?")) {
+    return;
+  }
+
+  button.disabled = true;
+  if (action === "start") card.dataset.starting = "1";
+
+  const result = await postJSON(`/api/v1/cameras/${cameraId}/${action}/`);
+
+  if (action === "start") delete card.dataset.starting;
+
+  if (!result.ok) {
+    const detail = (result.body && result.body.detail) || `request failed (${result.status})`;
+    errorBox.textContent = detail;
+    errorBox.hidden = false;
+  }
+
+  await refresh();
+});
+
+
+refresh();
+setInterval(refresh, POLL_MS);
+{% endblock %}

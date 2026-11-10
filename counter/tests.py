@@ -359,7 +359,15 @@ class ApiTests(TestCase):
     def test_dashboard_renders(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Visitors per date")
+
+    def test_cameras_page_lists_the_cameras(self):
+        # The live views have a page of their own; the dashboard no
+        # longer carries them.
+        response = self.client.get("/cameras/")
+        self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Front door")
+        self.assertNotContains(self.client.get("/"), "Front door")
 
     def test_overall_stats(self):
         response = self.client.get("/api/v1/stats/")
@@ -1061,14 +1069,14 @@ class ApiAuthTests(TestCase):
 
     # -- dashboard ------------------------------------------------------
 
-    def test_dashboard_hides_controls_from_anonymous(self):
-        response = self.client.get("/")
+    def test_camera_controls_are_hidden_from_anonymous(self):
+        response = self.client.get("/cameras/")
         self.assertNotContains(response, 'data-action="reset"')
         self.assertContains(response, "Read-only")
 
-    def test_dashboard_shows_controls_to_staff(self):
+    def test_camera_controls_are_shown_to_staff(self):
         self.client.force_login(self.staff)
-        response = self.client.get("/")
+        response = self.client.get("/cameras/")
         self.assertContains(response, 'data-action="reset"')
 
     @override_settings(COUNTER_PUBLIC_READS=False)
@@ -5590,3 +5598,54 @@ class DashboardEventFilterTests(TestCase):
         # looks like a right one.
         response = self.client.get("/api/v1/daily/?days=7&event=99999")
         self.assertIn(response.status_code, (400, 404))
+
+
+class LiveCamerasOnTheirOwnPageTests(TestCase):
+    """The streams moved off the dashboard.
+
+    Every camera on the dashboard streamed MJPEG continuously, whether or
+    not anybody had scrolled down to look. On their own page they only
+    run while somebody is watching them.
+    """
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Front door", source="0")
+
+    def test_the_dashboard_carries_no_streams(self):
+        page = self.client.get("/").content.decode()
+        self.assertNotIn('class="camera"', page)
+        self.assertNotIn('data-role="viewport"', page)
+
+    def test_the_cameras_page_carries_them(self):
+        page = self.client.get("/cameras/").content.decode()
+        self.assertIn('class="camera"', page)
+        self.assertIn('data-role="viewport"', page)
+
+    def test_both_pages_can_reach_the_other(self):
+        # The desktop window has no Back button, so a page with no way
+        # out is a dead end.
+        for path in ("/", "/cameras/"):
+            with self.subTest(path=path):
+                page = self.client.get(path).content.decode()
+                self.assertIn('href="/"', page)
+                self.assertIn('href="/cameras/"', page)
+
+    def test_each_page_marks_where_you_are(self):
+        self.assertIn('href="/" class="on"',
+                      self.client.get("/").content.decode())
+        self.assertIn('href="/cameras/" class="on"',
+                      self.client.get("/cameras/").content.decode())
+
+    def test_the_cameras_page_asks_only_for_cameras(self):
+        # It used to call /api/v1/stats/ and fill dashboard tiles that are
+        # not there, which threw on the first one and left every card
+        # stuck on "checking...".
+        page = self.client.get("/cameras/").content.decode()
+        self.assertIn('fetch("/api/v1/cameras/")', page)
+        self.assertNotIn('getElementById("t-in")', page)
+
+    def test_the_dashboard_still_updates_its_tiles(self):
+        # That logic lived in the function that moved.
+        page = self.client.get("/").content.decode()
+        self.assertIn("refreshTotals", page)
+        self.assertIn('getElementById("t-in")', page)

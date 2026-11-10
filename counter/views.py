@@ -43,14 +43,28 @@ from .reports import (
 # ---------------------------------------------------------------------------
 
 def dashboard(request):
+    return render(request, "counter/dashboard.html", _page_context(request, "dashboard"))
+
+
+def cameras_page(request):
+    """The live views, on their own page.
+
+    They were under the reports on the dashboard, where every camera
+    streams MJPEG continuously whether or not anybody has scrolled far
+    enough to see them. A page of their own means the streams only run
+    when somebody is actually watching.
+    """
+    return render(request, "counter/cameras.html", _page_context(request, "cameras"))
+
+
+def _page_context(request, page):
     cameras = list(Camera.objects.all())
     running = {row["camera_id"] for row in REGISTRY.stats() if row["running"]}
     for camera in cameras:
         camera.is_running = camera.pk in running
-    return render(
-        request,
-        "counter/dashboard.html",
+    return (
         {
+            "page": page,
             "cameras": cameras,
             "has_cameras": bool(cameras),
             # For the event filter. Newest first: the one somebody wants
@@ -61,7 +75,7 @@ def dashboard(request):
             "initial_admin": _initial_admin_note(),
             # Controls are hidden rather than left to fail with a 403.
             "can_operate": _is_operator(request),
-        },
+        }
     )
 
 

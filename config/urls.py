@@ -6,7 +6,7 @@ from django.urls import re_path
 from django.contrib import admin
 from django.urls import include, path
 
-from counter.views import dashboard
+from counter.views import cameras_page, dashboard
 
 admin.site.site_header = "VisitorsTracker Admin"
 admin.site.site_title = "VisitorsTracker Admin"
@@ -14,6 +14,7 @@ admin.site.index_title = "VisitorsTracker administration"
 
 urlpatterns = [
     path("", dashboard, name="dashboard"),
+    path("cameras/", cameras_page, name="cameras"),
     path("admin/", admin.site.urls),
     path("api/v1/", include("counter.urls")),
 ]
