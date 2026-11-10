@@ -5519,3 +5519,74 @@ class CsvNamesItsEventTests(TestCase):
 
         api = self.rows(f"/api/v1/daily/?days=3&event={self.event.pk}&format=csv")
         self.assertEqual(api[0], DAILY_COLUMNS)
+
+
+class DashboardEventFilterTests(TestCase):
+    """Choosing an event on the dashboard, and in what it exports.
+
+    The CSV carried an event column but the dashboard never sent one, so
+    every download said "All events" no matter what you were looking at.
+    """
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.show = Event.objects.create(
+            name="Trade show", starts_at=timezone.now() - timedelta(days=2),
+            ends_at=timezone.now() + timedelta(days=1))
+        self.open_day = Event.objects.create(
+            name="Open day", starts_at=timezone.now() - timedelta(days=5),
+            ends_at=timezone.now() - timedelta(days=4))
+        Crossing.objects.create(camera=self.camera, event=self.show,
+                                direction=DIRECTION_IN, track_id=1,
+                                occurred_at=timezone.now())
+
+    def page(self):
+        return self.client.get("/").content.decode()
+
+    def test_both_panels_offer_an_event_picker(self):
+        page = self.page()
+        self.assertIn('id="d-event"', page)
+        self.assertIn('id="h-event"', page)
+
+    def test_every_event_is_listed_with_an_all_option(self):
+        page = self.page()
+        self.assertIn(">All events<", page)
+        self.assertIn("Trade show", page)
+        self.assertIn("Open day", page)
+
+    def test_the_newest_event_comes_first(self):
+        # The one somebody wants is nearly always the most recent.
+        page = self.page()
+        self.assertLess(page.index("Trade show"), page.index("Open day"))
+
+    def test_the_url_builders_carry_the_selection(self):
+        page = self.page()
+        self.assertIn('eventParam("d-event")', page)
+        self.assertIn('eventParam("h-event")', page)
+
+    def test_a_filtered_csv_names_that_event_on_every_row(self):
+        rows = list(csv.reader(self.client.get(
+            f"/api/v1/daily/?days=7&event={self.show.pk}&format=csv"
+        ).content.decode().splitlines()))
+        self.assertTrue(all(r[0] == "Trade show" for r in rows[1:]))
+
+    def test_the_counts_follow_the_event_too(self):
+        # Not just the label: the other event has no crossings.
+        mine = self.client.get(
+            f"/api/v1/daily/?days=7&event={self.show.pk}").json()
+        theirs = self.client.get(
+            f"/api/v1/daily/?days=7&event={self.open_day.pk}").json()
+        self.assertEqual(mine["summary"]["in"], 1)
+        self.assertEqual(theirs["summary"]["in"], 0)
+
+    def test_the_hourly_export_follows_it_as_well(self):
+        rows = list(csv.reader(self.client.get(
+            f"/api/v1/hourly/?days=7&event={self.show.pk}&format=csv"
+        ).content.decode().splitlines()))
+        self.assertTrue(all(r[0] == "Trade show" for r in rows[1:]))
+
+    def test_an_unknown_event_is_refused_not_ignored(self):
+        # Silently reporting on everything would be a wrong answer that
+        # looks like a right one.
+        response = self.client.get("/api/v1/daily/?days=7&event=99999")
+        self.assertIn(response.status_code, (400, 404))

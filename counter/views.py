@@ -53,6 +53,9 @@ def dashboard(request):
         {
             "cameras": cameras,
             "has_cameras": bool(cameras),
+            # For the event filter. Newest first: the one somebody wants
+            # to look at is nearly always the most recent.
+            "events": Event.objects.order_by("-starts_at"),
             # Shown until the operator deletes the file, because a
             # generated password nobody can find is no better than none.
             "initial_admin": _initial_admin_note(),

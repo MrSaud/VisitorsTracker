@@ -898,6 +898,11 @@ The API does the same thing for scripts, and takes the same filters:
 curl -o day.csv "http://127.0.0.1:8000/api/v1/daily/?event=5&start=2026-11-01&end=2026-11-30&format=csv"
 ```
 
+On the dashboard, each of the two report panels has an **All events**
+dropdown. Pick one and the figures, the chart and the CSV all narrow to it;
+the control is outlined while it is narrowing anything, so a report is never
+quietly about one event when you expected all of them.
+
 Both exports start with the event, so a file still says what it covers once
 it is off the dashboard and in somebody's spreadsheet. An export that is not
 scoped to one event says `All events` rather than leaving the cell blank,

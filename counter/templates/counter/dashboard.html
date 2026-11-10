@@ -246,6 +246,12 @@
     color-scheme: dark; }
   .range .dates input[type="date"]:focus { outline: none; border-color: #2a7399; }
   .range button:disabled { opacity: 0.45; cursor: default; }
+  .range .event-pick {
+    background: #121821; border: 1px solid #2a3340; border-radius: 6px;
+    color: #dbe6f0; padding: 4px 8px; font: inherit; font-size: 12.5px;
+    max-width: 190px; }
+  .range .event-pick:focus { outline: none; border-color: #2a7399; }
+  .range .event-pick.on { border-color: #2a7399; background: #16222e; }
   .daily-summary {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -383,6 +389,12 @@
         <button data-days="7">7 days</button>
         <button data-days="30" class="on">30 days</button>
         <button data-days="90">90 days</button>
+        <select class="event-pick" id="d-event" title="Show one event only">
+          <option value="">All events</option>
+          {% for event in events %}
+          <option value="{{ event.pk }}">{{ event.name }}</option>
+          {% endfor %}
+        </select>
         <span class="dates">
           <label for="d-from">From</label>
           <input type="date" id="d-from">
@@ -420,6 +432,12 @@
     <div class="panel-head">
       <h2>Busiest hours</h2>
       <div class="range">
+        <select class="event-pick" id="h-event" title="Show one event only">
+          <option value="">All events</option>
+          {% for event in events %}
+          <option value="{{ event.pk }}">{{ event.name }}</option>
+          {% endfor %}
+        </select>
         <button data-hdays="7">7 days</button>
         <button data-hdays="30" class="on">30 days</button>
         <button data-hdays="90">90 days</button>
@@ -802,12 +820,21 @@ function dailyRange() {
   return from && to ? { from, to } : null;
 }
 
+function eventParam(selectId) {
+  const select = document.getElementById(selectId);
+  const value = select ? select.value : "";
+  // Highlight the control when it is narrowing what you see, so a report
+  // is never quietly about one event when you expected all of them.
+  if (select) select.classList.toggle("on", Boolean(value));
+  return value ? `&event=${encodeURIComponent(value)}` : "";
+}
+
 function dailyUrl(extra) {
   const range = dailyRange();
   const query = range
     ? `start=${range.from}&end=${range.to}`
     : `days=${dailyDays}`;
-  return `/api/v1/daily/?${query}` + (extra || "");
+  return `/api/v1/daily/?${query}` + eventParam("d-event") + (extra || "");
 }
 
 function renderDaily(data) {
@@ -909,6 +936,9 @@ document.querySelectorAll(".range button[data-days]").forEach((button) => {
     if (dailyRange()) refreshDaily();
   });
 });
+
+document.getElementById("d-event").addEventListener("change", refreshDaily);
+document.getElementById("h-event").addEventListener("change", refreshHourly);
 
 dClear.addEventListener("click", () => {
   dFrom.value = "";
@@ -1057,7 +1087,8 @@ async function refreshAlerts() {
 let hourlyDays = 30;
 
 function hourlyUrl(extra) {
-  return `/api/v1/hourly/?days=${hourlyDays}` + (extra || "");
+  return `/api/v1/hourly/?days=${hourlyDays}`
+    + eventParam("h-event") + (extra || "");
 }
 
 function describeHour(row) {
