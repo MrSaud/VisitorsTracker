@@ -1197,6 +1197,35 @@ python manage.py run_counter --source clip.mp4 --name "Test clip"
 deployment use `supervise`, which also restarts what stops — see
 [Staying up](#staying-up).
 
+## What each crossing records
+
+A crossing is not just a tally. The detector and the tracker already know
+these at the moment somebody crosses, and they used to be discarded:
+
+| | |
+|---|---|
+| `confidence` | the detector's own score, 0–1 |
+| `line_offset` | where along the line, 0 at one end and 1 at the other |
+| `speed` | pixels per frame across the line — a drift is slow, a walk is not |
+| `box_width`, `box_height` | how big they appeared, which stands in for distance |
+
+```bash
+curl -o crossings.csv "http://127.0.0.1:8000/api/v1/crossings/?days=1&format=csv"
+```
+
+```
+event,camera,occurred_at,direction,track_id,confidence,line_offset,speed,box_width,box_height
+Trade show,Door,2026-11-10T09:14:02+03:00,in,41,0.86,0.59,5.0,59.3,158.7
+```
+
+This is what a hand count is compared against. "4% under" tells you the
+figure is wrong; this tells you the eleven you missed were all weak
+detections bunched at one end of the line, which is a thing you can fix.
+The admin's crossing list labels each one strong, fair or weak beside the
+number — descriptive only, nothing is discarded.
+
+Rows recorded before this existed have empty cells rather than zeros.
+
 ## Measuring accuracy
 
 Until you can say "within 3%", you cannot put a number in front of a client.

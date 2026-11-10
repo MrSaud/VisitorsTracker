@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from typing import NamedTuple
 from pathlib import Path
 
 import cv2
@@ -286,6 +287,10 @@ class Track:
     box: tuple
     disappeared: int = 0
     side: int = 0
+    # The detector's confidence in the most recent measurement. Carried so
+    # a crossing can record how sure the machine was, instead of every
+    # count looking equally solid.
+    score: float = 0.0
     trail: deque = field(default_factory=lambda: deque(maxlen=24))
 
 
@@ -313,7 +318,13 @@ class CentroidTracker:
 
     def update_detections(self, detections):
         """Common interface: ``detections`` is a list of ``(box, score)``."""
-        return self.update([box for box, _score in detections])
+        tracks = self.update([box for box, _score in detections])
+        # Match scores back by box, since update() works on boxes alone.
+        by_box = {tuple(box): score for box, score in detections}
+        for track in tracks.values():
+            if tuple(track.box) in by_box:
+                track.score = float(by_box[tuple(track.box)])
+        return tracks
 
     def advance(self):
         """No motion model, so a skipped frame simply holds position."""
@@ -384,6 +395,24 @@ class CentroidTracker:
 # counting
 # ---------------------------------------------------------------------------
 
+class CrossingEvent(NamedTuple):
+    """What was true of a track at the moment it crossed.
+
+    All of it was already computed and then dropped. Kept because a count
+    with no provenance cannot be audited: after a hand count disagrees,
+    this is the difference between knowing the figure is wrong and
+    knowing which crossings were marginal and why.
+    """
+
+    track_id: int
+    direction: str
+    confidence: float       # the detector's, 0..1
+    offset: float           # where along the line, 0 at one end, 1 at the other
+    speed: float            # pixels per frame across the line
+    width: float            # of the box, in frame pixels
+    height: float
+
+
 class LineCounter:
     """Counts tracks crossing a virtual line, with a dead band against jitter."""
 
@@ -423,6 +452,36 @@ class LineCounter:
         except (TypeError, ValueError):
             return 0.0
         return abs(y2 - y1) if self.orientation == HORIZONTAL else abs(x2 - x1)
+
+    def _along_line(self, track, frame_shape) -> float:
+        """Where along the line they crossed, 0 at one end and 1 at the other.
+
+        A door with two leaves, or a line drawn too wide, shows up here:
+        crossings bunched at one end mean the line is not where the people
+        are.
+        """
+        height, width = frame_shape[:2]
+        span = width if self.orientation == HORIZONTAL else height
+        value = track.centroid[0] if self.orientation == HORIZONTAL else track.centroid[1]
+        if span <= 0:
+            return 0.0
+        return max(0.0, min(1.0, float(value) / span))
+
+    def _speed(self, track) -> float:
+        """Pixels per frame across the line, from the track's own trail.
+
+        Distinguishes a walk from a drift. The trail is short and already
+        kept for drawing, so this costs nothing.
+        """
+        trail = list(track.trail)
+        if len(trail) < 2:
+            return 0.0
+        axis = 1 if self.orientation == HORIZONTAL else 0
+        recent = trail[-6:]
+        if len(recent) < 2:
+            return 0.0
+        travelled = abs(float(recent[-1][axis]) - float(recent[0][axis]))
+        return travelled / (len(recent) - 1)
 
     def _is_clear_of_line(self, track, delta) -> bool:
         """Far enough past the line that it cannot be a sway."""
@@ -480,7 +539,16 @@ class LineCounter:
                 self.total_in += 1
             else:
                 self.total_out += 1
-            events.append((track.track_id, direction))
+            x1, y1, x2, y2 = track.box if track.box else (0, 0, 0, 0)
+            events.append(CrossingEvent(
+                track_id=track.track_id,
+                direction=direction,
+                confidence=round(float(track.score), 4),
+                offset=round(self._along_line(track, frame_shape), 4),
+                speed=round(self._speed(track), 2),
+                width=round(abs(float(x2) - float(x1)), 1),
+                height=round(abs(float(y2) - float(y1)), 1),
+            ))
             track.side = side
 
         return events

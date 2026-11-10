@@ -79,9 +79,25 @@ class EventAdmin(admin.ModelAdmin):
 
 @admin.register(Crossing)
 class CrossingAdmin(admin.ModelAdmin):
-    list_display = ("camera", "event", "direction", "track_id", "occurred_at")
+    list_display = ("camera", "event", "direction", "track_id", "occurred_at",
+                    "sureness", "line_offset", "speed")
     list_filter = ("direction", "camera", "event")
     date_hierarchy = "occurred_at"
+
+    @admin.display(description="Confidence", ordering="confidence")
+    def sureness(self, obj):
+        """Plain words beside the number, so a weak count is obvious.
+
+        The thresholds are descriptive, not a judgement: nothing is
+        discarded, it is only labelled.
+        """
+        if obj.confidence is None:
+            return "—"
+        if obj.confidence >= 0.75:
+            return f"{obj.confidence:.2f} strong"
+        if obj.confidence >= 0.5:
+            return f"{obj.confidence:.2f} fair"
+        return f"{obj.confidence:.2f} weak"
 
 
 @admin.register(Alert)

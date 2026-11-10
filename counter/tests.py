@@ -104,6 +104,7 @@ from .reports import (
     summarise,
 )
 from .vision import (
+    CrossingEvent,
     DEFAULT_HOG_CONFIDENCE,
     DEFAULT_ONNX_CONFIDENCE,
     PERSON_CLASS_ID,
@@ -142,14 +143,19 @@ class StubDetector:
 
     name = "stub"
 
-    def __init__(self, script):
+    def __init__(self, script, scores=None):
         self.script = list(script)
+        self.scores = list(scores) if scores else None
         self.calls = 0
 
     def detect(self, frame):
         boxes = self.script[min(self.calls, len(self.script) - 1)]
         self.calls += 1
-        return [(box, 1.0) for box in boxes]
+        if self.scores is None:
+            return [(box, 1.0) for box in boxes]
+        # Cycle, so one score can stand for every frame.
+        return [(box, self.scores[i % len(self.scores)])
+                for i, box in enumerate(boxes)]
 
 
 class NonMaxSuppressionTests(TestCase):
@@ -209,19 +215,19 @@ class LineCounterTests(TestCase):
     def test_downward_crossing_counts_in(self):
         counter = LineCounter(position=0.5, orientation=HORIZONTAL)
         events = self._run(counter, [40, 80, 100, 140, 180, 200])
-        self.assertEqual([d for _tid, d in events], [DIRECTION_IN])
+        self.assertEqual([e.direction for e in events], [DIRECTION_IN])
         self.assertEqual((counter.total_in, counter.total_out), (1, 0))
 
     def test_upward_crossing_counts_out(self):
         counter = LineCounter(position=0.5, orientation=HORIZONTAL)
         events = self._run(counter, [200, 180, 140, 100, 80, 40])
-        self.assertEqual([d for _tid, d in events], [DIRECTION_OUT])
+        self.assertEqual([e.direction for e in events], [DIRECTION_OUT])
         self.assertEqual((counter.total_in, counter.total_out), (0, 1))
 
     def test_round_trip_counts_both_directions(self):
         counter = LineCounter(position=0.5, orientation=HORIZONTAL)
         events = self._run(counter, [40, 100, 180, 200, 180, 100, 40])
-        self.assertEqual([d for _tid, d in events], [DIRECTION_IN, DIRECTION_OUT])
+        self.assertEqual([e.direction for e in events], [DIRECTION_IN, DIRECTION_OUT])
         self.assertEqual((counter.total_in, counter.total_out), (1, 1))
 
     def test_jitter_inside_dead_band_never_counts(self):
@@ -239,7 +245,7 @@ class LineCounterTests(TestCase):
     def test_invert_swaps_direction(self):
         counter = LineCounter(position=0.5, orientation=HORIZONTAL, invert=True)
         events = self._run(counter, [40, 100, 180, 200])
-        self.assertEqual([d for _tid, d in events], [DIRECTION_OUT])
+        self.assertEqual([e.direction for e in events], [DIRECTION_OUT])
 
     def test_vertical_line_uses_x_axis(self):
         counter = LineCounter(position=0.5, orientation=VERTICAL)
@@ -248,7 +254,7 @@ class LineCounterTests(TestCase):
         for x in (40, 100, 150, 200, 260):
             tracks = tracker.update([box_at(x, 120)])
             events.extend(counter.update(tracks, (FRAME_H, FRAME_W, 3)))
-        self.assertEqual([d for _tid, d in events], [DIRECTION_IN])
+        self.assertEqual([e.direction for e in events], [DIRECTION_IN])
 
     def test_line_coordinate_follows_orientation(self):
         horizontal = LineCounter(position=0.25, orientation=HORIZONTAL)
@@ -277,7 +283,7 @@ class VisitorCounterTests(TestCase):
             total_events.extend(events)
 
         self.assertEqual(len(total_events), 2)
-        self.assertEqual({d for _tid, d in total_events}, {DIRECTION_IN})
+        self.assertEqual({e.direction for e in total_events}, {DIRECTION_IN})
         self.assertEqual(counter.total_in, 2)
         self.assertEqual(counter.occupancy, 2)
 
@@ -5649,3 +5655,111 @@ class LiveCamerasOnTheirOwnPageTests(TestCase):
         page = self.client.get("/").content.decode()
         self.assertIn("refreshTotals", page)
         self.assertIn('getElementById("t-in")', page)
+
+
+class CrossingProvenanceTests(TestCase):
+    """What was true of a track when it crossed, kept rather than dropped.
+
+    All of this was already computed by the detector and the tracker and
+    thrown away at the line. Without it a disagreement with a hand count
+    says only that the figure is wrong.
+    """
+
+    def counter_over(self, ys, orientation=HORIZONTAL, scores=None):
+        frames = [[box_at(160, y)] for y in ys]
+        detector = StubDetector(frames, scores=scores) if scores else StubDetector(frames)
+        counter = VisitorCounter(
+            detector=detector,
+            tracker=build_tracker("sort", max_disappeared=25),
+            line=LineCounter(position=0.5, orientation=orientation),
+            detect_every=1,
+        )
+        frame = blank_frame()
+        events = []
+        for _ in ys:
+            events.extend(counter.process(frame)[1])
+        return events
+
+    def test_a_crossing_reports_where_along_the_line_it_happened(self):
+        events = self.counter_over(list(range(10, 235, 15)))
+        self.assertEqual(len(events), 1)
+        self.assertGreaterEqual(events[0].offset, 0.0)
+        self.assertLessEqual(events[0].offset, 1.0)
+
+    def test_a_crossing_reports_its_speed(self):
+        slow = self.counter_over(list(range(10, 235, 8)))
+        fast = self.counter_over(list(range(10, 235, 40)))
+        self.assertGreater(fast[0].speed, slow[0].speed,
+                           "a sprint should not look like a stroll")
+
+    def test_a_crossing_reports_the_box_it_was_seen_in(self):
+        events = self.counter_over(list(range(10, 235, 15)))
+        self.assertGreater(events[0].width, 0)
+        self.assertGreater(events[0].height, 0)
+
+    def test_the_detector_confidence_survives_the_tracker(self):
+        # It used to be dropped at update_detections, so every crossing
+        # looked equally certain.
+        events = self.counter_over(list(range(10, 235, 15)), scores=[0.83])
+        self.assertAlmostEqual(events[0].confidence, 0.83, places=2)
+
+    def test_the_worker_stores_all_of_it(self):
+        camera = Camera.objects.create(name="Door", source="0")
+        worker = CounterWorker(camera)
+        worker._persist([CrossingEvent(
+            track_id=7, direction=DIRECTION_IN, confidence=0.91,
+            offset=0.33, speed=4.2, width=40.0, height=120.0)])
+        row = Crossing.objects.get()
+        self.assertEqual(row.track_id, 7)
+        self.assertAlmostEqual(row.confidence, 0.91)
+        self.assertAlmostEqual(row.line_offset, 0.33)
+        self.assertAlmostEqual(row.speed, 4.2)
+        self.assertAlmostEqual(row.box_width, 40.0)
+        self.assertAlmostEqual(row.box_height, 120.0)
+
+    def test_older_rows_without_it_are_fine(self):
+        # Everything recorded before this existed has nulls, and nothing
+        # should trip over them.
+        camera = Camera.objects.create(name="Door", source="0")
+        Crossing.objects.create(camera=camera, direction=DIRECTION_IN,
+                                track_id=1, occurred_at=timezone.now())
+        response = self.client.get("/api/v1/crossings/?days=7")
+        self.assertEqual(response.status_code, 200)
+        rows = list(csv.reader(response.content.decode().splitlines()))
+        self.assertEqual(rows[1][5], "", "a missing confidence is blank, not 0")
+
+
+class CrossingsCsvTests(TestCase):
+    """One row per crossing, for comparing against a hand count."""
+
+    def setUp(self):
+        self.camera = Camera.objects.create(name="Door", source="0")
+        self.event = Event.objects.create(
+            name="Trade show", starts_at=timezone.now() - timedelta(days=1),
+            ends_at=timezone.now() + timedelta(days=1))
+        for i in range(3):
+            Crossing.objects.create(
+                camera=self.camera, event=self.event, direction=DIRECTION_IN,
+                track_id=i, occurred_at=timezone.now(), confidence=0.6 + i / 10,
+                line_offset=0.5, speed=4.0, box_width=40.0, box_height=120.0)
+
+    def test_it_gives_a_row_per_crossing_not_per_day(self):
+        rows = list(csv.reader(self.client.get(
+            "/api/v1/crossings/?days=7").content.decode().splitlines()))
+        self.assertEqual(len(rows) - 1, 3)
+
+    def test_every_measurement_is_there(self):
+        rows = list(csv.reader(self.client.get(
+            "/api/v1/crossings/?days=7").content.decode().splitlines()))
+        for column in ("confidence", "line_offset", "speed",
+                       "box_width", "box_height"):
+            self.assertIn(column, rows[0])
+
+    def test_it_filters_by_event_like_the_others(self):
+        other = Event.objects.create(
+            name="Quiet day", starts_at=timezone.now() - timedelta(days=1),
+            ends_at=timezone.now())
+        rows = list(csv.reader(self.client.get(
+            f"/api/v1/crossings/?days=7&event={other.pk}"
+        ).content.decode().splitlines()))
+        self.assertEqual(len(rows) - 1, 0)

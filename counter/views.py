@@ -24,6 +24,7 @@ from .models import Alert, Camera, Crossing, Event, active_event_for
 from .permissions import _is_operator
 from .exports import ALL_EVENTS, safe_filename
 from .reports import (
+    _bounds,
     DEFAULT_DAYS,
     busiest_hours,
     daily_counts,
@@ -197,6 +198,55 @@ def camera_stop(request, camera_id: int):
     camera = get_object_or_404(Camera, pk=camera_id)
     stopped = REGISTRY.stop(camera.pk)
     return Response({"camera_id": camera.pk, "stopped": stopped})
+
+
+@api_view(["GET"])
+def crossings_csv(request):
+    """Every crossing in a window, one row each, with its provenance.
+
+    The daily report says how many; this says which, and how sure the
+    machine was about each one. It is what a hand count is compared
+    against when the totals disagree.
+    """
+    try:
+        start, end, days, camera, event = _daily_params(request)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    window_start, window_end = resolve_range(start, end, days)
+    begin, finish = _bounds(window_start, window_end)
+
+    rows = Crossing.objects.filter(occurred_at__gte=begin, occurred_at__lt=finish)
+    if camera is not None:
+        rows = rows.filter(camera=camera)
+    if event is not None:
+        rows = rows.filter(event=event)
+    rows = rows.select_related("camera", "event").order_by("occurred_at", "id")
+
+    label = safe_filename(
+        event.name if event else "all-events",
+        f"{window_start.isoformat()}_{window_end.isoformat()}")
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = f'attachment; filename="crossings_{label}.csv"'
+
+    writer = csv.writer(response)
+    writer.writerow(["event", "camera", "occurred_at", "direction", "track_id",
+                     "confidence", "line_offset", "speed",
+                     "box_width", "box_height"])
+    for row in rows.iterator():
+        writer.writerow([
+            row.event.name if row.event else ALL_EVENTS,
+            row.camera.name,
+            timezone.localtime(row.occurred_at).isoformat(),
+            row.direction,
+            row.track_id,
+            "" if row.confidence is None else row.confidence,
+            "" if row.line_offset is None else row.line_offset,
+            "" if row.speed is None else row.speed,
+            "" if row.box_width is None else row.box_width,
+            "" if row.box_height is None else row.box_height,
+        ])
+    return response
 
 
 @api_view(["GET"])

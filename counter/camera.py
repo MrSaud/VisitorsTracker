@@ -537,12 +537,17 @@ class CounterWorker(threading.Thread):
         rows = [
             Crossing(
                 camera_id=self.camera_pk,
-                track_id=track_id,
-                direction=direction,
+                track_id=event.track_id,
+                direction=event.direction,
                 occurred_at=now,
                 event_id=event_id,
+                confidence=event.confidence,
+                line_offset=event.offset,
+                speed=event.speed,
+                box_width=event.width,
+                box_height=event.height,
             )
-            for track_id, direction in events
+            for event in events
         ]
         try:
             close_old_connections()

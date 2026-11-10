@@ -381,6 +381,26 @@ class Crossing(models.Model):
     track_id = models.PositiveIntegerField(
         help_text="Tracker-local id; unique per counter run, not across restarts."
     )
+
+    # What was true at the moment of the crossing. All of it was already
+    # computed by the detector and the tracker and then discarded. A count
+    # without it cannot be audited: when a hand count disagrees, this is
+    # what says which crossings were marginal and why. Null on rows
+    # recorded before this was kept.
+    confidence = models.FloatField(
+        null=True, blank=True,
+        help_text="The detector's confidence, 0-1, at the crossing.")
+    line_offset = models.FloatField(
+        null=True, blank=True,
+        help_text="Where along the line they crossed: 0 at one end, 1 at the other.")
+    speed = models.FloatField(
+        null=True, blank=True,
+        help_text="Pixels per frame across the line. A drift is slow; a walk is not.")
+    box_width = models.FloatField(null=True, blank=True)
+    box_height = models.FloatField(
+        null=True, blank=True,
+        help_text="Box size in frame pixels, which stands in for distance.")
+
     direction = models.CharField(max_length=8, choices=DIRECTION_CHOICES, db_index=True)
     occurred_at = models.DateTimeField(default=timezone.now, db_index=True)
 

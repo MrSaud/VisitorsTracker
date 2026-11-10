@@ -216,12 +216,13 @@ class _Candidate:
 
     __slots__ = ("kalman", "hits", "time_since_update", "track")
 
-    def __init__(self, track_id, box):
+    def __init__(self, track_id, box, score=0.0):
         box = tuple(float(v) for v in box)
         self.kalman = KalmanBox(box)
         self.hits = 1
         self.time_since_update = 0
-        self.track = Track(track_id=track_id, centroid=_centre(box), box=box)
+        self.track = Track(track_id=track_id, centroid=_centre(box), box=box,
+                           score=float(score))
         self.track.trail.append(_centre(box))
 
     @property
@@ -232,12 +233,20 @@ class _Candidate:
     def box(self):
         return self.track.box
 
-    def place(self, box):
-        """Move the track to ``box`` and extend its trail."""
+    def place(self, box, score=None):
+        """Move the track to ``box`` and extend its trail.
+
+        ``score`` is the detector's confidence in the measurement this
+        came from. It is carried so a crossing can say how sure the
+        machine was; a predicted position has none, so the last real one
+        is kept rather than reset to zero.
+        """
         box = tuple(float(v) for v in box)
         self.track.box = box
         self.track.centroid = _centre(box)
         self.track.disappeared = self.time_since_update
+        if score is not None:
+            self.track.score = float(score)
         self.track.trail.append(self.track.centroid)
 
 
@@ -336,7 +345,8 @@ class SortTracker:
             candidate = self._candidates[track_index]
             candidate.hits += 1
             candidate.time_since_update = 0
-            candidate.place(candidate.kalman.update(boxes[det_index]))
+            candidate.place(candidate.kalman.update(boxes[det_index]),
+                            score=scores[det_index])
 
         for track_index in unmatched_tracks:
             candidate = self._candidates[track_index]
@@ -344,7 +354,8 @@ class SortTracker:
             candidate.place(predicted[track_index])
 
         for det_index in unmatched_dets:
-            self._candidates.append(_Candidate(self._next_id, boxes[det_index]))
+            self._candidates.append(_Candidate(self._next_id, boxes[det_index],
+                                        scores[det_index]))
             self._next_id += 1
 
         self._candidates = [

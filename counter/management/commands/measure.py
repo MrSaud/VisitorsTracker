@@ -92,13 +92,20 @@ class Command(BaseCommand):
 
                 annotated, events = counter.process(frame)
                 at = frame_index / source_fps if source_fps else 0.0
-                for track_id, direction in events:
+                for event in events:
                     crossings.append({
                         "frame": frame_index,
                         "at": clock(at),
                         "seconds": round(at, 2),
-                        "direction": direction,
-                        "track_id": track_id,
+                        "direction": event.direction,
+                        "track_id": event.track_id,
+                        # The point of measuring is to learn why a count
+                        # was wrong, not only that it was.
+                        "confidence": event.confidence,
+                        "line_offset": event.offset,
+                        "speed": event.speed,
+                        "box_width": event.width,
+                        "box_height": event.height,
                     })
 
                 if options["record"]:
@@ -219,7 +226,9 @@ class Command(BaseCommand):
             options["csv_path"] or clip.with_suffix(".crossings.csv")).expanduser()
         with target.open("w", newline="") as handle:
             writer = csv.DictWriter(
-                handle, fieldnames=["frame", "at", "seconds", "direction", "track_id"])
+                handle, fieldnames=["frame", "at", "seconds", "direction", "track_id",
+            "confidence", "line_offset", "speed",
+            "box_width", "box_height"])
             writer.writeheader()
             writer.writerows(crossings)
         return target
