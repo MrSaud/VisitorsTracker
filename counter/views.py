@@ -18,6 +18,7 @@ from rest_framework.response import Response
 
 from .alerts import alert_channels, alerts_enabled
 from .camera import REGISTRY, mjpeg_frames
+from .supervisor import current_supervisor
 from .daywindow import occupancy_window_start
 from .health import STATUS_OK, build_report
 from .models import Alert, Camera, Crossing, Event, active_event_for
@@ -195,9 +196,56 @@ def camera_start(request, camera_id: int):
 
 @api_view(["POST"])
 def camera_stop(request, camera_id: int):
+    """Stop the worker now.
+
+    Temporary where a supervisor is running: it restarts any active
+    camera that is not alive, so this holds for a cooldown and no longer.
+    Disabling is what keeps a camera off.
+    """
     camera = get_object_or_404(Camera, pk=camera_id)
     stopped = REGISTRY.stop(camera.pk)
-    return Response({"camera_id": camera.pk, "stopped": stopped})
+    return Response({
+        "camera_id": camera.pk,
+        "stopped": stopped,
+        "is_active": camera.is_active,
+        # So the page can say so rather than letting somebody watch a
+        # camera they just stopped come back by itself.
+        "will_restart": bool(camera.is_active and current_supervisor() is not None),
+    })
+
+
+@api_view(["POST"])
+def camera_enable(request, camera_id: int):
+    """Mark the camera active, so the supervisor keeps it running."""
+    return _set_active(camera_id, True)
+
+
+@api_view(["POST"])
+def camera_disable(request, camera_id: int):
+    """Mark the camera inactive and stop it.
+
+    The durable off switch. Stop alone is undone by the supervisor within
+    a cooldown; this is what somebody means by "turn that camera off".
+    """
+    return _set_active(camera_id, False)
+
+
+def _set_active(camera_id, active):
+    camera = get_object_or_404(Camera, pk=camera_id)
+    if camera.is_active != active:
+        camera.is_active = active
+        camera.save(update_fields=["is_active"])
+
+    stopped = False
+    if not active:
+        # Do not wait for the supervisor's next pass to act on it.
+        stopped = REGISTRY.stop(camera.pk)
+
+    return Response({
+        "camera_id": camera.pk,
+        "is_active": camera.is_active,
+        "stopped": stopped,
+    })
 
 
 @api_view(["GET"])

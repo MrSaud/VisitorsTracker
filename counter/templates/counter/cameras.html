@@ -19,6 +19,7 @@
       </div>
 
       <div class="error" data-role="error" hidden></div>
+      <div class="note" data-role="note" hidden></div>
 
       <div class="camera-stats">
         <div><div class="label">In</div><div class="value v-in" data-role="in">&mdash;</div></div>
@@ -29,7 +30,9 @@
       {% if can_operate %}
       <div class="controls">
         <button class="primary" data-action="start">Start</button>
-        <button data-action="stop">Stop</button>
+        <button data-action="stop" title="Stops it now. A supervised camera restarts itself shortly after.">Stop</button>
+        <button data-action="enable" hidden>Enable</button>
+        <button data-action="disable" title="Keeps it off until you enable it again.">Disable</button>
         <button class="danger" data-action="reset">Reset counts</button>
       </div>
       {% else %}
@@ -136,8 +139,32 @@ function applyCamera(card, data) {
 
   const startButton = card.querySelector('[data-action="start"]');
   const stopButton = card.querySelector('[data-action="stop"]');
-  if (startButton) startButton.disabled = data.running;
+  const enableButton = card.querySelector('[data-action="enable"]');
+  const disableButton = card.querySelector('[data-action="disable"]');
+  const note = card.querySelector('[data-role="note"]');
+  const active = data.is_active !== false;
+
+  if (startButton) {
+    // Starting a disabled camera achieves nothing: the supervisor stops
+    // any camera that is not active on its next pass.
+    startButton.disabled = data.running || !active;
+    startButton.title = active ? "" : "Enable it first.";
+  }
   if (stopButton) stopButton.disabled = !data.running;
+  if (enableButton) enableButton.hidden = active;
+  if (disableButton) disableButton.hidden = !active;
+
+  if (note) {
+    if (!active) {
+      note.textContent = "Disabled \u2014 it will not run until you enable it.";
+      note.hidden = false;
+    } else if (card.dataset.stopHint) {
+      note.textContent = card.dataset.stopHint;
+      note.hidden = false;
+    } else {
+      note.hidden = true;
+    }
+  }
 }
 
 async function refresh() {
@@ -182,6 +209,16 @@ document.addEventListener("click", async (event) => {
     const detail = (result.body && result.body.detail) || `request failed (${result.status})`;
     errorBox.textContent = detail;
     errorBox.hidden = false;
+  }
+
+  // Stopping a supervised camera does not stick. Say so, rather than
+  // letting somebody watch it come back on its own and wonder.
+  if (action === "stop" && result.body && result.body.will_restart) {
+    card.dataset.stopHint =
+      "Stopped, but it is enabled and supervised, so it will start again"
+      + " shortly. Use Disable to keep it off.";
+  } else {
+    delete card.dataset.stopHint;
   }
 
   await refresh();

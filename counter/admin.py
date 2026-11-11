@@ -9,8 +9,37 @@ from .reports import parse_date
 @admin.register(Camera)
 class CameraAdmin(admin.ModelAdmin):
     list_display = ("name", "source", "is_active", "line_orientation", "line_position")
+    # Editable in the list, so turning a camera off does not mean opening
+    # its form and hunting for a tickbox.
+    list_editable = ("is_active",)
     list_filter = ("is_active", "line_orientation")
     search_fields = ("name", "source")
+    actions = ["enable_cameras", "disable_cameras"]
+
+    @admin.action(description="Enable selected cameras")
+    def enable_cameras(self, request, queryset):
+        changed = queryset.filter(is_active=False).update(is_active=True)
+        self.message_user(
+            request,
+            f"Enabled {changed} camera(s). The supervisor starts them within "
+            f"a pass; without one, press Start."
+            if changed else "Those cameras were already enabled.")
+
+    @admin.action(description="Disable selected cameras")
+    def disable_cameras(self, request, queryset):
+        """Stop them now as well as marking them inactive.
+
+        Waiting for the supervisor's next pass would leave a camera the
+        operator just switched off still counting for several seconds.
+        """
+        from .camera import REGISTRY
+
+        stopped = sum(1 for camera in queryset if REGISTRY.stop(camera.pk))
+        changed = queryset.filter(is_active=True).update(is_active=False)
+        self.message_user(
+            request,
+            f"Disabled {changed} camera(s); {stopped} were running and have "
+            f"been stopped.")
 
 
 @admin.register(Event)

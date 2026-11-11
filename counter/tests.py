@@ -5763,3 +5763,119 @@ class CrossingsCsvTests(TestCase):
             f"/api/v1/crossings/?days=7&event={other.pk}"
         ).content.decode().splitlines()))
         self.assertEqual(len(rows) - 1, 0)
+
+
+class EnableDisableCameraTests(TestCase):
+    """Turning a camera off and keeping it off.
+
+    Stop alone does not hold where a supervisor is running: it restarts
+    any camera that is active and not alive, so a stopped camera comes
+    back within a cooldown. Disabling is the durable switch.
+    """
+
+    def setUp(self):
+        self.staff = User.objects.create_superuser("boss", "b@example.com", "pw")
+        self.camera = Camera.objects.create(name="Door", source="0", is_active=True)
+
+    def post(self, action):
+        return self.client.post(f"/api/v1/cameras/{self.camera.pk}/{action}/")
+
+    def test_disable_marks_it_inactive(self):
+        self.client.force_login(self.staff)
+        response = self.post("disable")
+        self.assertEqual(response.status_code, 200)
+        self.camera.refresh_from_db()
+        self.assertFalse(self.camera.is_active)
+
+    def test_enable_marks_it_active(self):
+        self.camera.is_active = False
+        self.camera.save()
+        self.client.force_login(self.staff)
+        self.post("enable")
+        self.camera.refresh_from_db()
+        self.assertTrue(self.camera.is_active)
+
+    def test_disable_also_stops_it_rather_than_waiting_for_a_pass(self):
+        self.client.force_login(self.staff)
+        with patch.object(camera_module.REGISTRY, "stop",
+                          return_value=True) as stop:
+            self.post("disable")
+        stop.assert_called_once_with(self.camera.pk)
+
+    def test_enabling_twice_is_harmless(self):
+        self.client.force_login(self.staff)
+        self.assertEqual(self.post("enable").status_code, 200)
+        self.assertEqual(self.post("enable").status_code, 200)
+        self.camera.refresh_from_db()
+        self.assertTrue(self.camera.is_active)
+
+    def test_an_anonymous_visitor_cannot_turn_cameras_off(self):
+        response = self.post("disable")
+        self.assertEqual(response.status_code, 401)
+        self.camera.refresh_from_db()
+        self.assertTrue(self.camera.is_active)
+
+    def test_a_missing_camera_is_a_404(self):
+        self.client.force_login(self.staff)
+        self.assertEqual(
+            self.client.post("/api/v1/cameras/99999/disable/").status_code, 404)
+
+
+class StopIsHonestAboutComingBackTests(TestCase):
+    """Stop must not look permanent when it is not."""
+
+    def setUp(self):
+        self.staff = User.objects.create_superuser("boss", "b@example.com", "pw")
+        self.camera = Camera.objects.create(name="Door", source="0", is_active=True)
+        self.client.force_login(self.staff)
+
+    def stop(self):
+        return self.client.post(
+            f"/api/v1/cameras/{self.camera.pk}/stop/").json()
+
+    def test_it_warns_when_a_supervisor_will_restart_it(self):
+        with patch("counter.views.current_supervisor", return_value=object()):
+            self.assertTrue(self.stop()["will_restart"])
+
+    def test_it_does_not_warn_without_a_supervisor(self):
+        with patch("counter.views.current_supervisor", return_value=None):
+            self.assertFalse(self.stop()["will_restart"])
+
+    def test_a_disabled_camera_is_not_going_to_restart(self):
+        self.camera.is_active = False
+        self.camera.save()
+        with patch("counter.views.current_supervisor", return_value=object()):
+            self.assertFalse(self.stop()["will_restart"])
+
+
+class CameraPageControlsTests(TestCase):
+    """The controls an operator actually sees."""
+
+    def setUp(self):
+        self.staff = User.objects.create_superuser("boss", "b@example.com", "pw")
+        Camera.objects.create(name="Door", source="0")
+
+    def page(self):
+        self.client.force_login(self.staff)
+        return self.client.get("/cameras/").content.decode()
+
+    def test_enable_and_disable_are_offered(self):
+        page = self.page()
+        self.assertIn('data-action="enable"', page)
+        self.assertIn('data-action="disable"', page)
+
+    def test_a_disabled_camera_says_so(self):
+        self.assertIn("it will not run until you enable it", self.page())
+
+    def test_start_is_refused_for_a_disabled_camera(self):
+        # The supervisor would stop it again on its next pass.
+        self.assertIn("startButton.disabled = data.running || !active",
+                      self.page())
+
+    def test_anonymous_visitors_get_no_switches(self):
+        # The selector strings appear in the script on every page, so
+        # check the markup: no buttons rendered, and the notice instead.
+        page = self.client.get("/cameras/").content.decode()
+        self.assertNotIn('<button data-action="disable"', page)
+        self.assertNotIn('<button class="primary" data-action="start"', page)
+        self.assertIn("Read-only", page)
