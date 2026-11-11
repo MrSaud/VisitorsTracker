@@ -6291,3 +6291,190 @@ class OpenCVPinTests(TestCase):
         self.assertTrue(cv2.__version__.startswith("4.10."),
                         f"requirements pins 4.10.0.84 but 4.10 is not what "
                         f"is installed ({cv2.__version__})")
+
+
+class ServerUninstallTests(TestCase):
+    """The app was installed onto a machine that already had a job.
+
+    So the removal script has to take out its own pieces and leave the rest
+    of the server standing. These tests run it against a fake tree with
+    somebody else's files mixed in, and check those survive.
+    """
+
+    SCRIPT = pathlib.Path(settings.BASE_DIR) / "deploy" / "uninstall.sh"
+
+    def build_fake_server(self, root: pathlib.Path):
+        """A server with VisitorsTracker on it and other things besides."""
+        units = root / "etc/systemd/system"
+        nginx = root / "etc/nginx/conf.d"
+        app = root / "opt/visitorstracker"
+        for d in (units, nginx, app, root / "bin"):
+            d.mkdir(parents=True, exist_ok=True)
+
+        for unit in ("visitorstracker.service", "visitorstracker-backup.service",
+                     "visitorstracker-backup.timer"):
+            (units / unit).write_text(f"[Unit]\nDescription={unit}\n")
+        # Somebody else's unit, same directory.
+        (units / "mysqld.service").write_text("[Unit]\nDescription=MySQL\n")
+
+        (nginx / "visitorstracker.conf").write_text(
+            "upstream visitorstracker { server 127.0.0.1:8000; }\n")
+        # Somebody else's site, same directory.
+        (nginx / "shop.conf").write_text("server { server_name shop.example.com; }\n")
+
+        (app / "db.sqlite3").write_text("pretend database")
+        (app / "manage.py").write_text("#!/usr/bin/env python\n")
+        (root / "etc/visitorstracker.env").write_text("DJANGO_SECRET_KEY=abc\n")
+        # Somebody else's data, outside the app directory.
+        (root / "opt").mkdir(exist_ok=True)
+        other = root / "opt/othersapp"
+        other.mkdir(exist_ok=True)
+        (other / "important.db").write_text("not ours")
+
+        # Stubs, so the script can run anywhere: id reports root, systemctl
+        # and nginx succeed quietly, userdel does nothing.
+        for name, body in (
+            # -u reports root so the script will run; a named lookup fails,
+            # so the fake server has no service account to remove.
+            ("id", 'if [ "$1" = "-u" ]; then echo 0; else exit 1; fi'),
+            ("systemctl", 'exit 0'),
+            ("nginx", 'exit 0'),
+            ("userdel", 'exit 0'),
+            ("groupdel", 'exit 0'),
+        ):
+            stub = root / "bin" / name
+            stub.write_text(f"#!/bin/sh\n{body}\n")
+            stub.chmod(0o755)
+        return app, units, nginx
+
+    def run_script(self, root: pathlib.Path, *args):
+        app = root / "opt/visitorstracker"
+        env = dict(os.environ)
+        env.update({
+            "PATH": f"{root / 'bin'}:{env['PATH']}",
+            "VT_APP_DIR": str(app),
+            "VT_ENV_FILE": str(root / "etc/visitorstracker.env"),
+            "VT_UNIT_DIR": str(root / "etc/systemd/system"),
+            "VT_NGINX_DIRS": str(root / "etc/nginx/conf.d"),
+            "VT_SVC_USER": "nobody-at-all",
+        })
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), f"--backup-dir={root}", *args],
+            capture_output=True, text=True, env=env, timeout=120)
+
+    def test_a_dry_run_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            app, units, nginx = self.build_fake_server(root)
+            result = self.run_script(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DRY RUN", result.stdout)
+            # Everything still there.
+            self.assertTrue((app / "db.sqlite3").exists())
+            self.assertTrue((units / "visitorstracker.service").exists())
+            self.assertTrue((nginx / "visitorstracker.conf").exists())
+
+    def test_a_dry_run_lists_what_it_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.build_fake_server(root)
+            out = self.run_script(root).stdout
+            self.assertIn("visitorstracker.service", out)
+            self.assertIn("visitorstracker.conf", out)
+            self.assertIn("db.sqlite3", out)
+
+    def test_it_removes_its_own_pieces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            app, units, nginx = self.build_fake_server(root)
+            result = self.run_script(root, "--yes")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(app.exists(), "the app directory should be gone")
+            for unit in ("visitorstracker.service", "visitorstracker-backup.service",
+                         "visitorstracker-backup.timer"):
+                self.assertFalse((units / unit).exists(), unit)
+            self.assertFalse((nginx / "visitorstracker.conf").exists())
+            self.assertFalse((root / "etc/visitorstracker.env").exists())
+
+    def test_it_leaves_the_rest_of_the_server_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _app, units, nginx = self.build_fake_server(root)
+            self.run_script(root, "--yes")
+            # The reason this script exists rather than stopping the box.
+            self.assertTrue((units / "mysqld.service").exists(),
+                            "someone else's unit was removed")
+            self.assertTrue((nginx / "shop.conf").exists(),
+                            "someone else's nginx site was removed")
+            self.assertTrue((root / "opt/othersapp/important.db").exists(),
+                            "someone else's data was removed")
+
+    def test_it_saves_the_database_before_deleting_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.build_fake_server(root)
+            out = self.run_script(root, "--yes").stdout
+            tarballs = list(root.glob("visitorstracker-removed-*.tar.gz"))
+            self.assertEqual(len(tarballs), 1, out)
+            listing = subprocess.run(["tar", "-tzf", str(tarballs[0])],
+                                     capture_output=True, text=True, check=True).stdout
+            self.assertIn("db.sqlite3", listing)
+            self.assertIn("visitorstracker.env", listing)
+
+    def test_it_puts_the_nginx_file_back_if_nginx_objects(self):
+        """Other sites go through that nginx; a bad reload would take them down."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _app, _units, nginx = self.build_fake_server(root)
+            failing = root / "bin" / "nginx"
+            failing.write_text("#!/bin/sh\necho 'test failed' >&2\nexit 1\n")
+            failing.chmod(0o755)
+
+            out = self.run_script(root, "--yes").stdout
+            self.assertTrue((nginx / "visitorstracker.conf").exists(),
+                            "the file should have been restored")
+            self.assertIn("PUT BACK", out)
+
+    def test_it_says_so_when_nothing_is_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.build_fake_server(root)
+            for p in (root / "opt/visitorstracker", ):
+                shutil.rmtree(p)
+            (root / "etc/visitorstracker.env").unlink()
+            for unit in ("visitorstracker.service", "visitorstracker-backup.service",
+                         "visitorstracker-backup.timer"):
+                (root / "etc/systemd/system" / unit).unlink()
+            (root / "etc/nginx/conf.d/visitorstracker.conf").unlink()
+
+            result = self.run_script(root, "--yes")
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("nothing found", result.stdout)
+
+    def test_it_refuses_to_run_without_root(self):
+        result = subprocess.run(["bash", str(self.SCRIPT)],
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sudo", result.stderr)
+
+    def test_it_stops_rather_than_delete_when_the_backup_fails(self):
+        """The first version announced a backup that tar had refused to make,
+        then deleted the database anyway. If the safety net is not there,
+        nothing should be removed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            app, units, nginx = self.build_fake_server(root)
+
+            # A backup directory that cannot be written to.
+            result = self.run_script(root, "--yes",
+                                     f"--backup-dir={root / 'nope/deeper'}")
+
+            self.assertNotEqual(result.returncode, 0,
+                                "it should fail rather than continue")
+            self.assertIn("COULD NOT SAVE", result.stdout)
+            self.assertIn("Nothing has been removed", result.stdout)
+            # And nothing was.
+            self.assertTrue((app / "db.sqlite3").exists())
+            self.assertTrue((units / "visitorstracker.service").exists())
+            self.assertTrue((nginx / "visitorstracker.conf").exists())
+            self.assertTrue((root / "etc/visitorstracker.env").exists())
