@@ -29,6 +29,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 PROJECT = Path(SPECPATH)
+APP_VERSION = "1.0.0"
 
 # collect_submodules imports the package to walk it, and it runs now --
 # while the spec is being evaluated -- not inside Analysis, so pathex has
@@ -106,12 +107,22 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# Windows gets one file: the installer wants a single executable, and the
+# unpack-to-temp cost is paid once at launch.
+#
+# macOS gets a directory inside the .app instead. Onefile there unpacks its
+# libraries to a temporary folder outside the bundle, where the bundle's
+# signature does not reach -- PyInstaller warns that this "clashes with
+# macOS's security" and makes it an error in version 7. Measured here, it
+# also cost 35 to 65 seconds per launch unpacking 80MB every time.
+ONEFILE = sys.platform.startswith("win")
+
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    *([a.binaries, a.datas] if ONEFILE else []),
     [],
+    exclude_binaries=not ONEFILE,
     name="VisitorsTracker",
     debug=False,
     bootloader_ignore_signals=False,
@@ -121,5 +132,49 @@ exe = EXE(
     # nowhere, so the app writes its own log into the data directory.
     console=False,
     disable_windowed_traceback=False,
-    icon=str(PROJECT / "assets" / "AppIcon.ico"),
+    icon=str(PROJECT / "assets" / ("AppIcon.ico" if sys.platform.startswith("win")
+                                   else "AppIcon.icns")),
 )
+
+if not ONEFILE:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="VisitorsTracker",
+    )
+
+# macOS wants an .app, and not only for appearance: the camera grant
+# belongs to an application, so a bare executable has no identity to hold
+# one and cannot open a webcam at all. The thin bundle from
+# `manage.py build_app` borrows the project's virtualenv and only works on
+# the machine that built it; this one carries its own Python and can be
+# handed to somebody else.
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="VisitorsTracker.app",
+        icon=str(PROJECT / "assets" / "AppIcon.icns"),
+        bundle_identifier="com.visitorstracker.desktop",
+        version=APP_VERSION,
+        info_plist={
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
+            "LSMinimumSystemVersion": "11.0",
+            "NSHighResolutionCapable": True,
+            # Without this macOS terminates the process the moment it
+            # touches the camera, rather than asking.
+            "NSCameraUsageDescription": (
+                "VisitorsTracker counts people crossing a line in the "
+                "camera's view. Video is processed on this machine and is "
+                "not recorded or uploaded."
+            ),
+            # It serves its own dashboard on 127.0.0.1; nothing else.
+            "LSApplicationCategoryType": "public.app-category.utilities",
+            # One window, and closing it quits; no reason to linger in the
+            # Dock with nothing to show.
+            "LSMultipleInstancesProhibited": True,
+        },
+    )

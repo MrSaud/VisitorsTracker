@@ -234,6 +234,42 @@ def start_logging(data_dir):
     return handler.baseFilename
 
 
+def detach_output(data_dir, limit=5_000_000):
+    """Give the window's stdout and stderr somewhere of their own.
+
+    A windowed build inherits whatever handles launched it. Started from
+    Finder those are /dev/null and nothing is lost, but started from a
+    terminal they are that terminal's pipe -- and when the terminal goes
+    away, the development server's next request log writes to a closed pipe
+    and the app dies without a word. It did exactly that here. Pointing the
+    file descriptors at a file of our own removes the dependency on who
+    started us, and has the side benefit that request logs survive.
+
+    The descriptors are redirected rather than only ``sys.stdout``, because
+    OpenCV and the Python runtime also write to them directly.
+    """
+    path = data_dir / "output.log"
+    try:
+        # It is appended to for the life of an install, so cap it rather
+        # than let a long-running counter fill the disk with request logs.
+        if path.exists() and path.stat().st_size > limit:
+            path.unlink()
+        handle = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except OSError:
+        return None  # An unwritable data directory is reported elsewhere.
+
+    try:
+        os.dup2(handle.fileno(), 1)
+        os.dup2(handle.fileno(), 2)
+    except OSError:
+        handle.close()
+        return None
+
+    sys.stdout = handle
+    sys.stderr = handle
+    return path
+
+
 class DesktopApi:
     """What the page may ask the application to do for it.
 
@@ -274,7 +310,9 @@ def main(argv=None):
     from config.paths import is_frozen, resolve_data_dir
 
     if is_frozen():
-        start_logging(resolve_data_dir(Path(__file__).resolve().parent.parent))
+        data_dir = resolve_data_dir(Path(__file__).resolve().parent.parent)
+        start_logging(data_dir)
+        detach_output(data_dir)
 
     import django
 

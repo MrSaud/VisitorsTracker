@@ -16,12 +16,14 @@ import plistlib
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import urllib.error
 import urllib.request
 import time as time_module
+from pathlib import Path
 from io import StringIO
 from unittest.mock import patch
 from datetime import date, datetime, time, timedelta, timezone as dt_timezone
@@ -5973,3 +5975,170 @@ class SwitchingTheRunningEventTests(TestCase):
     def test_the_list_says_which_one_is_counting(self):
         page = self.client.get("/admin/counter/event/").content.decode()
         self.assertIn("Counting now", page)
+
+
+class DesktopDetachOutputTests(TestCase):
+    """A windowed build must not depend on the handles it was given.
+
+    Launched from a terminal the app inherits that terminal's pipe, and when
+    the terminal closes the next request log kills the process silently. This
+    was observed: the frozen app died a minute after launch leaving nothing in
+    its log. Redirecting the descriptors removes the dependency.
+    """
+
+    def test_writes_land_in_the_data_directory(self):
+        from counter.desktop import detach_output
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            script = (
+                "import sys, os;"
+                "sys.path.insert(0, %r);"
+                "from counter.desktop import detach_output;"
+                "p = detach_output(__import__('pathlib').Path(%r));"
+                # Both the Python-level objects and the raw descriptors.
+                "print('through stdout');"
+                "os.write(2, b'through fd 2\\n');"
+                "sys.stdout.flush()"
+                % (str(Path(__file__).resolve().parent.parent), str(data_dir))
+            )
+            subprocess.run([sys.executable, "-c", script], check=True,
+                           capture_output=True, timeout=60)
+
+            written = (data_dir / "output.log").read_text()
+        self.assertIn("through stdout", written)
+        self.assertIn("through fd 2", written)
+
+    def test_survives_a_closed_pipe(self):
+        """The failure this exists for: the reader goes away mid-run."""
+        from counter.desktop import detach_output  # noqa: F401
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                "import sys, os, time;"
+                "sys.path.insert(0, %r);"
+                "from counter.desktop import detach_output;"
+                "detach_output(__import__('pathlib').Path(%r));"
+                # Were stdout still the dead pipe, this would raise.
+                "time.sleep(0.4);"
+                "[print('x' * 200) for _ in range(200)];"
+                "sys.exit(7)"
+                % (str(Path(__file__).resolve().parent.parent), tmp)
+            )
+            proc = subprocess.Popen([sys.executable, "-c", script],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            proc.stdout.close()  # The terminal closing, in miniature.
+            self.assertEqual(proc.wait(timeout=60), 7)
+
+    def test_an_unwritable_data_directory_is_not_fatal(self):
+        from counter.desktop import detach_output
+
+        self.assertIsNone(detach_output(Path("/nonexistent-xyz/data")))
+
+    def test_a_large_log_is_dropped_rather_than_grown(self):
+        from counter.desktop import detach_output
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            log = data_dir / "output.log"
+            log.write_text("old\n" * 100)
+            script = (
+                "import sys;"
+                "sys.path.insert(0, %r);"
+                "from counter.desktop import detach_output;"
+                "detach_output(__import__('pathlib').Path(%r), limit=10);"
+                "print('fresh')"
+                % (str(Path(__file__).resolve().parent.parent), str(data_dir))
+            )
+            subprocess.run([sys.executable, "-c", script], check=True,
+                           capture_output=True, timeout=60)
+            written = log.read_text()
+        self.assertIn("fresh", written)
+        self.assertNotIn("old", written)
+
+
+class MacBundleSpecTests(TestCase):
+    """The .app is what makes the Mac build usable, for two reasons.
+
+    macOS grants camera access to an application, so a loose executable has
+    no identity to hold a permission with and cannot open a webcam at all.
+    And onefile inside a bundle unpacks its libraries where the bundle's
+    signature does not reach -- PyInstaller calls that a clash with macOS
+    security and makes it an error in version 7. It also cost 34 to 67
+    seconds per launch here, against 3 for a directory build.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.text = (pathlib.Path(settings.BASE_DIR)
+                    / "VisitorsTracker.spec").read_text()
+
+    def test_it_produces_an_app_bundle(self):
+        self.assertIn("BUNDLE(", self.text)
+        self.assertIn('name="VisitorsTracker.app"', self.text)
+        self.assertIn('bundle_identifier="com.visitorstracker.desktop"',
+                      self.text)
+
+    def test_the_bundle_declares_why_it_wants_the_camera(self):
+        # Without this key macOS kills the process the moment it touches a
+        # camera instead of asking the person.
+        self.assertIn("NSCameraUsageDescription", self.text)
+
+    def test_the_bundle_wraps_the_collected_directory_not_the_onefile_exe(self):
+        self.assertIn("coll = COLLECT(", self.text)
+        self.assertIn("BUNDLE(\n        coll,", self.text)
+
+    def test_onefile_is_windows_only(self):
+        self.assertIn('ONEFILE = sys.platform.startswith("win")', self.text)
+        self.assertIn("exclude_binaries=not ONEFILE", self.text)
+
+    def test_the_icon_matches_the_platform(self):
+        self.assertIn("AppIcon.icns", self.text)
+        self.assertIn("AppIcon.ico", self.text)
+
+
+class MacPackagingScriptTests(TestCase):
+    """The counterpart of the Inno Setup script, pinned the same way."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = pathlib.Path(settings.BASE_DIR)
+        cls.script = cls.root / "scripts" / "build_macos_app.sh"
+
+    def test_the_script_exists_and_runs(self):
+        self.assertTrue(self.script.exists())
+        self.assertTrue(os.access(self.script, os.X_OK),
+                        "the readme tells people to run it directly")
+
+    def test_it_refuses_to_run_anywhere_but_a_mac(self):
+        # PyInstaller does not cross-compile; a Linux run would produce a
+        # Linux binary with a .app wrapper around it.
+        self.assertIn('[ "$(uname -s)" = "Darwin" ]', self.script.read_text())
+
+    def test_it_checks_for_the_detector_where_the_detector_lives(self):
+        text = self.script.read_text()
+        self.assertIn("counter/ml_models/yolov8n.onnx", text)
+        self.assertTrue((self.root / "counter" / "ml_models").is_dir())
+
+    def test_it_signs_with_the_identifier_the_plist_declares(self):
+        self.assertIn("--identifier com.visitorstracker.desktop",
+                      self.script.read_text())
+
+    def test_it_ships_the_readme_it_names(self):
+        readme = self.root / "installer" / "README-macos.txt"
+        self.assertIn(str(readme.name), self.script.read_text())
+        self.assertTrue(readme.exists())
+
+    def test_the_readme_covers_the_two_things_that_will_confuse_people(self):
+        text = (self.root / "installer" / "README-macos.txt").read_text()
+        # Gatekeeper refuses an un-notarised app with no visible way forward.
+        self.assertIn("Right-click", text)
+        # And the data lives somewhere they would not guess.
+        self.assertIn("~/Library/Application Support/VisitorsTracker", text)
+
+    def test_the_architecture_limit_is_written_down(self):
+        text = (self.root / "installer" / "README-macos.txt").read_text()
+        self.assertIn("Intel", text)

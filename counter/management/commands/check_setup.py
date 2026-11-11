@@ -250,9 +250,18 @@ class Command(BaseCommand):
                         "Check the server's own value before worrying")
 
     def check_cameras(self, open_them=False):
+        from django.db import OperationalError
+
         from counter.models import Camera
 
-        cameras = list(Camera.objects.all())
+        try:
+            cameras = list(Camera.objects.all())
+        except OperationalError:
+            # A fresh install reaches here before `migrate` has run. The
+            # migrations check above has already said so; repeating it with a
+            # traceback would only make a first run look broken.
+            self.report(WARN, "configured", "unknown until migrations run")
+            return
         if not cameras:
             self.report(WARN, "configured", "none",
                         "add one in the admin, or see 'Adding a camera'")

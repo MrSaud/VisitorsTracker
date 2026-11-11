@@ -252,14 +252,18 @@ actually loaded, migrations, the port, `DEBUG`, and the cameras. With
 `--cameras` it tries to open each one, which is the step that proves the
 permission is granted. Run it there before trusting a single count.
 
-### A standalone .exe
+### Standalone apps
 
 For a machine with no Python on it, `VisitorsTracker.spec` builds one
-executable with the interpreter, OpenCV and the detector inside it.
+application with the interpreter, OpenCV and the detector inside it.
 
-**This has to be built on Windows.** PyInstaller bundles the interpreter and
-binaries of the machine it runs on; it does not cross-compile, so a Mac
-produces a Mac app and nothing else.
+**Build it on the platform you are shipping to.** PyInstaller bundles the
+interpreter and binaries of the machine it runs on; it does not
+cross-compile. On Apple Silicon it does not even cover both Macs: OpenCV
+publishes no universal wheel, so an arm64 build will not open on an Intel
+Mac.
+
+On Windows:
 
 ```bat
 pip install -r requirements.txt -r requirements-desktop.txt pyinstaller
@@ -267,8 +271,38 @@ python manage.py export_model
 pyinstaller VisitorsTracker.spec
 ```
 
-The result is `dist\VisitorsTracker.exe` — about 80MB on macOS, expect
-similar on Windows — which runs by double-click with nothing installed.
+That gives `dist\VisitorsTracker.exe`, one file of about 80MB that runs by
+double-click with nothing installed. `installer\VisitorsTracker.iss` wraps it
+in an Inno Setup installer with Start Menu entries and an uninstaller.
+
+On macOS, one script does the whole thing:
+
+```bash
+python manage.py export_model        # once; pulls torch, ~1GB
+./scripts/build_macos_app.sh
+```
+
+That freezes the app, signs it, and leaves
+`dist/VisitorsTracker-1.0.0-arm64.dmg` (~108MB) holding `VisitorsTracker.app`,
+a drag-to-Applications shortcut and `installer/README-macos.txt`. The app
+carries its own Python; the receiving Mac needs nothing.
+
+Two things differ from Windows and both matter:
+
+**It is a bundle, not a bare binary, and not onefile.** macOS grants camera
+access to an *application*, so a loose executable has no identity to hold a
+permission and cannot open a webcam at all. And onefile inside a `.app`
+unpacks its libraries to a temporary folder the bundle's signature does not
+cover — PyInstaller warns that this "clashes with macOS's security" and makes
+it an error in version 7. Measured here, it also cost **34 to 67 seconds per
+launch** unpacking 80MB every time. The spec builds onedir off Windows:
+**3 seconds** to a serving dashboard, and the dylibs stay inside the bundle.
+
+**Gatekeeper will refuse it on another Mac.** The signature is ad-hoc, which
+is enough to hold a camera grant but not enough to pass notarisation — that
+needs a paid Apple Developer identity. `spctl --assess` says `rejected`, and
+the first open has to be right-click > Open > Open. The readme in the disk
+image says so in the user's words.
 
 The spec was validated by actually freezing the app on a Mac and running
 it: the binary is useless on Windows, but every problem below is
@@ -280,6 +314,8 @@ platform-independent and each one was a silent failure found that way.
 | `No module named 'config.settings'` | Named only by a string in an environment variable |
 | `No module named 'corsheaders.middleware'` | Django is configured almost entirely by strings: `INSTALLED_APPS`, `MIDDLEWARE`, the database `ENGINE`, the DRF classes. None is traceable |
 | `attempted relative import with no known parent package` | PyInstaller runs its entry script as `__main__`, so `counter/desktop.py`'s relative imports fail. `app_main.py` exists to be that script |
+| The app died a minute after launch, log empty | A windowed build inherits whatever handles started it. From a terminal that is the terminal's pipe, and when the terminal closed, the development server's next request log wrote to a closed pipe and killed the process — exit 120, no traceback. `detach_output` points the descriptors at `output.log` in the data directory instead, so it no longer matters who started it |
+| `check_setup` dumped a traceback on a fresh install | It queries cameras, and on a new install it runs before `migrate`. The migrations check above it already says so; the traceback made a normal first run look broken |
 
 After those, a frozen build starts, migrates, serves the dashboard and
 reports `status: ok`. The first three were invisible until the app also
@@ -296,8 +332,9 @@ do on a customer's machine.
 The data moves as well. Frozen, the code is unpacked into a temporary
 directory that is **deleted when the app exits**, so the database and secret
 key live in the platform's application-data directory instead
-(`%LOCALAPPDATA%\VisitorsTracker` on Windows). `COUNTER_DATA_DIR` overrides
-it. In a checkout nothing changes: data stays beside the code.
+(`%LOCALAPPDATA%\VisitorsTracker` on Windows,
+`~/Library/Application Support/VisitorsTracker` on macOS).
+`COUNTER_DATA_DIR` overrides it. In a checkout nothing changes: data stays beside the code.
 
 With no console window, a failure before the window opens would be
 invisible, so a frozen build writes `visitorstracker.log` into that same
@@ -307,11 +344,16 @@ Expect Windows SmartScreen to warn about an unsigned executable the first
 time. Signing it needs a code-signing certificate, which costs money and is
 issued to a registered business.
 
-**None of the Windows path has been run on Windows.** This project is
-developed on a Mac. The generated files are pinned by tests and the backend
-choice is asserted, but "asserted" is not "works" — expect to iron something
-out on first run. `python manage.py build_app --target windows` on a Mac
-generates the files for inspection, with this machine's paths in them.
+**What has actually been run, and where.** The macOS app was built,
+installed from its disk image, and run from `~/Applications` with the project
+folder nowhere in reach: it migrated, served every page, exported CSV, and
+counted from a webcam at 15 fps. The Windows installer was built and
+installed in a Parallels VM, including an upgrade over an existing install
+that kept its database. **Camera capture was never tested on Windows**: that
+VM is ARM64 Windows running x64 Python under emulation, where the devices are
+visible but cannot be opened, and trying takes the camera away from macOS. The
+capture path there rests on `capture_backends()` choosing DirectShow, which is
+asserted by tests, not demonstrated on hardware.
 
 ## Deploying on a Linux server
 
