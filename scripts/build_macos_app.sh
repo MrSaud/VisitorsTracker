@@ -4,9 +4,15 @@
 # The counterpart of installer/VisitorsTracker.iss on Windows. What comes out
 # needs no Python, no virtualenv and no project folder on the receiving Mac.
 #
-# PyInstaller does not cross-compile: run this on a Mac, and on the same
-# architecture you intend to ship to. OpenCV publishes no universal wheel, so
-# an Apple Silicon build is arm64-only and will not run on an Intel Mac.
+# PyInstaller does not cross-compile, and OpenCV publishes no universal2
+# wheel, so macOS needs one build per chip. Set PYTHON to a virtualenv of the
+# architecture you are building for; on Apple Silicon an x86_64 interpreter
+# under `arch -x86_64` produces the Intel app, which Rosetta can then run and
+# test on the same machine.
+#
+# Do not point PYTHON at Homebrew's interpreter. Homebrew builds for the host,
+# so the app would silently refuse to start on any older macOS. The check
+# below reports the real floor and warns when that has happened.
 set -euo pipefail
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +28,7 @@ spec = pathlib.Path("VisitorsTracker.spec").read_text()
 print(re.search(r'APP_VERSION = "([^"]+)"', spec).group(1))
 PY
 )"
-DMG="$OUT/VisitorsTracker-$VERSION-$(uname -m).dmg"
+DMG=""   # named after the built binary's architecture, once it exists
 
 [ "$(uname -s)" = "Darwin" ] || { echo "This builds the Mac app; run it on a Mac." >&2; exit 1; }
 [ -x "$PYTHON" ] || { echo "No interpreter at $PYTHON. Set PYTHON=..." >&2; exit 1; }
@@ -42,6 +48,35 @@ echo "==> freezing (a few minutes)"
 
 [ -d "$APP" ] || { echo "PyInstaller produced no .app at $APP" >&2; exit 1; }
 
+ARCH="$(lipo -archs "$APP/Contents/MacOS/VisitorsTracker" | awk '{print $1}')"
+DMG="$OUT/VisitorsTracker-$VERSION-$ARCH.dmg"
+
+echo "==> deployment target"
+# Every bundled library carries the macOS version it was built against, and
+# the app can only run on the highest of them. Guessing this wrong is worse
+# than useless: the plist said 11.0 while Homebrew's Python made the real
+# floor 26.0, so the app would have been offered to Macs it cannot start on.
+MIN="$(find "$APP/Contents" -type f \( -name '*.so' -o -name '*.dylib' \
+             -o -name 'Python' -o -name 'VisitorsTracker' \) -print0 \
+       | xargs -0 -n 20 otool -l 2>/dev/null \
+       | awk '/LC_BUILD_VERSION/ {seen = 1} seen && /minos/ {print $2; seen = 0}' \
+       | sort -t. -k1,1n -k2,2n | tail -1)"
+[ -n "$MIN" ] || { echo "Could not read a deployment target from the bundle" >&2; exit 1; }
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MIN" "$APP/Contents/Info.plist"
+echo "    $ARCH, runs on macOS $MIN and newer"
+
+HOST_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
+MIN_MAJOR="${MIN%%.*}"
+if [ "$MIN_MAJOR" -ge "$HOST_MAJOR" ]; then
+  echo
+  echo "    WARNING: that floor is this machine's own macOS version, which"
+  echo "    means the interpreter was built for this host -- Homebrew does"
+  echo "    that. The app will not start on any older Mac. Build against a"
+  echo "    relocatable interpreter instead and set PYTHON to it:"
+  echo "      https://github.com/astral-sh/python-build-standalone"
+  echo
+fi
+
 echo "==> signing"
 # Ad-hoc: enough for the app to hold a camera grant of its own, which is why
 # it has to be a bundle at all. Not enough for Gatekeeper on another Mac --
@@ -59,13 +94,31 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-cp "$PROJECT/installer/README-macos.txt" "$STAGE/Read me first.txt"
+# The readme is shared by both builds, so say at the top which one this is.
+# A person holding the wrong image otherwise finds out by double-clicking it.
+{
+  case "$ARCH" in
+    arm64)  echo "This build is for Apple Silicon Macs (M1 and later)."
+            OTHER="VisitorsTracker-$VERSION-x86_64.dmg (Intel)" ;;
+    x86_64) echo "This build is for Intel Macs."
+            OTHER="VisitorsTracker-$VERSION-arm64.dmg (Apple Silicon)" ;;
+    *)      echo "This build is for $ARCH Macs."
+            OTHER="" ;;
+  esac
+  echo "It needs macOS $MIN or newer."
+  [ -n "$OTHER" ] && echo "For the other kind of Mac, use $OTHER."
+  echo
+  echo "To check which Mac you have: Apple menu > About This Mac."
+  echo
+  cat "$PROJECT/installer/README-macos.txt"
+} > "$STAGE/Read me first.txt"
 rm -f "$DMG"
 hdiutil create -quiet -volname "VisitorsTracker $VERSION" -srcfolder "$STAGE" \
         -ov -format UDZO "$DMG"
 
 echo
-echo "Built $DMG ($(du -h "$DMG" | cut -f1), $(uname -m) only)"
+echo "Built $DMG ($(du -h "$DMG" | cut -f1))"
+echo "  $ARCH Macs only, macOS $MIN or newer"
 echo
 echo "On the Mac you give it to, macOS will refuse it on first open because"
 echo "it is not notarised. Right-click the app > Open > Open, once."

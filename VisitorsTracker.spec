@@ -162,6 +162,10 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleShortVersionString": APP_VERSION,
             "CFBundleVersion": APP_VERSION,
+            # A placeholder. scripts/build_macos_app.sh reads the real
+            # floor out of the built binaries and overwrites this before
+            # signing, because the binaries are the only honest source: a
+            # wrong value here offers the app to Macs it cannot start on.
             "LSMinimumSystemVersion": "11.0",
             "NSHighResolutionCapable": True,
             # Without this macOS terminates the process the moment it

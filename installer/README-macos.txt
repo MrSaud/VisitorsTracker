@@ -65,12 +65,21 @@ Mac at 127.0.0.1:8000. It is deliberately not reachable from the network. To
 put it on a screen elsewhere, run the server version instead -- see the
 project's README.
 
-Which Macs this build runs on
------------------------------
-This build matches the chip of the Mac it was built on, because OpenCV
-publishes no single binary covering both. An Apple Silicon build will not
-open on an Intel Mac, and vice versa; build it again on a Mac of the other
-kind if you need both.
+Which Macs this runs on
+-----------------------
+There are two images, one per chip, because OpenCV publishes no single
+binary covering both:
+
+    VisitorsTracker-1.0.0-arm64.dmg    Apple Silicon (M1 and later)
+    VisitorsTracker-1.0.0-x86_64.dmg   Intel
+
+Both need macOS 14 (Sonoma) or newer. That floor is not a choice: the
+OpenCV and numpy binaries inside are built against it. The app refuses to
+start on an older Mac rather than half-working.
+
+Opening the wrong one gives "You can't open the application because it is
+not supported on this type of Mac". Check which you have under
+Apple menu > About This Mac, and use the other image.
 
 Removing it
 -----------

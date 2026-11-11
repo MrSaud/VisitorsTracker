@@ -259,9 +259,9 @@ application with the interpreter, OpenCV and the detector inside it.
 
 **Build it on the platform you are shipping to.** PyInstaller bundles the
 interpreter and binaries of the machine it runs on; it does not
-cross-compile. On Apple Silicon it does not even cover both Macs: OpenCV
-publishes no universal wheel, so an arm64 build will not open on an Intel
-Mac.
+cross-compile. On macOS it needs one build per chip, since OpenCV publishes
+no `universal2` wheel — though an Intel build *can* be produced and tested on
+an Apple Silicon Mac, which is how the one here was made.
 
 On Windows:
 
@@ -279,13 +279,53 @@ On macOS, one script does the whole thing:
 
 ```bash
 python manage.py export_model        # once; pulls torch, ~1GB
-./scripts/build_macos_app.sh
+PYTHON=/path/to/arch-specific/venv/bin/python ./scripts/build_macos_app.sh
 ```
 
-That freezes the app, signs it, and leaves
-`dist/VisitorsTracker-1.0.0-arm64.dmg` (~108MB) holding `VisitorsTracker.app`,
-a drag-to-Applications shortcut and `installer/README-macos.txt`. The app
-carries its own Python; the receiving Mac needs nothing.
+That freezes the app, works out which Macs it can run on, signs it, and
+leaves `dist/VisitorsTracker-1.0.0-<arch>.dmg` holding `VisitorsTracker.app`,
+a drag-to-Applications shortcut and a readme naming the chip and the macOS
+floor. The app carries its own Python; the receiving Mac needs nothing.
+
+**Do not build it with Homebrew's Python.** Homebrew compiles for the machine
+it is installed on, so its interpreter and every stdlib extension in it —
+`libsqlite3`, `_socket`, `_hashlib`, 55 binaries in all — are stamped with
+*this* Mac's macOS version. An app built that way starts here and nowhere
+older, and nothing says so until someone tries. The first build of this app
+had `LSMinimumSystemVersion` 11.0 in its plist and a real floor of macOS 26.
+The script now reads the floor out of the built binaries, writes that into the
+plist, and warns when the interpreter turns out to be host-tied.
+
+Use a relocatable interpreter instead —
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone),
+which is what `uv` installs. Its macOS builds target 10.15 (Intel) and 11.0
+(Apple Silicon), so the floor comes from the wheels rather than the build box:
+
+```bash
+# once per architecture, from the release's SHA256SUMS-verified tarball
+tar -xzf cpython-3.12.16+20261110-x86_64-apple-darwin-install_only.tar.gz
+arch -x86_64 ./python/bin/python3.12 -m venv .venv-x86_64
+arch -x86_64 .venv-x86_64/bin/python -m pip install \
+    -r requirements.txt -r requirements-desktop.txt pyinstaller
+PYTHON=$PWD/.venv-x86_64/bin/python arch -x86_64 ./scripts/build_macos_app.sh
+```
+
+**There is no universal build, so there are two images.** OpenCV publishes
+`macosx_13_0_arm64` and `macosx_13_0_x86_64` wheels and no `universal2`, so
+PyInstaller cannot thin one app to cover both chips. Build each separately:
+
+| Image | Chip | Needs |
+|---|---|---|
+| `VisitorsTracker-1.0.0-arm64.dmg` (112MB) | Apple Silicon | macOS 14+ |
+| `VisitorsTracker-1.0.0-x86_64.dmg` (139MB) | Intel | macOS 14+ |
+
+macOS 14 rather than 13 is numpy's doing: its 2.5.4 wheels are tagged
+`macosx_10_13` but the binaries inside carry `minos 14.0`. OpenCV asks for
+13.0 and the interpreter for 10.15, so numpy sets the floor.
+
+An **Intel build can be tested on Apple Silicon** — Rosetta runs it, which is
+how the x86_64 app here was verified without an Intel Mac. The reverse is not
+possible.
 
 Two things differ from Windows and both matter:
 
@@ -344,10 +384,14 @@ Expect Windows SmartScreen to warn about an unsigned executable the first
 time. Signing it needs a code-signing certificate, which costs money and is
 issued to a registered business.
 
-**What has actually been run, and where.** The macOS app was built,
-installed from its disk image, and run from `~/Applications` with the project
-folder nowhere in reach: it migrated, served every page, exported CSV, and
-counted from a webcam at 15 fps. The Windows installer was built and
+**What has actually been run, and where.** Both macOS apps were built,
+installed from their disk images, and run with the project folder nowhere in
+reach: each migrated, served every page and the admin CSS, exported CSV with
+the date window and event column, and counted from a webcam — the Apple
+Silicon build at 19.8 fps natively, the Intel build at 11.2 fps through
+Rosetta on the same Mac. Rosetta is why the Intel build could be verified at
+all without an Intel Mac; the figure is emulation overhead, not what an Intel
+Mac would do. The Windows installer was built and
 installed in a Parallels VM, including an upgrade over an existing install
 that kept its database. **Camera capture was never tested on Windows**: that
 VM is ARM64 Windows running x64 Python under emulation, where the devices are

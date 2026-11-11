@@ -6141,4 +6141,58 @@ class MacPackagingScriptTests(TestCase):
 
     def test_the_architecture_limit_is_written_down(self):
         text = (self.root / "installer" / "README-macos.txt").read_text()
+        # Two images, because OpenCV publishes no universal2 wheel. Someone
+        # holding the wrong one gets "not supported on this type of Mac".
         self.assertIn("Intel", text)
+        self.assertIn("Apple Silicon", text)
+        self.assertIn("arm64.dmg", text)
+        self.assertIn("x86_64.dmg", text)
+
+
+class MacDeploymentTargetTests(TestCase):
+    """The plist's macOS floor has to come from the binaries, not a guess.
+
+    The first build claimed LSMinimumSystemVersion 11.0 while Homebrew's
+    Python made the real floor 26.0 -- the app would have been offered to
+    Macs it cannot start on, and nothing would have said so until someone
+    tried it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = pathlib.Path(settings.BASE_DIR)
+        cls.script = (cls.root / "scripts" / "build_macos_app.sh").read_text()
+
+    def test_the_floor_is_read_out_of_the_built_bundle(self):
+        self.assertIn("LC_BUILD_VERSION", self.script)
+        self.assertIn("minos", self.script)
+        self.assertIn("Set :LSMinimumSystemVersion", self.script)
+
+    def test_it_refuses_to_build_when_it_cannot_read_one(self):
+        # Silently shipping the spec's placeholder is the failure this
+        # whole check exists to prevent.
+        self.assertIn('[ -n "$MIN" ] ||', self.script)
+
+    def test_it_warns_when_the_interpreter_is_tied_to_this_mac(self):
+        self.assertIn("sw_vers -productVersion", self.script)
+        self.assertIn("python-build-standalone", self.script)
+
+    def test_the_plist_edit_happens_before_signing(self):
+        # Editing Info.plist after codesign breaks the signature.
+        self.assertLess(self.script.index("Set :LSMinimumSystemVersion"),
+                        self.script.index("codesign --force"))
+
+    def test_the_image_is_named_after_the_binary_not_the_build_shell(self):
+        # With PYTHON set to an x86_64 interpreter, `uname -m` still says
+        # arm64, which would have mislabelled the Intel image.
+        self.assertIn('lipo -archs "$APP/Contents/MacOS/VisitorsTracker"',
+                      self.script)
+        self.assertNotIn("$(uname -m).dmg", self.script)
+
+    def test_the_spec_does_not_hardcode_a_floor_that_outranks_it(self):
+        spec = (self.root / "VisitorsTracker.spec").read_text()
+        # The spec may seed a value, but the script overwrites it; what
+        # matters is that nobody reads the seed as the truth.
+        self.assertIn("LSMinimumSystemVersion", spec)
+        self.assertIn("LSMinimumSystemVersion", self.script)
