@@ -56,10 +56,17 @@ echo "==> deployment target"
 # the app can only run on the highest of them. Guessing this wrong is worse
 # than useless: the plist said 11.0 while Homebrew's Python made the real
 # floor 26.0, so the app would have been offered to Macs it cannot start on.
+# Two load commands carry this. Binaries built against a modern SDK use
+# LC_BUILD_VERSION/minos; ones built against an older SDK -- which is exactly
+# what the compatible wheels are -- use LC_VERSION_MIN_MACOSX/version. Reading
+# only the first finds nothing in the wheels that matter most here.
 MIN="$(find "$APP/Contents" -type f \( -name '*.so' -o -name '*.dylib' \
              -o -name 'Python' -o -name 'VisitorsTracker' \) -print0 \
        | xargs -0 -n 20 otool -l 2>/dev/null \
-       | awk '/LC_BUILD_VERSION/ {seen = 1} seen && /minos/ {print $2; seen = 0}' \
+       | awk '/LC_BUILD_VERSION/      {mode = "build";   next}
+              /LC_VERSION_MIN_MACOSX/ {mode = "version"; next}
+              mode == "build"   && /minos/   {print $2; mode = ""}
+              mode == "version" && /version/ {print $2; mode = ""}' \
        | sort -t. -k1,1n -k2,2n | tail -1)"
 [ -n "$MIN" ] || { echo "Could not read a deployment target from the bundle" >&2; exit 1; }
 /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MIN" "$APP/Contents/Info.plist"

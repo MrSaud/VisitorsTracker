@@ -310,18 +310,47 @@ arch -x86_64 .venv-x86_64/bin/python -m pip install \
 PYTHON=$PWD/.venv-x86_64/bin/python arch -x86_64 ./scripts/build_macos_app.sh
 ```
 
-**There is no universal build, so there are two images.** OpenCV publishes
-`macosx_13_0_arm64` and `macosx_13_0_x86_64` wheels and no `universal2`, so
-PyInstaller cannot thin one app to cover both chips. Build each separately:
+**There is no universal build, so there are two images.** OpenCV publishes no
+`universal2` wheel, so PyInstaller cannot thin one app to cover both chips.
+Build each separately with `scripts/macos_build_env.py`, which prepares a
+virtualenv of the right architecture:
+
+```bash
+python3 scripts/macos_build_env.py --arch x86_64 \
+    --interpreter ./python/bin/python3.12 --venv /tmp/env-x86_64
+PYTHON=/tmp/env-x86_64/bin/python arch -x86_64 ./scripts/build_macos_app.sh
+```
 
 | Image | Chip | Needs |
 |---|---|---|
-| `VisitorsTracker-1.0.0-arm64.dmg` (112MB) | Apple Silicon | macOS 14+ |
-| `VisitorsTracker-1.0.0-x86_64.dmg` (139MB) | Intel | macOS 14+ |
+| `VisitorsTracker-1.0.0-arm64.dmg` (123MB) | Apple Silicon | macOS 11+ |
+| `VisitorsTracker-1.0.0-x86_64.dmg` (149MB) | Intel | macOS 12+ |
 
-macOS 14 rather than 13 is numpy's doing: its 2.5.4 wheels are tagged
-`macosx_10_13` but the binaries inside carry `minos 14.0`. OpenCV asks for
-13.0 and the interpreter for 10.15, so numpy sets the floor.
+**Those floors took work, and `pip install -r requirements.txt` does not
+reach them.** Two separate traps:
+
+numpy publishes *two* macOS wheels per architecture of the same version — one
+built against an old SDK (`macosx_10_13` / `macosx_11_0`) and one against a
+new one (`macosx_14_0`) — and pip takes the most specific wheel the running
+Mac accepts, which on a current Mac is the 14.0 build. That one choice put
+the floor at macOS 14. `macos_build_env.py` fetches the two
+architecture-specific wheels by name and checks them against the digests PyPI
+publishes, so the floor stops depending on which Mac did the build.
+
+OpenCV is pinned at **4.10.0.84** for the same reason: from 4.11 onwards its
+macOS wheels are tagged `macosx_13_0`, which alone would hold the floor at 13.
+4.10.0.84 publishes `macosx_11_0_arm64` and `macosx_12_0_x86_64`. The pin is
+project-wide — Mac, Windows and the Linux server all count with the same
+detector, which matters more than a version number. Inference is unaffected:
+the same ONNX model on the same seeded input gives sums and means identical to
+eight decimal places across the two versions, differing only in the last bits
+of float32, and all 605 tests pass on either.
+
+There is a third trap in reading the floor at all. Modern binaries carry it in
+`LC_BUILD_VERSION`/`minos`, older-SDK ones — exactly the wheels wanted here —
+in `LC_VERSION_MIN_MACOSX`/`version`. Code that knows only the first finds
+nothing in the wheels that matter most. Both the build script and the helper
+read both.
 
 An **Intel build can be tested on Apple Silicon** — Rosetta runs it, which is
 how the x86_64 app here was verified without an Intel Mac. The reverse is not
@@ -388,7 +417,7 @@ issued to a registered business.
 installed from their disk images, and run with the project folder nowhere in
 reach: each migrated, served every page and the admin CSS, exported CSV with
 the date window and event column, and counted from a webcam — the Apple
-Silicon build at 19.8 fps natively, the Intel build at 11.2 fps through
+Silicon build at 19.9 fps natively, the Intel build at 16.2 fps through
 Rosetta on the same Mac. Rosetta is why the Intel build could be verified at
 all without an Intel Mac; the figure is emulation overhead, not what an Intel
 Mac would do. The Windows installer was built and

@@ -2,5 +2,12 @@ Django>=5.2,<6
 djangorestframework>=3.16
 django-cors-headers>=4.6
 numpy>=2.0
-opencv-contrib-python-headless==4.11.0.86
+# Held at 4.10.0.84 for macOS reach, not by accident. From 4.11 onwards the
+# macOS wheels are tagged macosx_13_0, which puts the Mac app's floor at
+# macOS 13; 4.10.0.84 publishes macosx_11_0_arm64 and macosx_12_0_x86_64 and
+# brings it down to 11 and 12. Inference is unaffected: the same ONNX model on
+# the same input gives sums and means identical to 8 decimal places across the
+# two versions, differing only in the last bits of float32. Pinned for every
+# platform so a Mac, the Windows build and the Linux server all count alike.
+opencv-contrib-python-headless==4.10.0.84
 pillow>=11.0

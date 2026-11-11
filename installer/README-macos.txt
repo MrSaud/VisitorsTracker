@@ -70,12 +70,15 @@ Which Macs this runs on
 There are two images, one per chip, because OpenCV publishes no single
 binary covering both:
 
-    VisitorsTracker-1.0.0-arm64.dmg    Apple Silicon (M1 and later)
-    VisitorsTracker-1.0.0-x86_64.dmg   Intel
+    VisitorsTracker-1.0.0-arm64.dmg    Apple Silicon (M1 and later),
+                                       macOS 11 (Big Sur) or newer
+    VisitorsTracker-1.0.0-x86_64.dmg   Intel,
+                                       macOS 12 (Monterey) or newer
 
-Both need macOS 14 (Sonoma) or newer. That floor is not a choice: the
-OpenCV and numpy binaries inside are built against it. The app refuses to
-start on an older Mac rather than half-working.
+Those floors come from the OpenCV and numpy binaries inside, not from a
+preference. The line at the top of this file states the one for the build
+you are holding. An older Mac will not start it at all, rather than
+half-working.
 
 Opening the wrong one gives "You can't open the application because it is
 not supported on this type of Mac". Check which you have under

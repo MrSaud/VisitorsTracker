@@ -6196,3 +6196,98 @@ class MacDeploymentTargetTests(TestCase):
         # matters is that nobody reads the seed as the truth.
         self.assertIn("LSMinimumSystemVersion", spec)
         self.assertIn("LSMinimumSystemVersion", self.script)
+
+
+class MacWheelChoiceTests(TestCase):
+    """pip's wheel choice silently sets how old a Mac the app can run on.
+
+    numpy ships two macOS wheels per architecture of one version -- an
+    old-SDK build and a macosx_14_0 build -- and pip takes the most specific
+    one the building Mac accepts. That put the floor at macOS 14 with
+    nothing saying so. The helper picks the wheels by name instead.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = pathlib.Path(settings.BASE_DIR)
+        cls.helper = cls.root / "scripts" / "macos_build_env.py"
+        cls.text = cls.helper.read_text()
+
+    def test_the_helper_exists_and_runs(self):
+        self.assertTrue(self.helper.exists())
+        self.assertTrue(os.access(self.helper, os.X_OK))
+
+    def test_it_names_a_wheel_for_each_architecture(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("mbe", self.helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(set(module.WHEELS), {"arm64", "x86_64"})
+        for arch, entries in module.WHEELS.items():
+            packages = {name for name, _v, _py, _plat in entries}
+            self.assertEqual(
+                packages, {"numpy", "opencv-contrib-python-headless"},
+                "these two are the ones whose wheels set the floor")
+            for _name, _version, py_tag, platform_tag in entries:
+                self.assertIn(arch, platform_tag)
+                # Without an interpreter tag the platform tag alone matches
+                # one numpy wheel per Python version -- six of them.
+                self.assertTrue(py_tag)
+
+    def test_the_chosen_wheels_are_old_sdk_builds(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("mbe", self.helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        floors = {}
+        for arch, entries in module.WHEELS.items():
+            for _name, _version, _py, platform_tag in entries:
+                major = int(re.search(r"macosx_(\d+)_", platform_tag).group(1))
+                floors.setdefault(arch, []).append(major)
+        # macosx_13_0 or later would undo the whole exercise.
+        self.assertLessEqual(max(floors["arm64"]), 11)
+        self.assertLessEqual(max(floors["x86_64"]), 12)
+
+    def test_it_verifies_what_it_downloads(self):
+        self.assertIn("digests", self.text)
+        self.assertIn("sha256", self.text)
+
+    def test_it_refuses_to_fall_back_to_pips_choice(self):
+        # Falling back quietly would reintroduce the bug on the next time
+        # numpy or OpenCV changes its tags.
+        self.assertIn("publishes no", self.text)
+        self.assertIn("raise SystemExit", self.text)
+
+    def test_it_reads_both_deployment_target_load_commands(self):
+        for where in (self.text,
+                      (self.root / "scripts" / "build_macos_app.sh").read_text()):
+            self.assertIn("LC_BUILD_VERSION", where)
+            self.assertIn("LC_VERSION_MIN_MACOSX", where)
+
+
+class OpenCVPinTests(TestCase):
+    """The pin is load-bearing for how old a Mac can run the app."""
+
+    def test_opencv_is_held_at_the_version_with_low_macos_wheels(self):
+        text = (pathlib.Path(settings.BASE_DIR) / "requirements.txt").read_text()
+        self.assertIn("opencv-contrib-python-headless==4.10.0.84", text)
+
+    def test_the_reason_is_written_next_to_it(self):
+        text = (pathlib.Path(settings.BASE_DIR) / "requirements.txt").read_text()
+        line = next(i for i, l in enumerate(text.splitlines())
+                    if "opencv-contrib-python-headless==" in l)
+        above = "\n".join(text.splitlines()[max(0, line - 8):line])
+        self.assertIn("macosx", above,
+                      "a pin this specific needs its reason beside it")
+
+    def test_the_installed_version_matches_the_pin(self):
+        import cv2
+
+        self.assertTrue(cv2.__version__.startswith("4.10."),
+                        f"requirements pins 4.10.0.84 but 4.10 is not what "
+                        f"is installed ({cv2.__version__})")
