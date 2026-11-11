@@ -5879,3 +5879,97 @@ class CameraPageControlsTests(TestCase):
         self.assertNotIn('<button data-action="disable"', page)
         self.assertNotIn('<button class="primary" data-action="start"', page)
         self.assertIn("Read-only", page)
+
+
+class SwitchingTheRunningEventTests(TestCase):
+    """Choosing which event the counts are attributed to.
+
+    An event is counted for when it is active and its window covers now;
+    where several overlap the most recently started wins. Switching used
+    to mean editing dates by hand and working out that rule yourself.
+    """
+
+    def setUp(self):
+        self.staff = User.objects.create_superuser("boss", "b@example.com", "pw")
+        self.client.force_login(self.staff)
+        self.camera = Camera.objects.create(name="Door", source="0")
+        now = timezone.now()
+        self.one = Event.objects.create(
+            name="Event1", starts_at=now - timedelta(days=1),
+            ends_at=now + timedelta(days=5))
+        self.two = Event.objects.create(
+            name="Event2", starts_at=now - timedelta(hours=2),
+            ends_at=now + timedelta(days=5))
+
+    def act(self, action, *events):
+        return self.client.post("/admin/counter/event/", {
+            "action": action,
+            "_selected_action": [str(e.pk) for e in events],
+        }, follow=True)
+
+    def running(self):
+        event = active_event_for(self.camera)
+        return event.name if event else None
+
+    def test_switching_makes_that_event_the_one_counting(self):
+        self.assertEqual(self.running(), "Event2")   # started most recently
+        self.act("run_now", self.one)
+        self.assertEqual(self.running(), "Event1")
+
+    def test_switching_back_works_too(self):
+        self.act("run_now", self.one)
+        self.act("run_now", self.two)
+        self.assertEqual(self.running(), "Event2")
+
+    def test_crossings_already_counted_keep_their_event(self):
+        # The whole point: switching must not rewrite history.
+        Crossing.objects.create(camera=self.camera, event=self.two,
+                                direction=DIRECTION_IN, track_id=1,
+                                occurred_at=timezone.now())
+        self.act("run_now", self.one)
+        self.assertEqual(Crossing.objects.get().event, self.two)
+        self.assertEqual(self.two.totals()["in"], 1)
+        self.assertEqual(self.one.totals()["in"], 0)
+
+    def test_an_inactive_event_is_activated_by_switching_to_it(self):
+        self.one.is_active = False
+        self.one.save()
+        self.act("run_now", self.one)
+        self.one.refresh_from_db()
+        self.assertTrue(self.one.is_active)
+        self.assertEqual(self.running(), "Event1")
+
+    def test_a_finished_event_is_refused_rather_than_extended(self):
+        done = Event.objects.create(
+            name="Last week", starts_at=timezone.now() - timedelta(days=9),
+            ends_at=timezone.now() - timedelta(days=8))
+        before = done.ends_at
+        self.act("run_now", done)
+        done.refresh_from_db()
+        self.assertEqual(done.ends_at, before, "it must not quietly extend it")
+        self.assertNotEqual(self.running(), "Last week")
+
+    def test_choosing_several_is_refused(self):
+        # "Count for these three" has no meaning.
+        self.act("run_now", self.one, self.two)
+        self.assertEqual(self.running(), "Event2", "nothing should have changed")
+
+    def test_ending_an_event_stops_it_counting(self):
+        self.act("end_now", self.two)
+        self.assertEqual(self.running(), "Event1",
+                         "counting falls back to whatever still covers now")
+
+    def test_ending_the_last_one_leaves_nothing_counting(self):
+        self.act("end_now", self.one, self.two)
+        self.assertIsNone(self.running())
+
+    def test_ending_does_not_touch_what_was_already_counted(self):
+        Crossing.objects.create(camera=self.camera, event=self.two,
+                                direction=DIRECTION_IN, track_id=1,
+                                occurred_at=timezone.now())
+        self.act("end_now", self.two)
+        self.assertEqual(self.two.totals()["in"], 1)
+
+    def test_the_list_says_which_one_is_counting(self):
+        page = self.client.get("/admin/counter/event/").content.decode()
+        self.assertIn("Counting now", page)

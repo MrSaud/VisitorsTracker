@@ -1,5 +1,6 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.shortcuts import render
+from django.utils import timezone
 
 from .exports import events_csv_response
 from .models import Alert, Camera, Crossing, Event
@@ -44,7 +45,7 @@ class CameraAdmin(admin.ModelAdmin):
 
 @admin.register(Event)
 class EventAdmin(admin.ModelAdmin):
-    list_display = ("name", "starts_at", "ends_at", "is_active",
+    list_display = ("name", "running_now", "starts_at", "ends_at", "is_active",
                     "attendance", "occupancy_now")
     list_filter = ("is_active",)
     search_fields = ("name", "notes")
@@ -62,7 +63,95 @@ class EventAdmin(admin.ModelAdmin):
         ("Record", {"fields": ("created_at",)}),
     )
 
-    actions = ["export_csv"]
+    actions = ["export_csv", "run_now", "end_now"]
+
+    @admin.display(description="Counting now", boolean=True)
+    def running_now(self, obj):
+        """Whether crossings are being attributed to this event.
+
+        Not the same as "active": an event can be ticked active and still
+        be over, or not started. This is the question people actually
+        have, so the list answers it directly.
+        """
+        return obj.pk in self._running_event_ids()
+
+    def _running_event_ids(self):
+        from .models import Camera, active_event_for
+
+        return {
+            event.pk
+            for event in (active_event_for(camera) for camera in Camera.objects.all())
+            if event is not None
+        }
+
+    @admin.action(description="Count for this event from now on")
+    def run_now(self, request, queryset):
+        """Switch counting to one event.
+
+        An event is counted for when it is active and its window covers
+        now; where several overlap the most recently started one wins. So
+        this starts the chosen event now, which both makes it current and
+        makes it win, without touching the others or their figures --
+        crossings are attributed by foreign key, so nothing already
+        recorded moves.
+        """
+        if queryset.count() != 1:
+            self.message_user(
+                request, "Pick exactly one event to count for.",
+                level=messages.ERROR)
+            return
+
+        event = queryset.first()
+        now = timezone.now()
+
+        if event.ends_at and event.ends_at <= now:
+            self.message_user(
+                request,
+                f"{event.name} ended on "
+                f"{timezone.localtime(event.ends_at):%d %b %H:%M}. Give it a "
+                f"later end date first; this will not quietly extend it.",
+                level=messages.ERROR)
+            return
+
+        already = event.pk in self._running_event_ids()
+        changes = []
+        if not event.is_active:
+            event.is_active = True
+            changes.append("marked active")
+        if not already:
+            event.starts_at = now
+            changes.append("started now")
+        event.save()
+
+        if changes:
+            self.message_user(
+                request,
+                f"Counting for {event.name}: {', '.join(changes)}. Crossings "
+                f"already recorded keep the event they were counted under.")
+        else:
+            self.message_user(request, f"{event.name} was already the one counting.")
+
+    @admin.action(description="Stop counting for this event")
+    def end_now(self, request, queryset):
+        """End an event now, so crossings stop being attributed to it.
+
+        Sets the end to now rather than unticking active, because that is
+        what happened: the event finished. Unticking active would leave a
+        misleading schedule behind.
+        """
+        now = timezone.now()
+        ended = 0
+        for event in queryset:
+            if event.ends_at and event.ends_at <= now:
+                continue
+            event.ends_at = now
+            event.save(update_fields=["ends_at"])
+            ended += 1
+        self.message_user(
+            request,
+            f"Ended {ended} event(s) at {timezone.localtime(now):%H:%M}. "
+            f"Counting falls back to whichever event still covers now, or none."
+            if ended else "Those events had already ended.")
 
     @admin.action(description="Export visitor data to CSV")
     def export_csv(self, request, queryset):

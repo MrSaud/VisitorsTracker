@@ -908,6 +908,31 @@ it is off the dashboard and in somebody's spreadsheet. An export that is not
 scoped to one event says `All events` rather than leaving the cell blank,
 which would read as missing data.
 
+## Switching which event is counted
+
+A crossing belongs to the event that is active and whose window covers the
+moment it happened. Where events overlap, the one that started most
+recently wins — a session inside a longer programme is the normal case and
+the inner one is the more specific answer.
+
+To change which event the counts go to, select it in **Events** and choose
+**Count for this event from now on**. That marks it active and starts it
+now, which both makes it current and makes it win the overlap rule,
+without touching any other event.
+
+**Crossings already recorded keep the event they were counted under.**
+They are attributed by foreign key, not by date, so switching never
+rewrites history or moves figures between events.
+
+**Count for this event from now on** refuses an event that has already
+ended rather than quietly extending it; give it a later end date first.
+**Stop counting for this event** ends it now, after which counting falls
+back to whichever event still covers the present, or to none.
+
+The Events list has a *Counting now* column, because "active" and "being
+counted for" are different questions — an event can be ticked active and
+still be over, or not yet started.
+
 ## Visitors per date
 
 The dashboard's **Visitors per date** panel charts daily crossings over 7, 30
