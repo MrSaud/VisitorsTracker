@@ -128,4 +128,7 @@ echo "Built $DMG ($(du -h "$DMG" | cut -f1))"
 echo "  $ARCH Macs only, macOS $MIN or newer"
 echo
 echo "On the Mac you give it to, macOS will refuse it on first open because"
-echo "it is not notarised. Right-click the app > Open > Open, once."
+echo "it is not notarised. The way through, on every version:"
+echo "  copy it to /Applications, double-click, Cancel the warning, then"
+echo "  System Settings > Privacy & Security > Open Anyway."
+echo "The old right-click > Open shortcut was removed in macOS 15."

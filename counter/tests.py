@@ -6135,7 +6135,10 @@ class MacPackagingScriptTests(TestCase):
     def test_the_readme_covers_the_two_things_that_will_confuse_people(self):
         text = (self.root / "installer" / "README-macos.txt").read_text()
         # Gatekeeper refuses an un-notarised app with no visible way forward.
-        self.assertIn("Right-click", text)
+        # This used to assert "Right-click", which pinned the instruction
+        # Apple removed in macOS 15 -- the test held the bug in place rather
+        # than catching it. GatekeeperInstructionsTests covers the detail.
+        self.assertIn("Open Anyway", text)
         # And the data lives somewhere they would not guess.
         self.assertIn("~/Library/Application Support/VisitorsTracker", text)
 
@@ -6478,3 +6481,52 @@ class ServerUninstallTests(TestCase):
             self.assertTrue((units / "visitorstracker.service").exists())
             self.assertTrue((nginx / "visitorstracker.conf").exists())
             self.assertTrue((root / "etc/visitorstracker.env").exists())
+
+
+class GatekeeperInstructionsTests(TestCase):
+    """The install instructions have to work on the macOS people have.
+
+    The first version said "right-click > Open", which Apple removed in
+    macOS 15. It still works on 14 and earlier, so it read as correct from
+    a machine that never needed it -- and left somebody installing on an
+    Intel Mac with a dialog offering only Move to Trash and Cancel.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = pathlib.Path(settings.BASE_DIR)
+        cls.readme = (root / "installer" / "README-macos.txt").read_text()
+        cls.script = (root / "scripts" / "build_macos_app.sh").read_text()
+
+    def test_the_route_that_works_on_every_version_is_there(self):
+        for text in (self.readme, self.script):
+            self.assertIn("Privacy & Security", text)
+            self.assertIn("Open Anyway", text)
+
+    def test_the_removed_shortcut_is_not_the_main_instruction(self):
+        # It may be mentioned for older systems, but the steps people follow
+        # must not depend on it.
+        steps = self.readme.split("Why any of this happens")[0]
+        first_mention = steps.find("right-click")
+        open_anyway = steps.find("Open Anyway")
+        self.assertNotEqual(open_anyway, -1)
+        if first_mention != -1:
+            self.assertLess(open_anyway, first_mention,
+                            "the version-independent route must come first")
+
+    def test_it_says_which_version_removed_the_shortcut(self):
+        self.assertIn("macOS 15", self.readme)
+
+    def test_the_terminal_fallback_is_the_command_that_was_tested(self):
+        self.assertIn("xattr -dr com.apple.quarantine", self.readme)
+        self.assertIn("/Applications/VisitorsTracker.app", self.readme)
+
+    def test_it_tells_people_to_copy_it_out_of_the_image_first(self):
+        self.assertIn("Applications folder", self.readme)
+
+    def test_it_warns_that_cancel_is_the_right_button(self):
+        # The dialog offers Move to Trash and Cancel; picking the first
+        # throws the app away and the install fails for good.
+        self.assertIn("Move to Trash", self.readme)
+        self.assertIn("Cancel", self.readme)

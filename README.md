@@ -369,9 +369,23 @@ launch** unpacking 80MB every time. The spec builds onedir off Windows:
 
 **Gatekeeper will refuse it on another Mac.** The signature is ad-hoc, which
 is enough to hold a camera grant but not enough to pass notarisation — that
-needs a paid Apple Developer identity. `spctl --assess` says `rejected`, and
-the first open has to be right-click > Open > Open. The readme in the disk
-image says so in the user's words.
+needs a paid Apple Developer identity. `spctl --assess` says `rejected`.
+
+Getting past it once, on any version: copy the app to `/Applications`,
+double-click, cancel the warning, then **System Settings > Privacy & Security
+> Open Anyway**. Or `xattr -dr com.apple.quarantine
+/Applications/VisitorsTracker.app`, which clears the download flag and leaves
+the signature intact (checked, not assumed).
+
+The readme in the disk image said "right-click > Open" and that was wrong:
+**Apple removed the right-click override in macOS 15.** It still works on 14
+and earlier, so the instruction looked fine from a machine that had never
+needed it. Someone installing on an Intel Mac hit a dead end with it. The
+readme now leads with the System Settings route, which works everywhere, and
+keeps right-click only as a footnote for older systems.
+
+The permanent fix is notarisation, which is a change to how the app is built
+rather than anything the person installing it can do.
 
 The spec was validated by actually freezing the app on a Mac and running
 it: the binary is useless on Windows, but every problem below is

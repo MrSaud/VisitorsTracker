@@ -6,18 +6,47 @@ Mac; nothing is uploaded, and no internet connection is needed.
 
 Installing
 ----------
-Drag VisitorsTracker to the Applications folder in this window.
+1. Drag VisitorsTracker to the Applications folder in this window.
+   Do this first. Opening it from inside the disk image makes the next
+   step harder than it needs to be.
 
-Then open it ONCE like this:
+2. Double-click it. You will get
 
-    Right-click VisitorsTracker in Applications > Open > Open
+       "Apple could not verify VisitorsTracker is free of malware"
 
-A plain double-click the first time gets you "Apple could not verify
-VisitorsTracker is free of malware" and no way forward. That is not a
-problem with the app: Apple charges developers a yearly fee to register
-apps, and this one is not registered. The right-click is how macOS lets you
-make that decision yourself. You only do it once -- after that, double-click
-as normal.
+   and the only buttons will be Move to Trash and Cancel. Click Cancel.
+   This is expected, and it is step 2 of 3, not a failure.
+
+3. Open  System Settings > Privacy & Security  and scroll down to the
+   Security section. There will be a line saying VisitorsTracker was
+   blocked. Click  Open Anyway,  confirm, and it starts.
+
+You do this once. After that it opens by double-click like anything else.
+
+On macOS 14 and earlier there is a shortcut: right-click the app in
+Applications and choose Open, which offers the same override in a dialog.
+Apple removed that route in macOS 15, which is why the steps above go
+through System Settings instead -- they work on every version.
+
+If the Security section shows no such line, this does the same thing from
+Terminal and works on all versions:
+
+    xattr -dr com.apple.quarantine /Applications/VisitorsTracker.app
+
+Why any of this happens
+-----------------------
+macOS runs an unknown app only if Apple has seen and approved it in
+advance, which costs the developer a paid Apple Developer account and a
+submission for each release. This app is signed but not submitted, so macOS
+has nothing to check it against and asks you to make the decision instead.
+
+The warning says Apple cannot verify the app, not that anything is wrong
+with it. Nothing about the app changes when you click Open Anyway; you are
+only telling macOS you trust where you got it from.
+
+To remove the step entirely, the app has to be notarised with an Apple
+Developer account. That is a change to how it is built, not something you
+can switch on here.
 
 Starting it
 -----------
