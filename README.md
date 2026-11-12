@@ -634,6 +634,45 @@ to the lens or down the hall.
 This is also why a suggested line is kept between 0.2 and 0.8 of the frame:
 at 0.9 a close subject has no room left to get clear of the line.
 
+### When the tracker swaps two people
+
+Distance past the line answers "did they really cross". It does not answer
+"was it the same person". In a crowd the tracker sometimes hands an id to a
+neighbour, and from the counter's side that looks like somebody teleporting
+across the line and back.
+
+Measured on a ten-second clip of a dense pavement crowd: **14 people crossed
+and the app counted 23.** Seven tracks crossed two or three times, one of them
+in and then out ten frames apart -- four tenths of a second. Tracing that
+track showed it walking steadily right at 5px a frame with a 41px box, then
+jumping 112px backwards: 2.7 times its own width, against its own direction of
+travel. Another jumped 3.7 widths.
+
+Nobody moves a whole body width between two frames, so a step that large is
+not movement, it is a different person. A side change is now ignored when the
+track's last step was more than `COUNTER_LINE_JUMP_FRACTION` of its own box
+(default 2.0); the track takes the new position, but nothing is counted.
+
+| | counted |
+|---|---|
+| People who actually crossed | 14-18 |
+| Before | 23 |
+| After | **20** |
+
+Why 2.0 and not tighter: people walk at 0.07-0.15 of their own width per
+frame, so 2.0 leaves a wide margin, and this project's own fast-crossing tests
+use steps up to 1.6. Tightening to 1.0 would have reached 19 on the clip and
+broken six of those tests.
+
+It is a partial fix and the residue is honest: three crossings on that clip
+are still repeats. Catching those means not swapping the identities in the
+first place, which is work in the tracker rather than the counter.
+
+A rule was also tried and **rejected**: making a counted track travel a longer
+distance before it could count again. It removed real crossings -- somebody
+who steps in and turns straight back out is a normal thing to do, and two of
+this project's own tests say so.
+
 ### Why not a frame count
 
 There used to be a second guard — the track had to hold the new side for
@@ -932,6 +971,7 @@ All of these are environment variables:
 | `COUNTER_DETECT_EVERY` | `3` | Detect on every Nth frame |
 | `COUNTER_MAX_DISAPPEARED` | `25` | Frames a track survives unseen |
 | `COUNTER_LINE_COMMIT_FRACTION` | `0.6` | How far past the line a track must get before it counts, as a fraction of its own box — see [Loitering](#loitering) |
+| `COUNTER_LINE_JUMP_FRACTION` | `2.0` | The largest single-frame step still treated as the same person, as a fraction of its own box. Bigger steps are identity swaps and are not counted. `0` disables the check |
 | `COUNTER_FRAME_WIDTH` | `640` | Frames are downscaled to this width before detection |
 | `COUNTER_OCCUPANCY_RESET_AT` | `00:00` | Local time occupancy returns to zero |
 | `COUNTER_STALE_FRAME_SECONDS` | `30` | No frame for this long means stalled |

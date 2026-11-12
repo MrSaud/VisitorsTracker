@@ -53,6 +53,13 @@ PERSON_CLASS_ID = 0
 # footage and none of the sway.
 DEFAULT_COMMIT_FRACTION = 0.6
 
+# The largest step, as a multiple of the track's own width, that can still be
+# the same person walking. Anything bigger is the tracker handing the id to
+# somebody else, and must not be read as a crossing. Measured on real
+# footage: people walk at 0.07 to 0.15 of their own width per frame, while
+# the identity swaps that produced phantom crossings jumped 1.4 to 3.7.
+DEFAULT_JUMP_FRACTION = 2.0
+
 # How close to the frame edge a suggested line may sit. Past these a
 # crossing has too little room left to be confirmed.
 LINE_POSITION_MIN = 0.2
@@ -423,12 +430,14 @@ class LineCounter:
         invert: bool = False,
         margin: int = 10,
         commit_fraction: float = DEFAULT_COMMIT_FRACTION,
+        jump_fraction: float = DEFAULT_JUMP_FRACTION,
     ):
         self.position = float(position)
         self.orientation = orientation if orientation in (HORIZONTAL, VERTICAL) else HORIZONTAL
         self.invert = bool(invert)
         self.margin = int(margin)
         self.commit_fraction = max(0.0, float(commit_fraction))
+        self.jump_fraction = max(0.0, float(jump_fraction))
         self.total_in = 0
         self.total_out = 0
 
@@ -483,9 +492,34 @@ class LineCounter:
         travelled = abs(float(recent[-1][axis]) - float(recent[0][axis]))
         return travelled / (len(recent) - 1)
 
-    def _is_clear_of_line(self, track, delta) -> bool:
+    def _moved_rather_than_jumped(self, track) -> bool:
+        """Whether this is the same person a frame later, or a different one.
+
+        A tracker in a crowd sometimes hands an id to a neighbour. From here
+        that looks like a person teleporting across the line and back, and it
+        was the largest source of overcounting on real footage: one track
+        counted in, then out ten frames later, having moved 2.7 times its own
+        width backwards against its own direction of travel.
+
+        A person cannot move a whole body width between two frames. Something
+        that does has not moved at all.
+        """
+        if self.jump_fraction <= 0:
+            return True
+        trail = list(track.trail)
+        if len(trail) < 2:
+            return True        # nothing to compare against yet
+        extent = self._axis_extent(track.box)
+        if extent <= 0:
+            return True        # no scale; the other guards still apply
+        axis = 1 if self.orientation == HORIZONTAL else 0
+        step = abs(float(trail[-1][axis]) - float(trail[-2][axis]))
+        return step <= extent * self.jump_fraction
+
+    def _is_clear_of_line(self, track, delta, fraction=None) -> bool:
         """Far enough past the line that it cannot be a sway."""
-        if self.commit_fraction <= 0:
+        fraction = self.commit_fraction if fraction is None else float(fraction)
+        if fraction <= 0:
             # No distance asked for, so the dead band is the only guard and
             # the first flip counts. This is the old, inflating behaviour,
             # kept reachable so a test can demonstrate it.
@@ -495,7 +529,7 @@ class LineCounter:
             # No box to scale against. Better to miss the crossing than to
             # count an unknown amount of sway as visitors.
             return False
-        return abs(delta) >= extent * self.commit_fraction
+        return abs(delta) >= extent * fraction
 
     def update(self, tracks, frame_shape):
         """Returns a list of ``(track_id, direction)`` for crossings this frame."""
@@ -522,6 +556,12 @@ class LineCounter:
             if side == previous:
                 # Back where they were, and they were never clear of the
                 # line, so there is nothing to abandon. This is the sway.
+                continue
+
+            if not self._moved_rather_than_jumped(track):
+                # The id changed hands. Take the new position as where this
+                # track now is, but count nothing: nobody walked anywhere.
+                track.side = side
                 continue
 
             # They are on the other side. It counts once they are clear of

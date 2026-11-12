@@ -6791,3 +6791,86 @@ class SharedPageScriptTests(TestCase):
 
     def test_the_cameras_page_still_uses_them(self):
         self.assertIn("postJSON(", self.templates()["cameras.html"])
+
+
+class IdentitySwapDoesNotCountTests(TestCase):
+    """A tracker in a crowd sometimes hands an id to a neighbour.
+
+    From the line counter's side that looks like somebody teleporting
+    across the line and back, and on real footage it was the largest source
+    of overcounting: a clip of 14 people crossing was counted as 23. One
+    track was counted in, then out ten frames later, having moved 2.7 times
+    its own width backwards against its own direction of travel.
+    """
+
+    def counter(self, **kwargs):
+        from counter.vision import LineCounter
+
+        return LineCounter(position=0.5, orientation="horizontal", **kwargs)
+
+    def track(self, track_id, ys, box_h=80):
+        """A track whose trail is the given path down the frame."""
+        from collections import deque
+        from counter.vision import Track
+
+        t = Track(track_id=track_id, centroid=(160, ys[-1]),
+                  box=[140, ys[-1] - box_h / 2, 180, ys[-1] + box_h / 2])
+        t.trail = deque([(160, y) for y in ys], maxlen=24)
+        return t
+
+    def run_path(self, ys, **kwargs):
+        """Feed one track along a path and return (in, out)."""
+        line = self.counter(**kwargs)
+        for i in range(2, len(ys) + 1):
+            t = self.track(1, ys[:i])
+            t.side = getattr(self, "_side", 0)
+            line.update({1: t}, (480, 640))
+            self._side = t.side
+        self._side = 0
+        return line.total_in, line.total_out
+
+    def test_a_walk_across_is_still_counted(self):
+        self.assertEqual(self.run_path([180, 200, 220, 240, 260, 280, 300]),
+                         (1, 0))
+
+    def test_a_teleport_across_is_not(self):
+        # 300px in one step with an 80px box: 3.7 times its own height, the
+        # size of jump seen on the real clip.
+        self.assertEqual(self.run_path([180, 200, 500]), (0, 0))
+
+    def test_the_threshold_is_where_it_is_documented(self):
+        from counter.vision import DEFAULT_JUMP_FRACTION
+
+        # People walk at 0.07-0.15 of their own width per frame; the swaps
+        # measured on real footage jumped 2.7 and 3.7. 2.0 sits between,
+        # with room for a sprinter.
+        self.assertEqual(DEFAULT_JUMP_FRACTION, 2.0)
+
+    def test_a_sprinter_is_still_under_the_threshold(self):
+        # 150px in one step with an 80px box -- 1.9 times its own height,
+        # faster than anyone walks and still counted. The line is at 240 in
+        # a 480-tall frame, so this starts above it and lands well below.
+        self.assertEqual(self.run_path([160, 200, 350]), (1, 0))
+
+    def test_it_can_be_turned_off(self):
+        self.assertEqual(self.run_path([180, 200, 500], jump_fraction=0.0),
+                         (1, 0))
+
+    def test_a_track_with_no_history_is_given_the_benefit_of_the_doubt(self):
+        from counter.vision import LineCounter
+
+        line = LineCounter(position=0.5, orientation="horizontal")
+        t = self.track(1, [200])
+        t.side = -1
+        # One point in the trail: nothing to measure a jump against.
+        line.update({1: t}, (480, 640))
+        self.assertEqual((line.total_in, line.total_out), (0, 0))
+
+    def test_a_boxless_track_does_not_crash_the_check(self):
+        from counter.vision import LineCounter
+
+        line = LineCounter(position=0.5, orientation="horizontal")
+        t = self.track(1, [180, 500])
+        t.box = None
+        t.side = -1
+        line.update({1: t}, (480, 640))   # must not raise

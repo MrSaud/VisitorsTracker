@@ -7,7 +7,7 @@ from django.core.exceptions import ImproperlyConfigured
 
 # The counting defaults live beside the code that measured them, so a
 # settings file cannot quietly disagree with them.
-from counter.vision import DEFAULT_COMMIT_FRACTION
+from counter.vision import DEFAULT_COMMIT_FRACTION, DEFAULT_JUMP_FRACTION
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -214,6 +214,12 @@ COUNTER_DETECT_EVERY = int(os.environ.get("COUNTER_DETECT_EVERY", "3"))
 # over the line; see "Loitering" in the README.
 COUNTER_LINE_COMMIT_FRACTION = float(
     os.environ.get("COUNTER_LINE_COMMIT_FRACTION", str(DEFAULT_COMMIT_FRACTION)))
+
+# The largest single-frame step, in multiples of the track's own width, that
+# is still the same person. Bigger than this is an identity swap, and
+# counting it as a crossing invents visitors.
+COUNTER_LINE_JUMP_FRACTION = float(
+    os.environ.get("COUNTER_LINE_JUMP_FRACTION", str(DEFAULT_JUMP_FRACTION)))
 
 # Frames a track may go unseen before it is dropped.
 COUNTER_MAX_DISAPPEARED = int(os.environ.get("COUNTER_MAX_DISAPPEARED", "25"))
