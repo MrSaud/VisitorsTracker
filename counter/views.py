@@ -95,6 +95,31 @@ def _initial_admin_note():
         return None
 
 
+@api_view(["POST"])
+def initial_admin_delete(request):
+    """Delete the first-run password file.
+
+    The notice tells people to delete it once they have signed in and
+    changed the password, and until now that meant finding a file in a
+    directory most people never open. Staff only: this is the one copy of
+    a password nobody has memorised, and the account it belongs to cannot
+    hand it back -- the database holds a hash, not the password.
+    """
+    from .firstrun import password_path
+
+    path = password_path(settings.DATA_DIR)
+    if not path.exists():
+        # Already gone is the state the caller wanted, not an error.
+        return Response({"deleted": False, "reason": "already gone",
+                         "path": str(path)})
+    try:
+        path.unlink()
+    except OSError as error:
+        return Response({"deleted": False, "reason": str(error),
+                         "path": str(path)}, status=500)
+    return Response({"deleted": True, "path": str(path)})
+
+
 def _read_initial_password(path):
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("password:"):

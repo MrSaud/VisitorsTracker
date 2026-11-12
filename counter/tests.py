@@ -6643,3 +6643,151 @@ class DesktopClipboardTests(TestCase):
         self.assertTrue(self.api().copy_text(marker)["copied"])
         self.assertEqual(
             sp.run(["pbpaste"], capture_output=True, text=True).stdout, marker)
+
+
+class DeleteInitialAdminFileTests(TestCase):
+    """The notice says to delete a file; now it can delete it.
+
+    The file holds the only copy of a generated password -- the database
+    keeps a hash, so once it is gone it cannot be recovered. That shapes
+    both the permission and the two-click confirmation.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.models import User
+
+        self.data_dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.data_dir, True)
+        self.staff = User.objects.create_user("op", password="x", is_staff=True)
+        self.plain = User.objects.create_user("vis", password="x")
+
+    def write_note(self):
+        from counter.firstrun import password_path
+
+        path = password_path(self.data_dir)
+        path.write_text("username: admin\npassword: Zq7-Rhyme-Patio\n",
+                        encoding="utf-8")
+        return path
+
+    def test_staff_can_delete_it(self):
+        path = self.write_note()
+        self.client.force_login(self.staff)
+        with self.settings(DATA_DIR=self.data_dir):
+            response = self.client.post("/api/v1/initial-admin/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["deleted"])
+        self.assertFalse(path.exists())
+
+    def test_the_notice_goes_with_it(self):
+        self.write_note()
+        self.client.force_login(self.staff)
+        with self.settings(DATA_DIR=self.data_dir):
+            self.assertContains(self.client.get("/"), "First run")
+            self.client.post("/api/v1/initial-admin/")
+            self.assertNotContains(self.client.get("/"), "First run")
+
+    def test_anonymous_cannot_delete_it(self):
+        path = self.write_note()
+        with self.settings(DATA_DIR=self.data_dir):
+            response = self.client.post("/api/v1/initial-admin/")
+
+        self.assertIn(response.status_code, (401, 403))
+        self.assertTrue(path.exists(), "it must still be there")
+
+    def test_a_signed_in_non_staff_user_cannot_delete_it(self):
+        path = self.write_note()
+        self.client.force_login(self.plain)
+        with self.settings(DATA_DIR=self.data_dir):
+            response = self.client.post("/api/v1/initial-admin/")
+
+        self.assertIn(response.status_code, (401, 403))
+        self.assertTrue(path.exists())
+
+    def test_get_does_not_delete_anything(self):
+        path = self.write_note()
+        self.client.force_login(self.staff)
+        with self.settings(DATA_DIR=self.data_dir):
+            response = self.client.get("/api/v1/initial-admin/")
+
+        self.assertEqual(response.status_code, 405)
+        self.assertTrue(path.exists())
+
+    def test_deleting_it_twice_is_not_an_error(self):
+        self.write_note()
+        self.client.force_login(self.staff)
+        with self.settings(DATA_DIR=self.data_dir):
+            self.client.post("/api/v1/initial-admin/")
+            again = self.client.post("/api/v1/initial-admin/")
+
+        self.assertEqual(again.status_code, 200)
+        self.assertFalse(again.json()["deleted"])
+        self.assertIn("already gone", again.json()["reason"])
+
+    def test_the_button_is_only_shown_to_someone_who_can_use_it(self):
+        self.write_note()
+        with self.settings(DATA_DIR=self.data_dir):
+            anonymous = self.client.get("/").content.decode()
+            self.client.force_login(self.staff)
+            operator = self.client.get("/").content.decode()
+
+        self.assertNotIn('id="delete-initial-admin"', anonymous)
+        self.assertIn("sign in to the admin to delete", anonymous)
+        self.assertIn('id="delete-initial-admin"', operator)
+
+    def test_the_page_asks_twice_before_deleting(self):
+        template = (pathlib.Path(settings.BASE_DIR) / "counter" / "templates"
+                    / "counter" / "base.html").read_text()
+        # Two clicks on the button itself.
+        self.assertIn("data-confirm", template)
+        self.assertIn("armed", template)
+        # Not a native dialog: a web view is under no obligation to show
+        # one, and a confirmation nobody sees is a deletion without one.
+        self.assertNotIn("window.confirm", template)
+        script = template.split("<script>")[1]
+        calls = [line for line in script.splitlines()
+                 if "confirm(" in line and not line.strip().startswith("//")
+                 and "dataset.confirm" not in line]
+        self.assertEqual(calls, [], f"looks like a native dialog: {calls}")
+
+    def test_a_failure_is_reported_not_swallowed(self):
+        path = self.write_note()
+        self.client.force_login(self.staff)
+        with self.settings(DATA_DIR=self.data_dir), \
+                patch("pathlib.Path.unlink", side_effect=OSError("read-only")):
+            response = self.client.post("/api/v1/initial-admin/")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(response.json()["deleted"])
+        self.assertIn("read-only", response.json()["reason"])
+        self.assertTrue(path.exists())
+
+
+class SharedPageScriptTests(TestCase):
+    """CSRF and postJSON moved into the shared block for the notice.
+
+    Both were declared with const in cameras.html, and the page templates
+    are inlined into one <script> element -- a second declaration of either
+    is a SyntaxError that stops every script on the page, including the
+    ones that were working before.
+    """
+
+    def templates(self):
+        root = (pathlib.Path(settings.BASE_DIR) / "counter" / "templates"
+                / "counter")
+        return {p.name: p.read_text() for p in root.glob("*.html")}
+
+    def test_each_shared_name_is_declared_exactly_once(self):
+        joined = "\n".join(self.templates().values())
+        for name in ("const CSRF", "async function postJSON",
+                     "function clockTime", "async function copyToClipboard"):
+            self.assertEqual(joined.count(name), 1,
+                             f"{name} is declared {joined.count(name)} times")
+
+    def test_the_shared_ones_live_in_the_base_template(self):
+        base = self.templates()["base.html"]
+        for name in ("const CSRF", "async function postJSON"):
+            self.assertIn(name, base)
+
+    def test_the_cameras_page_still_uses_them(self):
+        self.assertIn("postJSON(", self.templates()["cameras.html"])

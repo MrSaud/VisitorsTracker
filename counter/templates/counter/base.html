@@ -117,6 +117,7 @@
     vertical-align: baseline;
   }
   code.just-copied { outline: 1px solid var(--in); border-radius: 3px; }
+  .muted-inline { opacity: 0.75; font-size: 11.5px; }
   button.danger { background: #6f2a2a; border-color: #8d3a3a; }
   .controls.read-only { color: var(--muted); font-size: 12.5px; }
   .pill {
@@ -378,7 +379,14 @@
                 data-copied="Copied">Copy password</button></li>
     <li>Add your camera there, then change this password.</li>
     <li>This message disappears when you delete
-        <code>{{ initial_admin.path }}</code></li>
+        <code>{{ initial_admin.path }}</code>
+        {% if can_operate %}
+        <button type="button" class="copy danger" id="delete-initial-admin"
+                data-confirm="Delete it &mdash; sure?">Delete it now</button>
+        {% else %}
+        <span class="muted-inline">(sign in to the admin to delete it from
+        here)</span>
+        {% endif %}</li>
   </ul>
 </section>
 {% endif %}
@@ -393,6 +401,59 @@
 
 <script>
 // Shared by every page.
+const CSRF = "{{ csrf_token }}";
+
+async function postJSON(url) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "X-CSRFToken": CSRF },
+  });
+  let body = null;
+  try { body = await response.json(); } catch (err) { body = null; }
+  return { ok: response.ok, status: response.status, body: body };
+}
+
+// Deleting the first-run file cannot be undone: the database keeps a hash
+// of that password, not the password, so once the file is gone a password
+// nobody wrote down is gone with it. Hence two clicks rather than a
+// native confirm(), which a web view is not obliged to show at all.
+const deleteNotice = document.getElementById("delete-initial-admin");
+if (deleteNotice) {
+  let armed = false;
+  let disarm = null;
+  const original = deleteNotice.textContent;
+
+  deleteNotice.addEventListener("click", async () => {
+    if (!armed) {
+      armed = true;
+      deleteNotice.textContent = deleteNotice.dataset.confirm || "Sure?";
+      disarm = setTimeout(() => {
+        armed = false;
+        deleteNotice.textContent = original;
+      }, 5000);
+      return;
+    }
+
+    clearTimeout(disarm);
+    armed = false;
+    deleteNotice.disabled = true;
+    deleteNotice.textContent = "Deleting";
+
+    const result = await postJSON("/api/v1/initial-admin/");
+    if (result.ok && result.body && result.body.deleted) {
+      // The notice exists only to carry that file; both go together.
+      const notice = document.querySelector("section.firstrun");
+      if (notice) notice.remove();
+      return;
+    }
+
+    const reason = (result.body && (result.body.reason || result.body.detail))
+      || `HTTP ${result.status}`;
+    deleteNotice.textContent = `Could not delete: ${reason}`;
+    deleteNotice.disabled = false;
+    setTimeout(() => { deleteNotice.textContent = original; }, 6000);
+  });
+}
 
 // Three ways to reach a clipboard, because no single one is dependable
 // here. The desktop window is a web view, not a browser: clipboard

@@ -13,6 +13,8 @@ urlpatterns = [
     path("events/<int:event_id>/", views.event_detail, name="event-detail"),
     path("daily/", views.daily_report, name="daily-report"),
     path("crossings/", views.crossings_csv, name="crossings-csv"),
+    path("initial-admin/", views.initial_admin_delete,
+         name="initial-admin-delete"),
     path("hourly/", views.hourly_report, name="hourly-report"),
     path("cameras/", views.camera_list, name="camera-list"),
     path("cameras/<int:camera_id>/", views.camera_detail, name="camera-detail"),

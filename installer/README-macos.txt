@@ -59,8 +59,10 @@ An administrator account is created for you, and the dashboard shows the
 username and password at the top, with a Copy password button next to it --
 the password is generated and long, so copy it rather than retyping it. Use
 them to sign in at the "admin" link, add your camera, then change the
-password. The notice disappears once you
-delete this file:
+password. Once you are signed in, the notice grows a "Delete it now"
+button that removes the password file for you -- it asks twice, because
+the file holds the only copy of that password. Deleting it by hand does
+the same thing:
 
     ~/Library/Application Support/VisitorsTracker/initial-admin.txt
 

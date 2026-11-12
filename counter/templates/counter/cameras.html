@@ -56,22 +56,11 @@
 {% endblock %}
 
 {% block scripts %}
-const CSRF = "{{ csrf_token }}";
 const CAN_OPERATE = {% if can_operate %}true{% else %}false{% endif %};
 const IDLE_TEXT = CAN_OPERATE
   ? "Not running — press Start to open this camera."
   : "Not running.";
 const POLL_MS = 2000;
-
-async function postJSON(url) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "X-CSRFToken": CSRF },
-  });
-  let body = null;
-  try { body = await response.json(); } catch (err) { body = null; }
-  return { ok: response.ok, status: response.status, body: body };
-}
 
 function setText(root, role, value) {
   const node = root.querySelector(`[data-role="${role}"]`);
