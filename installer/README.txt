@@ -12,7 +12,7 @@ loads the detector before the window appears. Later launches are quick.
 First run
 ---------
 An administrator account is created for you, and the dashboard shows the
-username and password at the top. Use them to sign in at the "admin" link,
+username and password at the top, with a Copy password button beside it. Use them to sign in at the "admin" link,
 add your camera, then change the password. The notice disappears once you
 delete this file:
 

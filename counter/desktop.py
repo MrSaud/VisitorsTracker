@@ -273,12 +273,42 @@ def detach_output(data_dir, limit=5_000_000):
 class DesktopApi:
     """What the page may ask the application to do for it.
 
-    One thing, so far: save a file. The window has no address bar and no
-    Back button, so a download link that navigates leaves the operator
-    staring at raw CSV with no way out -- which is exactly what the
+    Saving a file and copying to the clipboard. The window has no address
+    bar and no Back button, so a download link that navigates leaves the
+    operator staring at raw CSV with no way out -- which is exactly what the
     Download CSV buttons used to do. A webview is not a browser and must
     not be asked to behave like one.
     """
+
+    def copy_text(self, text):
+        """Put text on the system clipboard.
+
+        The page tries navigator.clipboard first and falls back to here.
+        A webview's clipboard access depends on the platform's web view and
+        on being inside a user gesture, and the first thing anyone copies is
+        the first-run admin password -- the one string where "it silently
+        did nothing" means they cannot get into the admin at all.
+        """
+        import subprocess
+
+        if not isinstance(text, str) or not text:
+            return {"copied": False, "reason": "nothing to copy"}
+
+        if sys.platform == "darwin":
+            command = ["pbcopy"]
+        elif sys.platform.startswith("win"):
+            command = ["clip"]
+        else:
+            command = ["xclip", "-selection", "clipboard"]
+
+        try:
+            subprocess.run(command, input=text.encode("utf-8"),
+                           check=True, timeout=10)
+        except FileNotFoundError:
+            return {"copied": False, "reason": f"{command[0]} is not installed"}
+        except (OSError, subprocess.SubprocessError) as error:
+            return {"copied": False, "reason": str(error)}
+        return {"copied": True}
 
     def save_file(self, filename, content):
         """Ask where to put it, then write it. Returns what happened."""

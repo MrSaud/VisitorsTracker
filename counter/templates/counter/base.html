@@ -110,6 +110,13 @@
   button:hover:not(:disabled) { border-color: #3d4452; background: #252a34; }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
   button.primary { background: #1f6f43; border-color: #2a8d56; }
+  button.copy {
+    padding: 1px 8px;
+    font-size: 11.5px;
+    margin-left: 4px;
+    vertical-align: baseline;
+  }
+  code.just-copied { outline: 1px solid var(--in); border-radius: 3px; }
   button.danger { background: #6f2a2a; border-color: #8d3a3a; }
   .controls.read-only { color: var(--muted); font-size: 12.5px; }
   .pill {
@@ -365,8 +372,10 @@
   <div class="title">First run &mdash; sign in to add a camera</div>
   <ul>
     <li>Open <a href="/admin/">the admin</a> and sign in as
-        <code>{{ initial_admin.username }}</code> with
-        <code>{{ initial_admin.password }}</code></li>
+        <code id="initial-admin-user">{{ initial_admin.username }}</code> with
+        <code id="initial-admin-pass">{{ initial_admin.password }}</code>
+        <button type="button" class="copy" data-copy="initial-admin-pass"
+                data-copied="Copied">Copy password</button></li>
     <li>Add your camera there, then change this password.</li>
     <li>This message disappears when you delete
         <code>{{ initial_admin.path }}</code></li>
@@ -384,6 +393,86 @@
 
 <script>
 // Shared by every page.
+
+// Three ways to reach a clipboard, because no single one is dependable
+// here. The desktop window is a web view, not a browser: clipboard
+// permissions differ per platform, and the page is served over plain HTTP
+// on 127.0.0.1, where navigator.clipboard is absent in some engines. The
+// first thing anybody copies is the first-run admin password, and that is
+// the one string where failing quietly means they cannot get in at all.
+async function copyToClipboard(text) {
+  if (!text) return false;
+
+  const native = window.pywebview && window.pywebview.api
+    && window.pywebview.api.copy_text;
+  if (native) {
+    try {
+      const result = await window.pywebview.api.copy_text(text);
+      if (result && result.copied) return true;
+    } catch (error) { /* fall through to the browser routes */ }
+  }
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (error) { /* needs a gesture, or permission was refused */ }
+  }
+
+  // Deprecated, and the only one that works without a secure context.
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-1000px";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    document.body.removeChild(area);
+    if (copied) return true;
+  } catch (error) { /* nothing left to try */ }
+
+  return false;
+}
+
+// Select the text instead, so a failure still leaves something to do.
+function selectText(node) {
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } catch (error) { /* not worth reporting */ }
+}
+
+document.querySelectorAll("button.copy[data-copy]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const source = document.getElementById(button.dataset.copy);
+    if (!source) return;
+
+    const label = button.textContent;
+    button.disabled = true;
+    const ok = await copyToClipboard(source.textContent.trim());
+
+    if (ok) {
+      button.textContent = button.dataset.copied || "Copied";
+      source.classList.add("just-copied");
+    } else {
+      // Say so rather than pretend. The text is now selected, so the
+      // keyboard shortcut will work even though the button could not.
+      button.textContent = "Select and copy";
+      selectText(source);
+    }
+    setTimeout(() => {
+      button.textContent = label;
+      button.disabled = false;
+      source.classList.remove("just-copied");
+    }, 2000);
+  });
+});
+
 function clockTime(iso) {
   if (!iso) return "";
   const d = new Date(iso);

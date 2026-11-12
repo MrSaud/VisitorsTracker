@@ -6530,3 +6530,116 @@ class GatekeeperInstructionsTests(TestCase):
         # throws the app away and the install fails for good.
         self.assertIn("Move to Trash", self.readme)
         self.assertIn("Cancel", self.readme)
+
+
+class CopyInitialPasswordTests(TestCase):
+    """The first-run password is the one string that must be easy to move.
+
+    It is generated, long, and the only way into the admin. Retyping it by
+    eye from a notice is where a first run goes wrong.
+    """
+
+    def setUp(self):
+        self.data_dir = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.data_dir, True)
+
+    def write_note(self, password="Zq7-Rhyme-Patio-4418"):
+        from counter.firstrun import password_path
+
+        path = password_path(self.data_dir)
+        path.write_text(
+            "VisitorsTracker administrator\n"
+            "username: admin\n"
+            f"password: {password}\n\n"
+            "Change it at /admin/ and delete this file.\n",
+            encoding="utf-8")
+        return password
+
+    def test_the_notice_offers_a_copy_button_for_the_password(self):
+        password = self.write_note()
+        with self.settings(DATA_DIR=self.data_dir):
+            html = self.client.get("/").content.decode()
+
+        self.assertIn(password, html)
+        self.assertIn('id="initial-admin-pass"', html)
+        self.assertIn('data-copy="initial-admin-pass"', html)
+
+    def test_the_button_points_at_the_password_and_not_the_username(self):
+        self.write_note()
+        with self.settings(DATA_DIR=self.data_dir):
+            html = self.client.get("/").content.decode()
+
+        button = html[html.index('class="copy"'):]
+        button = button[:button.index("</button>")]
+        self.assertIn("initial-admin-pass", button)
+        self.assertNotIn("initial-admin-user", button)
+
+    def test_no_button_once_the_file_is_gone(self):
+        # The notice is the only thing that carries it.
+        with self.settings(DATA_DIR=self.data_dir):
+            html = self.client.get("/").content.decode()
+        self.assertNotIn('data-copy="initial-admin-pass"', html)
+
+    def test_the_page_tries_every_clipboard_route(self):
+        template = (pathlib.Path(settings.BASE_DIR) / "counter" / "templates"
+                    / "counter" / "base.html").read_text()
+        # A web view is not a browser: which of these works depends on the
+        # platform and on the page being a secure context.
+        self.assertIn("pywebview.api.copy_text", template)
+        self.assertIn("navigator.clipboard", template)
+        self.assertIn("execCommand", template)
+
+    def test_a_failure_selects_the_text_instead_of_lying(self):
+        template = (pathlib.Path(settings.BASE_DIR) / "counter" / "templates"
+                    / "counter" / "base.html").read_text()
+        self.assertIn("Select and copy", template)
+        self.assertIn("selectText", template)
+
+
+class DesktopClipboardTests(TestCase):
+    """The desktop window's own route to the clipboard."""
+
+    def api(self):
+        from counter.desktop import DesktopApi
+
+        return DesktopApi()
+
+    def test_it_shells_out_to_the_platform_tool(self):
+        with patch("subprocess.run") as run:
+            result = self.api().copy_text("hello")
+
+        self.assertTrue(result["copied"])
+        command, = run.call_args[0]
+        expected = {"darwin": "pbcopy", "win32": "clip"}.get(sys.platform, "xclip")
+        self.assertEqual(command[0], expected)
+        self.assertEqual(run.call_args[1]["input"], b"hello")
+
+    def test_it_reports_a_missing_tool_rather_than_claiming_success(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = self.api().copy_text("hello")
+
+        self.assertFalse(result["copied"])
+        self.assertIn("not installed", result["reason"])
+
+    def test_it_reports_a_failing_tool(self):
+        import subprocess as sp
+
+        with patch("subprocess.run", side_effect=sp.CalledProcessError(1, "pbcopy")):
+            result = self.api().copy_text("hello")
+        self.assertFalse(result["copied"])
+
+    def test_empty_text_is_not_a_success(self):
+        for value in ("", None, 42):
+            self.assertFalse(self.api().copy_text(value)["copied"], repr(value))
+
+    @skipUnless(sys.platform == "darwin", "uses pbcopy/pbpaste")
+    def test_it_really_reaches_the_clipboard(self):
+        import subprocess as sp
+
+        before = sp.run(["pbpaste"], capture_output=True, text=True).stdout
+        self.addCleanup(lambda: sp.run(["pbcopy"], input=before.encode()))
+
+        marker = "visitorstracker-test-ZQ7"
+        self.assertTrue(self.api().copy_text(marker)["copied"])
+        self.assertEqual(
+            sp.run(["pbpaste"], capture_output=True, text=True).stdout, marker)
