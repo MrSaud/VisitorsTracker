@@ -119,5 +119,10 @@ Apple menu > About This Mac, and use the other image.
 
 Removing it
 -----------
-Drag the app to the Trash. Delete the folder above too if you want the
-counting history gone with it.
+Drag the app to the Trash, and delete the data folder above too if you want
+the counting history gone with it. Deleting only the app leaves the data,
+so a reinstall picks up where it left off.
+
+Uninstalling.txt in this disk image has the exact commands, including how
+to keep a copy of the database first and how to make macOS forget the
+camera permission.

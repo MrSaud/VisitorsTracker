@@ -1,0 +1,105 @@
+Removing VisitorsTracker from a Mac
+===================================
+
+There are two separate things to remove: the application, and the folder
+where it keeps your counting history. Deleting the app alone does NOT give
+you a clean slate -- reinstalling afterwards picks the old database back up,
+which is deliberate, so that upgrading does not lose your counts.
+
+
+Before you start
+----------------
+Quit VisitorsTracker. Close its window, or right-click its Dock icon and
+choose Quit.
+
+Read the next section before deleting anything, unless you are certain you
+do not want the counting history.
+
+
+What you are about to lose
+--------------------------
+This folder holds everything the app recorded:
+
+    ~/Library/Application Support/VisitorsTracker/
+
+      db.sqlite3            every crossing, camera and event it counted
+      .secret_key           generated on first run
+      initial-admin.txt     the first-run password, if you never deleted it
+      visitorstracker.log   what the app did
+      output.log            raw web server log
+      backups/              nightly database copies, if any
+
+To keep the history, copy db.sqlite3 somewhere safe first:
+
+    cp ~/Library/Application\ Support/VisitorsTracker/db.sqlite3 ~/Desktop/
+
+Putting that file back into the same folder after reinstalling restores
+everything, as long as it came from the same or an older version.
+
+You can also export the counts as CSV from the dashboard before removing
+anything, which is the better option if you only want the numbers.
+
+
+Removing it
+-----------
+1. The application. It is in one of these two places depending on how it
+   was installed, so this removes both:
+
+       rm -rf ~/Applications/VisitorsTracker.app /Applications/VisitorsTracker.app
+
+   In Finder instead: open Applications, drag VisitorsTracker to the Trash.
+
+2. The data. This is the step that gives you a clean slate:
+
+       rm -rf ~/Library/Application\ Support/VisitorsTracker
+
+   In Finder instead: Go menu > Go to Folder, paste
+
+       ~/Library/Application Support/
+
+   press Return, then drag the VisitorsTracker folder to the Trash. That
+   Library folder is hidden in Finder normally, which is why you go to it
+   by name.
+
+3. Empty the Trash if you used Finder.
+
+
+Optional: make macOS forget the camera permission
+-------------------------------------------------
+macOS remembers that you allowed the app to use the camera. If you want a
+reinstall to ask again from scratch:
+
+    tccutil reset Camera com.visitorstracker.desktop
+
+Without this the app keeps the permission it already had, which is usually
+what you want.
+
+
+What is NOT removed
+-------------------
+Nothing else on the Mac is touched. In particular:
+
+  - If you also have the project source folder anywhere, it has its own
+    separate database and is untouched by all of the above.
+  - No system settings are changed, and nothing is installed outside the
+    two locations listed here.
+
+
+Starting fresh afterwards
+-------------------------
+Install again from the disk image:
+
+    VisitorsTracker-1.0.0-arm64.dmg     Apple Silicon Macs (M1 and later)
+    VisitorsTracker-1.0.0-x86_64.dmg    Intel Macs
+
+On first launch it builds a new database, generates a new administrator
+password and shows the first-run notice again.
+
+macOS will refuse the first open, because the app is not registered with
+Apple. Drag it to Applications, double-click, press Cancel on the warning
+-- NOT "Move to Trash" -- then go to
+
+    System Settings > Privacy & Security
+
+scroll down to Security, and click "Open Anyway". You do this once per
+install.

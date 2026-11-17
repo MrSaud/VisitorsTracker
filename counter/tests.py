@@ -6874,3 +6874,63 @@ class IdentitySwapDoesNotCountTests(TestCase):
         t.box = None
         t.side = -1
         line.update({1: t}, (480, 640))   # must not raise
+
+
+class MacUninstallNotesTests(TestCase):
+    """Whoever ends up with the app has to be able to remove it.
+
+    Deleting the app alone leaves the data behind on purpose, so that an
+    upgrade keeps the counting history. That makes "start fresh" a two-step
+    job, and the second step is a folder Finder hides.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.root = pathlib.Path(settings.BASE_DIR)
+        cls.path = cls.root / "installer" / "UNINSTALL-macos.txt"
+        cls.text = cls.path.read_text()
+
+    def test_it_exists_and_ships_in_the_image(self):
+        self.assertTrue(self.path.exists())
+        script = (self.root / "scripts" / "build_macos_app.sh").read_text()
+        self.assertIn("UNINSTALL-macos.txt", script)
+        self.assertIn("Uninstalling.txt", script)
+
+    def test_it_names_the_directory_the_app_actually_uses(self):
+        from config.paths import default_data_dir
+
+        real = str(default_data_dir()).replace(str(pathlib.Path.home()), "~")
+        self.assertIn(real, self.text,
+                      "the data path here must be the one the code resolves")
+
+    def test_it_covers_both_places_the_app_can_live(self):
+        # Dragged from the image it lands in /Applications; installed any
+        # other way it may be in ~/Applications.
+        self.assertIn("~/Applications/VisitorsTracker.app", self.text)
+        self.assertIn("/Applications/VisitorsTracker.app", self.text)
+
+    def test_it_warns_before_it_deletes(self):
+        # The database is the only copy of the counting history.
+        self.assertIn("db.sqlite3", self.text)
+        warning = self.text.index("What you are about to lose")
+        removing = self.text.index("Removing it")
+        self.assertLess(warning, removing,
+                        "say what is lost before giving the command")
+
+    def test_it_says_how_to_keep_the_history(self):
+        self.assertIn("cp ~/Library/Application", self.text)
+        self.assertIn("CSV", self.text)
+
+    def test_it_uses_the_bundle_id_the_app_is_signed_with(self):
+        spec = (self.root / "VisitorsTracker.spec").read_text()
+        self.assertIn("com.visitorstracker.desktop", self.text)
+        self.assertIn("com.visitorstracker.desktop", spec)
+
+    def test_it_says_what_is_not_touched(self):
+        # The project checkout has its own separate database.
+        self.assertIn("NOT removed", self.text)
+
+    def test_the_readme_points_at_it(self):
+        readme = (self.root / "installer" / "README-macos.txt").read_text()
+        self.assertIn("Uninstalling.txt", readme)

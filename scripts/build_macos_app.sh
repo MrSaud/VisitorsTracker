@@ -119,6 +119,9 @@ ln -s /Applications "$STAGE/Applications"
   echo
   cat "$PROJECT/installer/README-macos.txt"
 } > "$STAGE/Read me first.txt"
+# Shipped beside the app so whoever ends up with it can remove it cleanly,
+# without needing the repository or asking whoever installed it.
+cp "$PROJECT/installer/UNINSTALL-macos.txt" "$STAGE/Uninstalling.txt"
 rm -f "$DMG"
 hdiutil create -quiet -volname "VisitorsTracker $VERSION" -srcfolder "$STAGE" \
         -ov -format UDZO "$DMG"
