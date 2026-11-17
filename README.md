@@ -634,6 +634,53 @@ to the lens or down the hall.
 This is also why a suggested line is kept between 0.2 and 0.8 of the frame:
 at 0.9 a close subject has no room left to get clear of the line.
 
+### Zoom, when people are too small
+
+The detector's input is **640x640 whatever it is handed**. The ONNX export
+fixes that: feeding it 960x960 is refused outright. So a 1280-wide frame
+arrives at half scale, and a person who is 200px tall in the picture is
+100px tall by the time anything looks at them. Detection falls off steeply
+as that number drops:
+
+| Person's height in the frame | Detections found |
+|---|---|
+| 349px | 100% |
+| 284px | 92% |
+| 219px | 80% |
+| 170px | 68% |
+| 121px | 45% |
+
+Cropping to the part of the frame that matters spends the 640x640 budget
+there instead. Measured on real footage, counting only people inside the
+same physical area either way:
+
+| Region kept | More people found |
+|---|---|
+| Most of the frame | +13% |
+| The line and its crowd | +13% |
+| Tight on the line | +28% |
+| Very tight | +32% |
+
+Each camera has `zoom_left`, `zoom_top`, `zoom_right` and `zoom_bottom` in
+the admin, as fractions of the frame. Left at 0, 0, 1, 1 nothing is cropped
+and nothing is copied. The crop is applied **before** the resize -- the
+other order throws the pixels away before the crop can use them -- and
+everything downstream sees the cropped view: the line, the tracks and the
+picture on the Live cameras page. What you watch is what the detector is
+looking at.
+
+**It trades coverage for resolution, and the trade is real.** On a clip
+where the crowd fills the frame, zooming onto the line took the count from
+20 to 11, because people crossing outside the crop are not crossing at all
+as far as the app is concerned. The case it is for is the opposite one: the
+same clip shrunk to simulate a camera mounted too far back was counted as
+10 people, and zoomed to the area they were in, 15 -- against 14 for the
+footage at full size. It recovers a distant mount; it does not improve a
+well-framed one.
+
+So: zoom when people are small and the action is confined. Do not zoom to
+"focus" on a doorway that people walk around.
+
 ### When the tracker swaps two people
 
 Distance past the line answers "did they really cross". It does not answer

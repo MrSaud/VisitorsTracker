@@ -605,11 +605,16 @@ class VisitorCounter:
         max_disappeared: int = 25,
         frame_width: int = 640,
         tracker=None,
+        zoom=None,
     ):
         self.detector = detector
         self.line = line or LineCounter()
         self.detect_every = max(1, int(detect_every))
         self.frame_width = int(frame_width)
+        # (left, top, right, bottom) as fractions, or None for the whole
+        # frame. Applied before anything else, so the line, the tracking
+        # and the picture the operator watches are all the same view.
+        self.zoom = tuple(float(v) for v in zoom) if zoom else None
         # Any object offering update_detections() and advance() will do.
         self.tracker = tracker or CentroidTracker(max_disappeared=max_disappeared)
         self._frame_index = 0
@@ -630,6 +635,29 @@ class VisitorCounter:
     @property
     def active_tracks(self) -> int:
         return len(self.tracker.tracks)
+
+    def _crop(self, frame):
+        """Digital zoom: keep only the part of the frame that matters.
+
+        The detector's input is a fixed 640x640 whatever it is handed, so a
+        wide frame arrives at a fraction of its real scale and distant
+        people lose the pixels they needed. Cropping first spends that
+        budget where the counting happens.
+
+        Everything downstream sees the cropped frame -- the line, the
+        tracks and the live picture -- so what the operator watches is what
+        the detector is actually looking at.
+        """
+        if not self.zoom:
+            return frame
+        height, width = frame.shape[:2]
+        left, top, right, bottom = self.zoom
+        x1, x2 = int(round(left * width)), int(round(right * width))
+        y1, y2 = int(round(top * height)), int(round(bottom * height))
+        # Never hand back an empty array, whatever the stored values say.
+        x1, y1 = max(0, min(x1, width - 1)), max(0, min(y1, height - 1))
+        x2, y2 = max(x1 + 1, min(x2, width)), max(y1 + 1, min(y2, height))
+        return frame[y1:y2, x1:x2]
 
     def _resize(self, frame):
         height, width = frame.shape[:2]
@@ -655,7 +683,10 @@ class VisitorCounter:
 
     def process(self, frame):
         """Run one frame. Returns ``(annotated_frame, events)``."""
-        frame = self._resize(frame)
+        # Crop before resizing: zooming first and shrinking second is what
+        # gives the detector more of the person. The other order would
+        # throw the pixels away before the crop could use them.
+        frame = self._resize(self._crop(frame))
 
         # On a detect frame the tracker gets measurements. In between it
         # advances its motion model instead of being fed stale boxes,

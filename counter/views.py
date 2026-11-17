@@ -178,6 +178,9 @@ def _camera_payload(camera, worker=None):
         "source": camera.source,
         "is_active": camera.is_active,
         "line_position": camera.line_position,
+        # None when the whole frame is used, so a client can tell at a
+        # glance whether what it is watching is the full view.
+        "zoom": camera.zoom_box(),
         "line_orientation": camera.line_orientation,
         "invert_direction": camera.invert_direction,
         "totals": camera.totals(),

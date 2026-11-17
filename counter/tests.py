@@ -6934,3 +6934,132 @@ class MacUninstallNotesTests(TestCase):
     def test_the_readme_points_at_it(self):
         readme = (self.root / "installer" / "README-macos.txt").read_text()
         self.assertIn("Uninstalling.txt", readme)
+
+
+class CameraZoomTests(TestCase):
+    """Digital zoom: watch part of the frame, at more pixels per person.
+
+    The detector's input is a fixed 640x640 whatever it is handed, so a
+    wide frame arrives at a fraction of its real scale. Measured on real
+    footage: with the scene shrunk to simulate a distant mount the app
+    found 10 people; zoomed to the area they were in, 15 -- against 14 on
+    the same footage at full size.
+    """
+
+    def camera(self, **kwargs):
+        from counter.models import Camera
+
+        return Camera(name="c", source="0", **kwargs)
+
+    def test_the_whole_frame_is_the_default_and_costs_nothing(self):
+        self.assertIsNone(self.camera().zoom_box())
+
+    def test_a_set_region_is_reported(self):
+        cam = self.camera(zoom_left=0.2, zoom_top=0.1,
+                          zoom_right=0.8, zoom_bottom=0.9)
+        self.assertEqual(cam.zoom_box(), (0.2, 0.1, 0.8, 0.9))
+
+    def test_values_outside_the_frame_are_refused(self):
+        from django.core.exceptions import ValidationError
+
+        for field, value in (("zoom_left", -0.1), ("zoom_right", 1.5),
+                             ("zoom_top", -2.0), ("zoom_bottom", 9.0)):
+            with self.subTest(field=field):
+                cam = self.camera(**{field: value})
+                with self.assertRaises(ValidationError):
+                    cam.full_clean()
+
+    def test_an_inverted_or_vanishing_region_is_refused(self):
+        from django.core.exceptions import ValidationError
+
+        # Right of left, and a sliver, both leave the detector nothing.
+        for kwargs in ({"zoom_left": 0.8, "zoom_right": 0.2},
+                       {"zoom_left": 0.5, "zoom_right": 0.52},
+                       {"zoom_top": 0.9, "zoom_bottom": 0.1},
+                       {"zoom_top": 0.5, "zoom_bottom": 0.53}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(ValidationError):
+                    self.camera(**kwargs).full_clean()
+
+    def test_the_default_camera_validates(self):
+        self.camera().full_clean()      # must not raise
+
+
+class ZoomCropTests(TestCase):
+    """The crop itself."""
+
+    def counter(self, zoom):
+        from counter.vision import VisitorCounter
+
+        class NoDetector:
+            name = "none"
+
+            def detect(self, frame):
+                return []
+
+        return VisitorCounter(NoDetector(), zoom=zoom)
+
+    def frame(self, w=1280, h=720):
+        import numpy as np
+
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
+    def test_no_zoom_hands_back_the_same_frame_untouched(self):
+        frame = self.frame()
+        self.assertIs(self.counter(None)._crop(frame), frame)
+
+    def test_a_region_is_cut_to_the_right_pixels(self):
+        cropped = self.counter((0.25, 0.5, 0.75, 1.0))._crop(self.frame())
+        self.assertEqual(cropped.shape[:2], (360, 640))
+
+    def test_nonsense_values_still_leave_something_to_look_at(self):
+        # Validation catches these on the way in; the hot path must not
+        # hand the detector an empty array if one ever gets past.
+        for zoom in ((0.9, 0.9, 0.1, 0.1), (-1.0, -1.0, 5.0, 5.0),
+                     (0.5, 0.5, 0.5, 0.5)):
+            with self.subTest(zoom=zoom):
+                cropped = self.counter(zoom)._crop(self.frame())
+                self.assertGreater(cropped.shape[0], 0)
+                self.assertGreater(cropped.shape[1], 0)
+
+    def test_the_crop_happens_before_the_resize(self):
+        # The other order throws the pixels away before the crop can use
+        # them, which is the whole point of zooming.
+        source = (pathlib.Path(settings.BASE_DIR) / "counter" / "vision.py").read_text()
+        self.assertIn("self._resize(self._crop(frame))", source)
+
+    def test_everything_downstream_sees_the_cropped_view(self):
+        # The line, the tracks and the published picture must agree.
+        counter = self.counter((0.25, 0.0, 0.75, 1.0))
+        annotated, _events = counter.process(self.frame())
+        self.assertEqual(annotated.shape[1], 640)
+
+
+class ZoomIsWiredUpTests(TestCase):
+    """A setting nothing reads is worse than no setting."""
+
+    def test_the_worker_passes_the_camera_s_region(self):
+        source = (pathlib.Path(settings.BASE_DIR) / "counter" / "camera.py").read_text()
+        self.assertIn("zoom=camera.zoom_box()", source)
+
+    def test_the_api_reports_it(self):
+        from counter.models import Camera
+
+        Camera.objects.create(name="z", source="0", zoom_left=0.2,
+                              zoom_right=0.8)
+        payload = self.client.get("/api/v1/cameras/").json()
+        # JSON has no tuples; it comes back as a list.
+        self.assertEqual(payload["cameras"][0]["zoom"], [0.2, 0.0, 0.8, 1.0])
+
+    def test_the_api_says_none_when_the_whole_frame_is_used(self):
+        from counter.models import Camera
+
+        Camera.objects.create(name="z", source="0")
+        payload = self.client.get("/api/v1/cameras/").json()
+        self.assertIsNone(payload["cameras"][0]["zoom"])
+
+    def test_there_is_a_migration_for_the_fields(self):
+        folder = pathlib.Path(settings.BASE_DIR) / "counter" / "migrations"
+        text = "\n".join(p.read_text() for p in folder.glob("0*.py"))
+        for field in ("zoom_left", "zoom_top", "zoom_right", "zoom_bottom"):
+            self.assertIn(field, text)

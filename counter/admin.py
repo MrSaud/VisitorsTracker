@@ -9,10 +9,16 @@ from .reports import parse_date
 
 @admin.register(Camera)
 class CameraAdmin(admin.ModelAdmin):
-    list_display = ("name", "source", "is_active", "line_orientation", "line_position")
+    list_display = ("name", "source", "is_active", "line_orientation",
+                    "line_position", "zoomed")
     # Editable in the list, so turning a camera off does not mean opening
     # its form and hunting for a tickbox.
     list_editable = ("is_active",)
+
+    @admin.display(boolean=True, description="Zoomed")
+    def zoomed(self, camera):
+        """Whether this camera is watching less than the whole frame."""
+        return camera.zoom_box() is not None
     list_filter = ("is_active", "line_orientation")
     search_fields = ("name", "source")
     actions = ["enable_cameras", "disable_cameras"]

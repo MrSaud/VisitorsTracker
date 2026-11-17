@@ -171,6 +171,7 @@ class CounterWorker(threading.Thread):
             detect_every=settings.COUNTER_DETECT_EVERY,
             max_disappeared=settings.COUNTER_MAX_DISAPPEARED,
             frame_width=settings.COUNTER_FRAME_WIDTH,
+            zoom=camera.zoom_box(),
         )
 
         self._event_id = None
