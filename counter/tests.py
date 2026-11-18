@@ -7063,3 +7063,107 @@ class ZoomIsWiredUpTests(TestCase):
         text = "\n".join(p.read_text() for p in folder.glob("0*.py"))
         for field in ("zoom_left", "zoom_top", "zoom_right", "zoom_bottom"):
             self.assertIn(field, text)
+
+
+class LatePickupTests(TestCase):
+    """An arrival nobody saw is still an arrival.
+
+    A track first seen past the line is not counted, because nothing was
+    observed crossing. But when that person later leaves, the track exists
+    by then and the exit IS counted. The entry is gone for good, and over a
+    day that shows up as exits outnumbering entries with no obvious cause.
+
+    Measured on real footage: with the line at 0.53 of the frame, four
+    tracks appeared within two body widths of it and three of those never
+    registered a crossing. Moved to 0.65, one and none.
+    """
+
+    def line(self, **kwargs):
+        from counter.vision import LineCounter
+
+        return LineCounter(position=0.5, orientation="horizontal", **kwargs)
+
+    def track(self, track_id, y, box_h=80):
+        from collections import deque
+        from counter.vision import Track
+
+        t = Track(track_id=track_id, centroid=(160, y),
+                  box=[140, y - box_h / 2, 180, y + box_h / 2])
+        t.trail = deque([(160, y)], maxlen=24)
+        return t
+
+    def test_appearing_on_top_of_the_line_is_recorded(self):
+        line = self.line()
+        # The line sits at 240; 2 box heights is 160px either side.
+        line.update({1: self.track(1, 300)}, (480, 640))
+        self.assertEqual(line.late_pickups, 1)
+
+    def test_appearing_well_clear_of_the_line_is_not(self):
+        line = self.line()
+        line.update({1: self.track(1, 60)}, (480, 640))
+        self.assertEqual(line.late_pickups, 0)
+
+    def test_it_does_not_count_a_crossing(self):
+        line = self.line()
+        line.update({1: self.track(1, 300)}, (480, 640))
+        self.assertEqual((line.total_in, line.total_out), (0, 0))
+
+    def test_only_the_first_sighting_counts_towards_it(self):
+        # The tracker hands back the same Track object frame after frame --
+        # it has to, because the counter records the side on it.
+        line = self.line()
+        track = self.track(1, 300)
+        for _ in range(5):
+            line.update({1: track}, (480, 640))
+        self.assertEqual(line.late_pickups, 1,
+                         "it is about arriving, not about staying")
+
+    def test_the_tracker_really_does_reuse_the_track_object(self):
+        # If it ever handed back a fresh one, every frame would look like an
+        # arrival and this counter would be meaningless.
+        from counter.tracking import SortTracker
+
+        tracker = SortTracker()
+        box = (100, 100, 160, 280)
+        # SORT holds a new detection as a candidate for a few frames before
+        # publishing it as a track -- which is itself part of why a person
+        # can reach the line before the counter knows they exist.
+        seen = []
+        for _ in range(6):
+            seen.append(tracker.update_detections([(box, 0.9)]))
+        published = [s for s in seen if s]
+        self.assertTrue(published, "the tracker never published a track")
+        first, last = published[0], published[-1]
+        self.assertEqual(set(first), set(last))
+        for tid in first:
+            self.assertIs(first[tid], last[tid])
+
+    def test_a_track_with_no_box_does_not_crash_or_count(self):
+        line = self.line()
+        t = self.track(1, 300)
+        t.box = None
+        line.update({1: t}, (480, 640))
+        self.assertEqual(line.late_pickups, 0)
+
+    def test_the_pipeline_exposes_it(self):
+        from counter.vision import VisitorCounter
+
+        class NoDetector:
+            name = "none"
+
+            def detect(self, frame):
+                return []
+
+        counter = VisitorCounter(NoDetector())
+        self.assertEqual(counter.late_pickups, 0)
+
+    def test_the_live_status_reports_it(self):
+        source = (pathlib.Path(settings.BASE_DIR) / "counter" / "camera.py").read_text()
+        self.assertIn('"late_pickups": self.counter.late_pickups', source)
+
+    def test_the_threshold_is_stated_once_and_documented(self):
+        from counter.vision import LATE_PICKUP_WIDTHS
+
+        self.assertEqual(LATE_PICKUP_WIDTHS, 2.0)
+        readme = (pathlib.Path(settings.BASE_DIR) / "README.md").read_text()
+        self.assertIn("late_pickups", readme)

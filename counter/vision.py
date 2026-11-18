@@ -60,6 +60,13 @@ DEFAULT_COMMIT_FRACTION = 0.6
 # the identity swaps that produced phantom crossings jumped 1.4 to 3.7.
 DEFAULT_JUMP_FRACTION = 2.0
 
+# How close to the line a track can first appear before its arrival is
+# suspect. A track first seen past the line is not counted -- nothing was
+# seen to cross -- so the entry is lost, while the exit that follows is
+# counted normally. That asymmetry shows up as exits outnumbering entries,
+# and the cause is invisible unless it is counted.
+LATE_PICKUP_WIDTHS = 2.0
+
 # How close to the frame edge a suggested line may sit. Past these a
 # crossing has too little room left to be confirmed.
 LINE_POSITION_MIN = 0.2
@@ -440,6 +447,11 @@ class LineCounter:
         self.jump_fraction = max(0.0, float(jump_fraction))
         self.total_in = 0
         self.total_out = 0
+        # Tracks first seen so near the line that whatever they did before
+        # being detected was missed. Not an error on its own -- it is how
+        # a badly placed line, or a detector picking people up too late,
+        # makes itself known.
+        self.late_pickups = 0
 
     def line_coordinate(self, frame_shape) -> int:
         height, width = frame_shape[:2]
@@ -551,6 +563,11 @@ class LineCounter:
                 # First sighting: note which side they started on. Nothing is
                 # counted, because we never saw them cross anything.
                 track.side = side
+                extent = self._axis_extent(track.box)
+                if extent > 0 and abs(delta) <= extent * LATE_PICKUP_WIDTHS:
+                    # Appeared right on top of the line. If they were already
+                    # walking through, that crossing is gone for good.
+                    self.late_pickups += 1
                 continue
 
             if side == previous:
@@ -631,6 +648,11 @@ class VisitorCounter:
     @property
     def occupancy(self) -> int:
         return max(0, self.line.total_in - self.line.total_out)
+
+    @property
+    def late_pickups(self) -> int:
+        """Tracks that appeared too close to the line to be trusted."""
+        return self.line.late_pickups
 
     @property
     def active_tracks(self) -> int:

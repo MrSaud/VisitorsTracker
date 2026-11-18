@@ -248,6 +248,11 @@ class CounterWorker(threading.Thread):
             "reconnecting": self.reconnecting,
             "reconnects": self.reconnects,
             "retry_in": self.retry_in,
+            # Tracks that appeared on top of the line: each one is an
+            # arrival nobody saw, and the exit that follows will still be
+            # counted. A number that climbs means the line is in the wrong
+            # place or people are being detected too late.
+            "late_pickups": self.counter.late_pickups,
             "session_in": self.counter.total_in,
             "session_out": self.counter.total_out,
             "session_inside": self.counter.occupancy,

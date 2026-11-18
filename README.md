@@ -681,6 +681,41 @@ well-framed one.
 So: zoom when people are small and the action is confined. Do not zoom to
 "focus" on a doorway that people walk around.
 
+### Arrivals nobody saw
+
+A track first seen past the line is not counted, and that is correct -- the
+app watched nothing cross. But the consequence is one-sided. When that
+person later leaves, the track exists by then and the exit **is** counted.
+The entry is gone for good.
+
+Over a day that reads as exits outnumbering entries, with nothing in the
+data to say why. It is not the direction being inverted: inverting swaps
+the two columns, it cannot make one larger. It is arrivals going unseen.
+
+Each camera now reports `late_pickups` in its live status: tracks first
+seen within two body widths of the line. On real footage, with the line at
+0.53 of the frame:
+
+| Line at | Late pickups | in | out |
+|---|---|---|---|
+| 0.40 | 6 | 15 | 1 |
+| 0.53 | 4 | 16 | 4 |
+| 0.65 | **1** | 14 | 2 |
+| 0.75 | 0 | 11 | 1 |
+
+The fix is placement, not arithmetic. People need a stretch of picture in
+which to be detected *before* they reach the line, so put it where they are
+already being tracked rather than where they first come into view. Pushed
+too far the other way the count falls instead, because fewer people reach
+the line at all and there is less room to get clear of it -- 0.75 above.
+
+The app does not guess at the missed crossing. It could: a track born just
+past the line and moving away from it has probably walked through. But
+inventing a count from something never observed is the failure this
+project has spent the most effort avoiding, and a number that is quietly
+too low is easier to live with than one that is quietly too high. The
+counter reports the condition instead, and leaves the camera to be moved.
+
 ### When the tracker swaps two people
 
 Distance past the line answers "did they really cross". It does not answer
